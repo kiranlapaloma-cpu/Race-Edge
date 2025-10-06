@@ -102,7 +102,7 @@ def compute_phase_speeds(df_times: pd.DataFrame, distance_m: int) -> pd.DataFram
     d = distance_m
     c_F200 = [f"{d-100}_Time", f"{d-200}_Time"]
     # tsSPI: from (D-300) down to 600 (inclusive) stepping -100
-    c_tsSPI = [f"{x}_Time" for x in range(d-300, 500, -100)]  # note: stop at >500 so 600 included
+    c_tsSPI = [f"{x}_Time" for x in range(d-300, 500, -100)]  # INCLUDES 600 (1200: 900,800,700,600)
     # Accel: 500, 400, 300, 200
     c_Accel = [f"{x}_Time" for x in [500, 400, 300, 200] if x > 0 and x < d]
     # Grind: 100 + Finish_Time
@@ -119,6 +119,10 @@ def compute_phase_speeds(df_times: pd.DataFrame, distance_m: int) -> pd.DataFram
     out["Accel_speed"] = df_times.apply(lambda r: (100.0 * len([c for c in c_Accel if c in r.index and pd.notna(r[c])])) / sum_cols(r, c_Accel) if pd.notna(sum_cols(r, c_Accel)) else np.nan, axis=1)
     out["Grind_speed"] = df_times.apply(lambda r: (100.0 * len([c for c in c_Grind if c in r.index and pd.notna(r[c])])) / sum_cols(r, c_Grind) if pd.notna(sum_cols(r, c_Grind)) else np.nan, axis=1)
 
+        # sanity: ensure no overlap between phases
+    _overlap_ts_acc = set(c_tsSPI).intersection(set(c_Accel)),
+    _overlap_ts_gr = set(c_tsSPI).intersection(set(c_Grind)),
+    _overlap_acc_gr = set(c_Accel).intersection(set(c_Grind)),
     meta = dict(
         expected_cols=expected_cols,
         have_cols=have_cols,
@@ -377,7 +381,7 @@ def trip_classification(zF: float, zM: float, zA: float, zG: float, race_type: s
 # Narrative generation
 # =======================
 def race_level_phrases(indices: pd.DataFrame) -> Dict[str, str]:
-    def phrase(med_z, hot="Hot phrase", cool="Cool phrase", up=0.5, down=-0.5):
+    def phrase(med_z, up=0.5, down=-0.5, hot, cool):
         if med_z >= up:
             return hot
         if med_z <= down:
@@ -600,6 +604,12 @@ if uploaded:
     # Diagnostics
     st.markdown("#### Diagnostics")
     st.write(f"Expected splits: {len(meta['expected_cols'])} | Present: {len(meta['have_cols'])} | Integrity: {integrity}")
+    st.write("Phase columns", {"F200": meta.get("c_F200"), "tsSPI": meta.get("c_tsSPI"), "Accel": meta.get("c_Accel"), "Grind": meta.get("c_Grind")})
+    st.write("Phase overlap check:", {
+        "tsSPI∩Accel": meta.get("_overlap_ts_acc", set()),
+        "tsSPI∩Grind": meta.get("_overlap_ts_gr", set()),
+        "Accel∩Grind": meta.get("_overlap_acc_gr", set()),
+    })
     st.write("Missing:", [c for c in meta['expected_cols'] if c not in meta['have_cols']])
 
     # Optional: mock PDF export placeholder (actual PDF generation omitted here to keep code focused)
