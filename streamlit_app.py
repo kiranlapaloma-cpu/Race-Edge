@@ -377,7 +377,7 @@ def trip_classification(zF: float, zM: float, zA: float, zG: float, race_type: s
 # Narrative generation
 # =======================
 def race_level_phrases(indices: pd.DataFrame) -> Dict[str, str]:
-    def phrase(med_z, up=0.5, down=-0.5, hot, cool):
+    def phrase(med_z, hot="Hot phrase", cool="Cool phrase", up=0.5, down=-0.5):
         if med_z >= up:
             return hot
         if med_z <= down:
