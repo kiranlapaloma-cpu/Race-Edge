@@ -1241,3 +1241,383 @@ st.dataframe(AM_view, use_container_width=True)
 # Optional: download the table as CSV
 csv_bytes = AM_view.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Download Ability Matrix (CSV)", csv_bytes, "ability_matrix_v2.csv", "text/csv")
+
+# ======================= Batch 4 — Database, Search & PDF Export (robust) =======================
+import sqlite3, io, os
+from datetime import datetime
+
+# ---------- ReportLab (PDF) is optional but recommended ----------
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+    from reportlab.lib.units import cm
+    HAS_RL = True
+except Exception:
+    HAS_RL = False
+
+# ---------- DB path (honours sidebar input from Batch 1) ----------
+DB_PATH = db_path if "db_path" in globals() else "race_edge.db"
+
+# ---------- Initialise DB (idempotent) ----------
+def init_db_safe(path: str = DB_PATH):
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    # Minimal, stable schema (no migrations needed). Store key outputs per runner.
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS races(
+  race_id        TEXT PRIMARY KEY,
+  date           TEXT,
+  track          TEXT,
+  race_no        INTEGER,
+  distance_m     INTEGER NOT NULL,
+  split_step     INTEGER CHECK(split_step IN (100,200)) NOT NULL,
+  rsbi           REAL,   -- Race Shape Bias Index (if available)
+  rsp            REAL,   -- Race Shape Profile (if available)
+  fsr            REAL,   -- Finish Slowdown Ratio (from CG)
+  collapse       REAL,   -- CollapseSeverity (from CG)
+  created_ts     TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS performances(
+  perf_id        TEXT PRIMARY KEY,
+  race_id        TEXT NOT NULL REFERENCES races(race_id) ON DELETE CASCADE,
+  horse          TEXT NOT NULL,
+  finish_pos     INTEGER,
+  race_time_s    REAL,
+  f200_idx       REAL,
+  tsspi          REAL,
+  accel          REAL,
+  grind          REAL,
+  grind_cg       REAL,
+  pi             REAL,
+  gci            REAL,
+  hidden         REAL,
+  iai            REAL,
+  bal            REAL,
+  comp           REAL,
+  ability        REAL,
+  ability_tier   TEXT,
+  near_elite     TEXT,   -- blank or '⭐ Near-Elite'
+  direction      TEXT,   -- sprint-lean / stayer-lean / balanced
+  confidence     TEXT,   -- High/Med/Low
+  why_tier       TEXT,
+  inserted_ts    TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_perf_horse ON performances(horse);
+CREATE INDEX IF NOT EXISTS idx_perf_race  ON performances(race_id);
+""")
+    conn.commit()
+    conn.close()
+
+init_db_safe(DB_PATH)
+
+# ---------- Helpers to build safe keys ----------
+def _safe_str(x): 
+    return "" if x is None else str(x)
+
+def _safe_float(x, d=0.0):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else d
+    except Exception:
+        return d
+
+def _safe_int(x, d=0):
+    try:
+        v = int(x)
+        return v
+    except Exception:
+        return d
+
+def _make_race_id(date, track, race_no, distance_m, step):
+    # Compact key; good enough uniqueness for personal db
+    return f"{_safe_str(date)}|{_safe_str(track)}|R{_safe_int(race_no)}|{_safe_int(distance_m)}m|{_safe_int(step)}"
+
+def _make_perf_id(race_id, horse):
+    return f"{race_id}|{_safe_str(horse).upper()}"
+
+# ---------- Save current race ----------
+st.markdown("---")
+st.markdown("### 💾 Save current race to database")
+
+col_a, col_b, col_c, col_d = st.columns([1.2, 1.2, 0.9, 0.9])
+with col_a:
+    race_date = st.text_input("Race date (YYYY-MM-DD):", value=datetime.today().strftime("%Y-%m-%d"))
+with col_b:
+    race_track = st.text_input("Track / Meeting:", "")
+with col_c:
+    race_no = st.number_input("Race #", min_value=1, step=1, value=1)
+with col_d:
+    race_title_override = st.text_input("Optional title override", "")
+
+def _save_current_race():
+    if AM_view is None or AM_view.empty:
+        st.warning("Ability Matrix table is empty — run an analysis first.")
+        return
+    step = int(metrics.attrs.get("STEP", 100))
+    fsr = float(metrics.attrs.get("FSR", np.nan)) if "FSR" in metrics.attrs else np.nan
+    collapse = float(metrics.attrs.get("CollapseSeverity", np.nan)) if "CollapseSeverity" in metrics.attrs else np.nan
+    rsbi = float(metrics.attrs.get("RSBI", np.nan)) if "RSBI" in metrics.attrs else np.nan
+    rsp  = float(metrics.attrs.get("RSP",  np.nan)) if "RSP"  in metrics.attrs else np.nan
+
+    race_id = _make_race_id(race_date, race_track, race_no, int(race_distance_input), step)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys=ON;")
+    # Upsert race
+    conn.execute("""
+INSERT INTO races (race_id, date, track, race_no, distance_m, split_step, rsbi, rsp, fsr, collapse)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(race_id) DO UPDATE SET
+  date=excluded.date, track=excluded.track, race_no=excluded.race_no,
+  distance_m=excluded.distance_m, split_step=excluded.split_step,
+  rsbi=excluded.rsbi, rsp=excluded.rsp, fsr=excluded.fsr, collapse=excluded.collapse
+""", (race_id, race_date, race_track, int(race_no), int(race_distance_input), step, rsbi, rsp, fsr, collapse))
+
+    # Upsert performances from AM_view (already sorted and includes key fields)
+    for _, r in AM_view.fillna("").iterrows():
+        horse = _safe_str(r.get("Horse",""))
+        perf_id = _make_perf_id(race_id, horse)
+        conn.execute("""
+INSERT INTO performances
+(perf_id, race_id, horse, finish_pos, race_time_s, f200_idx, tsspi, accel, grind, grind_cg,
+ pi, gci, hidden, iai, bal, comp, ability, ability_tier, near_elite, direction, confidence, why_tier)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(perf_id) DO UPDATE SET
+  finish_pos=excluded.finish_pos, race_time_s=excluded.race_time_s, f200_idx=excluded.f200_idx,
+  tsspi=excluded.tsspi, accel=excluded.accel, grind=excluded.grind, grind_cg=excluded.grind_cg,
+  pi=excluded.pi, gci=excluded.gci, hidden=excluded.hidden, iai=excluded.iai, bal=excluded.bal,
+  comp=excluded.comp, ability=excluded.ability, ability_tier=excluded.ability_tier,
+  near_elite=excluded.near_elite, direction=excluded.direction, confidence=excluded.confidence,
+  why_tier=excluded.why_tier
+""", (
+    perf_id, race_id, horse,
+    _safe_int(r.get("Finish_Pos", 0)),
+    _safe_float(r.get("RaceTime_s", 0)),
+    _safe_float(r.get("F200_idx", 0)),
+    _safe_float(r.get("tsSPI", 0)),
+    _safe_float(r.get("Accel", 0)),
+    _safe_float(r.get("Grind", 0)),
+    _safe_float(metrics.get("Grind_CG", r.get("Grind")), 0),  # fallback
+    _safe_float(r.get("PI", 0)),
+    _safe_float(r.get("GCI", 0)),
+    _safe_float(r.get("HiddenScore", 0)),
+    _safe_float(r.get("IAI", 0)),
+    _safe_float(r.get("BAL", 0)),
+    _safe_float(r.get("COMP", 0)),
+    _safe_float(r.get("AbilityScore", 0)),
+    _safe_str(r.get("AbilityTier","")),
+    _safe_str(r.get("NearEliteFlag","")),
+    _safe_str(r.get("DirectionHint","")),
+    _safe_str(r.get("Confidence","")),
+    _safe_str(r.get("WhyTier",""))
+))
+    conn.commit()
+    conn.close()
+    st.success(f"Saved race '{race_id}' with {len(AM_view)} performances to {DB_PATH}.")
+
+if st.button("Save this race to DB"):
+    _save_current_race()
+
+# ---------- Quick horse search ----------
+st.markdown("### 🐎 Search horse in database")
+col1, col2 = st.columns([1.4, 0.6])
+with col1:
+    q_horse = st.text_input("Horse name (partial or exact):", value="")
+with col2:
+    limit_rows = st.number_input("Max rows", min_value=10, max_value=2000, step=10, value=200)
+
+def _search_by_horse(q: str, limit_n: int = 200):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("""
+SELECT p.horse, r.date, r.track, r.race_no, r.distance_m, r.split_step,
+       p.finish_pos, p.pi, p.gci, p.iai, p.hidden, p.ability, p.ability_tier,
+       p.near_elite, p.direction, p.confidence
+FROM performances p
+JOIN races r ON r.race_id = p.race_id
+WHERE p.horse LIKE ?
+ORDER BY r.date DESC, r.track, r.race_no
+LIMIT ?
+""", conn, params=[f"%{q}%", int(limit_n)])
+    conn.close()
+    return df
+
+if q_horse.strip():
+    dfq = _search_by_horse(q_horse.strip(), int(limit_rows))
+    if dfq.empty:
+        st.info("No matching records.")
+    else:
+        st.dataframe(dfq, use_container_width=True)
+        st.caption("Tip: use exact casing as saved; search is case-insensitive via LIKE.")
+
+# ---------- PDF Export ----------
+st.markdown("---")
+st.markdown("### 📥 Export Complete Race Report (PDF)")
+
+def _fmt_df_for_pdf(df: pd.DataFrame, num_cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in num_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:.3f}")
+    return out.fillna("").astype(str)
+
+def make_pdf_report(
+        *,
+        distance_m:int,
+        split_step:int,
+        metrics_table_df:pd.DataFrame,
+        ability_png:bytes|None,
+        shape_png:bytes|None,
+        pace_png:bytes|None,
+        ability_table_df:pd.DataFrame,
+        hidden_table_df:pd.DataFrame,
+        title:str,
+        rsbi:float|None=None,
+        rsp:float|None=None,
+        fsr:float|None=None,
+        collapse:float|None=None
+    ):
+    if not HAS_RL:
+        st.error("PDF export requires ReportLab. Install with:  pip install reportlab>=4")
+        return None
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=landscape(A4),
+        leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18
+    )
+    styles = getSampleStyleSheet()
+    H1, H3, P = styles["Heading1"], styles["Heading3"], styles["BodyText"]
+
+    story = []
+    # Header
+    hdr = f"<b>{title}</b> — {distance_m} m (step {split_step} m)"
+    story += [Paragraph(hdr, H1), Spacer(0, 6)]
+
+    # Diagnostics line
+    diag_bits = []
+    if rsbi is not None and np.isfinite(rsbi):
+        diag_bits.append(f"RSBI: {rsbi:+.2f}")
+    if rsp is not None and np.isfinite(rsp):
+        diag_bits.append(f"RSP: {rsp:.2f}")
+    if fsr is not None and np.isfinite(fsr):
+        diag_bits.append(f"FSR: {fsr:.3f}")
+    if collapse is not None and np.isfinite(collapse):
+        diag_bits.append(f"Collapse: {collapse:.1f} pts")
+    if diag_bits:
+        story += [Paragraph(" · ".join(diag_bits), P), Spacer(0, 4)]
+
+    # Sectional Metrics
+    story += [Paragraph("Sectional Metrics", H3)]
+    tbl_df = metrics_table_df.copy()
+    tbl_df = _fmt_df_for_pdf(tbl_df, ["RaceTime_s","F200_idx","tsSPI","Accel","Grind","Grind_CG","GrindAdjPts","PI","GCI"])
+    data = [list(tbl_df.columns)] + tbl_df.values.tolist()
+    t = Table(data, repeatRows=1, colWidths=None)
+    t.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+        ('FONTSIZE',(0,0),(-1,0),9),
+        ('FONTSIZE',(0,1),(-1,-1),8),
+        ('ALIGN',(2,1),(-1,-1),'RIGHT'),
+        ('GRID',(0,0),(-1,-1),0.25,colors.whitesmoke),
+        ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.whitesmoke, colors.white])
+    ]))
+    story += [t, Spacer(0, 8)]
+
+    # Images
+    if shape_png:
+        story += [Paragraph("Sectional Shape Map", H3)]
+        story += [Image(io.BytesIO(shape_png), width=24*cm, height=18*cm, kind="proportional"), Spacer(0, 6)]
+    if pace_png:
+        story += [Paragraph("Pace Curve", H3)]
+        story += [Image(io.BytesIO(pace_png), width=24*cm, height=15*cm, kind="proportional"), Spacer(0, 6)]
+    if ability_png:
+        story += [Paragraph("Ability Matrix", H3)]
+        story += [Image(io.BytesIO(ability_png), width=24*cm, height=16*cm, kind="proportional"), Spacer(0, 6)]
+
+    # Hidden Horses — flagged only
+    story += [Paragraph("Hidden Horses (flagged)", H3)]
+    flagged = hidden_table_df[hidden_table_df["Tier"] != ""].copy()
+    if not flagged.empty:
+        hh_tbl = flagged.copy()
+        hh_tbl = _fmt_df_for_pdf(hh_tbl, ["PI","GCI","tsSPI","Accel","Grind","HiddenScore","SOS","ASI2","TFS","UEI"])
+        data_hh = [list(hh_tbl.columns)] + hh_tbl.values.tolist()
+        t2 = Table(data_hh, repeatRows=1)
+        t2.setStyle(TableStyle([
+            ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
+            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+            ('FONTSIZE',(0,0),(-1,0),9),
+            ('FONTSIZE',(0,1),(-1,-1),8),
+            ('ALIGN',(2,1),(-1,-1),'RIGHT'),
+            ('GRID',(0,0),(-1,-1),0.25,colors.whitesmoke),
+            ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.whitesmoke, colors.white])
+        ]))
+        story += [t2, Spacer(0, 6)]
+    else:
+        story += [Paragraph("No horses flagged as Hidden in this race.", P), Spacer(0, 6)]
+
+    # Ability Matrix Table — full AM_view with key columns
+    story += [Paragraph("Ability Matrix — Table", H3)]
+    am_tbl = ability_table_df.copy()
+    num_cols = ["IAI","HiddenScore","BAL","COMP","AbilityScore","PI","GCI"]
+    for c in num_cols:
+        if c in am_tbl.columns:
+            am_tbl[c] = pd.to_numeric(am_tbl[c], errors="coerce").map(lambda x: "" if pd.isna(x) else f"{float(x):.2f}")
+    data_am = [list(am_tbl.columns)] + am_tbl.fillna("").astype(str).values.tolist()
+    t3 = Table(data_am, repeatRows=1)
+    t3.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+        ('FONTSIZE',(0,0),(-1,0),9),
+        ('FONTSIZE',(0,1),(-1,-1),8),
+        ('ALIGN',(2,1),(-1,-1),'RIGHT'),
+        ('GRID',(0,0),(-1,-1),0.25,colors.whitesmoke),
+        ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.whitesmoke, colors.white])
+    ]))
+    story += [t3, Spacer(0, 6)]
+
+    # Footnote
+    story += [Paragraph(
+        "Notes: Indices are vs-field (100 = par). CG = Corrected Grind with collapse adjustment. "
+        "Ability tiers are strict; ‘⭐ Near-Elite’ indicates close to group-level thresholds.",
+        P
+    )]
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+colL, colR = st.columns([1.2, 0.8])
+with colL:
+    pdf_title = race_title_override.strip() or f"Race Analysis — {int(race_distance_input)} m"
+with colR:
+    gen_pdf = st.button("Generate PDF Report")
+
+if gen_pdf:
+    pdf_buf = make_pdf_report(
+        distance_m=int(race_distance_input),
+        split_step=int(metrics.attrs.get("STEP", 100)),
+        metrics_table_df=display_df,
+        ability_png=ability_png,
+        shape_png=shape_map_png,
+        pace_png=pace_png,
+        ability_table_df=AM_view[["Horse","Finish_Pos","IAI","HiddenScore","BAL","COMP","AbilityScore","AbilityTier","NearEliteFlag","DirectionHint","Confidence","PI","GCI"]],
+        hidden_table_df=hh_view,
+        title=pdf_title,
+        rsbi=metrics.attrs.get("RSBI", None),
+        rsp=metrics.attrs.get("RSP", None),
+        fsr=metrics.attrs.get("FSR", None),
+        collapse=metrics.attrs.get("CollapseSeverity", None)
+    )
+    if pdf_buf is not None:
+        st.download_button(
+            "📥 Download PDF",
+            data=pdf_buf.getvalue(),
+            file_name=f"RaceEdge_{int(race_distance_input)}m_Report.pdf",
+            mime="application/pdf"
+        )
