@@ -1053,3 +1053,73 @@ if not plot_df.empty:
     cbar=figA.colorbar(sc,ax=axA,fraction=0.05,pad=0.04); cbar.set_label("BAL (100 = balanced late)")
     axA.grid(True,linestyle=":",alpha=0.25)
     st.pyplot(figA)
+    # ---------- Ability Matrix table + CSV download ----------
+# (place this right after the Ability Matrix v2 plot block)
+
+# Small helper used in the tier explainer
+def _in_range(x, lo, hi):
+    try:
+        x = float(x)
+        return np.isfinite(x) and (lo <= x <= hi)
+    except Exception:
+        return False
+
+def _why_tier_row(r):
+    conf_ok = str(r.get("Confidence","")).strip() in ("High","Med")
+    parts = []
+    try:
+        parts.append(f"IAI {float(r['IAI']):.2f} {'✅' if float(r['IAI'])>=elite_iai_floor else '❌'}")
+    except: parts.append("IAI —")
+    try:
+        parts.append(f"PI {float(r['PI']):.2f} {'✅' if float(r['PI'])>=7.2 else '❌'}")
+    except: parts.append("PI —")
+    try:
+        parts.append(f"GCI {float(r['GCI']):.2f} {'✅' if float(r['GCI'])>=6.0 else '❌'}")
+    except: parts.append("GCI —")
+    try:
+        parts.append(f"IAI_pct {float(r['IAI_pct']):.2f} {'✅' if float(r['IAI_pct'])>=elite_pct_floor else '❌'}")
+    except: parts.append("IAI_pct —")
+    try:
+        parts.append(f"BAL {float(r['BAL']):.1f} {'✅' if _in_range(r['BAL'],98,104) else '❌'}")
+    except: parts.append("BAL —")
+    parts.append(f"Conf {r.get('Confidence','')} {'✅' if conf_ok else '❌'}")
+    return " · ".join(parts)
+
+# Sprint/Stayer direction hint (uses active grind column)
+_gr = metrics.attrs.get("GR_COL","Grind")
+def _dir_hint_row(r):
+    try:
+        dv = float(r.get("Accel", np.nan)) - float(r.get(_gr, np.nan))
+        if not np.isfinite(dv): return ""
+        if dv >= 2.0:  return "⚡ Sprint-lean (turn of foot)"
+        if dv <= -2.0: return "🪨 Stayer-lean (sustained)"
+        return "⚖ Balanced"
+    except Exception:
+        return ""
+
+AM["WhyTier"] = AM.apply(_why_tier_row, axis=1)
+if "DirectionHint" not in AM.columns:
+    AM["DirectionHint"] = AM.apply(_dir_hint_row, axis=1)
+
+# Final view (sorted & tidy)
+am_cols = [
+    "Horse","Finish_Pos",
+    "IAI","HiddenScore","BAL","COMP",
+    "AbilityScore","AbilityTier","NearEliteFlag","WhyTier",
+    "DirectionHint","Confidence","PI","GCI"
+]
+for c in am_cols:
+    if c not in AM.columns:
+        AM[c] = np.nan
+
+AM_view = AM.sort_values(
+    ["AbilityTier","AbilityScore","PI","Finish_Pos"],
+    ascending=[True, False, False, True]
+)[am_cols]
+
+st.markdown("### Ability Matrix — table view")
+st.dataframe(AM_view, use_container_width=True)
+
+# Optional: download the table as CSV
+csv_bytes = AM_view.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download Ability Matrix (CSV)", csv_bytes, "ability_matrix_v2.csv", "text/csv")
