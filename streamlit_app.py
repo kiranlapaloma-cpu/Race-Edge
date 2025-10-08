@@ -874,6 +874,124 @@ else:
         shape_map_png=buf.getvalue()
         st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
         st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
+
+# ======================= Visual 2: Pace Curve — robust to missing data =======================
+st.markdown("## Pace Curve — field average (black) + Top 8 finishers (robust)")
+
+pace_png = None
+STEP = metrics.attrs.get("STEP", 100)
+
+def _build_segs(df, distance_m:int, step:int):
+    wanted = [m for m in range(int(distance_m) - step, step-1, -step)]
+    segs = []
+    for m in wanted:
+        c = f"{m}_Time"
+        if c in df.columns:
+            segs.append((m+step, m, float(step), c))
+    if "Finish_Time" in df.columns:
+        segs.append((step, 0, float(step), "Finish_Time"))
+    return segs
+
+if seg_markers or ("Finish_Time" in work.columns):
+    segs_raw = _build_segs(work, int(race_distance_input), STEP)
+    if len(segs_raw) == 0:
+        st.info("Not enough *_Time columns to draw the pace curve.")
+    else:
+        # Keep only segments with at least one valid time across the field
+        def _has_valid(col):
+            s = pd.to_numeric(work[col], errors="coerce")
+            return bool((s > 0).any())
+        segs = [(s,e,L,c) for (s,e,L,c) in segs_raw if _has_valid(c)]
+
+        if len(segs) < 2:
+            st.info("Too few usable segments after filtering missing/zero times.")
+        else:
+            # Compute speeds with NaNs where missing, then robust means
+            cols = [c for (_,_,_,c) in segs]
+            times_df = work[cols].apply(pd.to_numeric, errors="coerce").clip(lower=0).replace(0, np.nan)
+            speed_df = pd.DataFrame(index=work.index)
+            for (s,e,L,c) in segs:
+                speed_df[c] = L / times_df[c]
+
+            # Field average: nanmean across runners for each segment
+            field_avg = np.array([np.nanmean(speed_df[c].to_numpy()) for c in cols])
+            # If the entire array is NaN, abort gracefully
+            if not np.isfinite(field_avg).any():
+                st.info("Pace curve cannot render: all segments are empty after cleaning.")
+            else:
+                # Choose top-8 to draw
+                if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
+                    top8 = metrics.sort_values("Finish_Pos").head(8)
+                    top8_rule = "Top-8 by Finish_Pos"
+                else:
+                    top8 = metrics.sort_values("PI", ascending=False).head(8)
+                    top8_rule = "Top-8 by PI"
+
+                # X axis labels
+                x_idx = list(range(len(segs)))
+                def seg_label(s, e, c):
+                    return f"{int(s)}→{int(e)}" if c != "Finish_Time" else f"{STEP}→0 (Finish)"
+                x_labels = [seg_label(s,e,c) for (s,e,_,c) in segs]
+
+                # Plot
+                fig2, ax2 = plt.subplots(figsize=(9.2, 5.4), layout="constrained")
+
+                # Field average line (ignore NaNs; matplotlib will gap them)
+                ax2.plot(
+                    x_idx, field_avg, linewidth=2.2, color="black",
+                    label="Field average", marker=None
+                )
+
+                # Plot horses with at least two finite points so we get a line, not noise
+                palette = color_cycle(len(top8))
+                plotted_any = False
+                for i, (_, r) in enumerate(top8.iterrows()):
+                    # locate the row with raw times (by Horse if present)
+                    if "Horse" in work.columns and "Horse" in metrics.columns:
+                        row0 = work[work["Horse"] == r.get("Horse")]
+                        row_times = row0.iloc[0] if not row0.empty else r
+                    else:
+                        row_times = r
+
+                    y_vals = []
+                    for (_, _, L, c) in segs:
+                        t = pd.to_numeric(row_times.get(c, np.nan), errors="coerce")
+                        y_vals.append(L / t if pd.notna(t) and t > 0 else np.nan)
+
+                    finite_count = np.isfinite(y_vals).sum()
+                    if finite_count >= 2:
+                        ax2.plot(
+                            x_idx, y_vals, linewidth=1.1, marker="o", markersize=2.6,
+                            label=str(r.get("Horse", "")), color=palette[i]
+                        )
+                        plotted_any = True
+
+                # Labels & legend
+                ax2.set_xticks(x_idx)
+                ax2.set_xticklabels(x_labels, rotation=45, ha="right")
+                ax2.set_ylabel("Speed (m/s)")
+                ax2.set_title("Pace over segments (left = early; right = home straight; handles gaps)")
+                ax2.grid(True, linestyle="--", alpha=0.30)
+
+                # If no horses could be plotted, just show the field average in the legend
+                if plotted_any:
+                    ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, frameon=False, fontsize=9)
+                else:
+                    ax2.legend(loc="upper left", frameon=False, fontsize=9)
+
+                st.pyplot(fig2)
+
+                # Download
+                buf = io.BytesIO()
+                fig2.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
+                pace_png = buf.getvalue()
+                st.download_button("Download pace curve (PNG)", pace_png,
+                                   file_name="pace_curve.png", mime="image/png")
+
+                st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly. Missing splits are left blank (gaps).")
+else:
+    st.info("Not enough *_Time columns to draw the pace curve.")
+    
         # ======================= Hidden Horses (v2, shape-aware) =======================
 st.markdown("## Hidden Horses v2 (Shape-aware)")
 
