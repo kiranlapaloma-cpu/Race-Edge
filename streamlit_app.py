@@ -1065,12 +1065,5 @@ for c in am_cols:
         AM[c] = np.nan
 AM_view = AM.sort_values(["AbilityScore","PI","Finish_Pos"], ascending=[False, False, True])[am_cols]
 st.dataframe(AM_view, use_container_width=True)
-# ---------- Table ----------
-am_cols = ["Horse","Finish_Pos","IAI","HiddenScore","BAL","COMP","AbilityScore","AbilityTier","DirectionHint","Confidence","PI"]
-for c in am_cols:
-    if c not in AM.columns:
-        AM[c] = np.nan
-AM_view = AM.sort_values(["AbilityScore","PI","Finish_Pos"], ascending=[False, False, True])[am_cols]
-st.dataframe(AM_view, use_container_width=True)
 
 # ------------------ Hand-off to Batch 4 (DB save/search + PDF) ------------------
