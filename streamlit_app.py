@@ -292,10 +292,11 @@ if split_step == 200:
 # -------------------------------------------------------------------------
 # Hand-off: Batch 2 will compute metrics and the Race Shape module (SED/FRA/SCI)
 # -------------------------------------------------------------------------
-# ======================= Batch 2 — Metrics Engine + Race Shape (SED/SCI/FRA) =======================
+# ======================= Batch 2 — Metrics Engine + Race Shape v2 =======================
 import math
 import numpy as np
 import pandas as pd
+from dataclasses import dataclass
 
 # -------- Stage helpers (100m/200m aware) --------
 def collect_markers(df):
@@ -392,7 +393,7 @@ def pi_weights_distance_and_context(distance_m: float,
     grd_med = float(grd_median) if grd_median is not None else None
     if acc_med is not None and grd_med is not None and math.isfinite(acc_med) and math.isfinite(grd_med):
         bias = acc_med - grd_med
-        scale = math.tanh(abs(bias) / 6.0)          # sensitivity curve
+        scale = math.tanh(abs(bias) / 6.0)
         max_shift = 0.02 * scale
         F200 = base["F200_idx"]; ts = base["tsSPI"]; ACC = base["Accel"]; GR = base["Grind"]
         if bias > 0:           # race rewarded acceleration → rebalance a touch toward Grind
@@ -410,10 +411,7 @@ def pi_weights_distance_and_context(distance_m: float,
         base = {k: v / s for k, v in base.items()}
     return base
 
-# -------- Metric builder (handles 100m and 200m) --------
-# -------- Race Shape v2 (adaptive + confirm + bootstrap) --------
-from dataclasses import dataclass
-
+# ---------- Race Shape v2 (adaptive + confirm + bootstrap) ----------
 @dataclass
 class RaceShapeResult:
     label: str
@@ -513,6 +511,7 @@ def classify_race_shape_v2(metrics_df: pd.DataFrame, *, distance_m: int,
     )
     return RaceShapeResult(label=final_label, confidence=float(conf), details=details)
 
+# -------- Metric builder (handles 100m and 200m) --------
 def build_metrics_and_shape(df_in: pd.DataFrame,
                             D_actual_m: float,
                             step: int,
@@ -722,18 +721,15 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["GCI"] = gci_vals
 
     # ---------- RACE SHAPE v2 (classification + FRA using confidence) ----------
-    # Defaults (if module is off)
     shape_tag = "OFF" if not use_race_shape else "EVEN"
     sci = 1.0
     fra_applied = 0
 
-    # Always have shape-adjusted mirrors,
-    # start equal to raw PI/GCI and adjust only if needed.
+    # Mirrors; start equal to raw
     w["PI_RS"]  = w["PI"].astype(float)
     w["GCI_RS"] = w["GCI"].astype(float)
 
     if use_race_shape:
-        # classify using v2 (after GR_COL is known and PI/GCI precomputed)
         rs_res = classify_race_shape_v2(
             w,
             distance_m=int(D),
@@ -741,38 +737,26 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
             fsr=w.attrs.get("FSR", np.nan) if hasattr(w, "attrs") else np.nan
         )
         shape_tag = rs_res.label
-        sci = float(rs_res.confidence)  # reuse as SCI (0..1)
+        sci = float(rs_res.confidence)
 
-        # False-Run Adjustment (soft; scaled by confidence and by horse-specific evidence)
-        # We use late composite = mean(Accel, GR_COL) as “late_excess”.
-        late_comp = (pd.to_numeric(w["Accel"], errors="coerce") + pd.to_numeric(w[GR_COL], errors="coerce"))/2.0
+        # late/early evidence
+        late_comp   = (pd.to_numeric(w["Accel"], errors="coerce") + pd.to_numeric(w[GR_COL], errors="coerce"))/2.0
         late_excess = (late_comp - 100.0).clip(lower=0.0, upper=8.0).fillna(0.0)
-
-        # "sturdiness" for Fast-Early (credit grinders that weren’t flattered)
-        sturdiness = (
-            (pd.to_numeric(w[GR_COL], errors="coerce") - 100.0) -
-            (100.0 - pd.to_numeric(w["Accel"], errors="coerce")).clip(lower=0.0)
-        ).clip(lower=0.0, upper=6.0).fillna(0.0)
+        sturdiness  = ((pd.to_numeric(w[GR_COL], errors="coerce") - 100.0) -
+                       (100.0 - pd.to_numeric(w["Accel"], errors="coerce")).clip(lower=0.0)).clip(0.0, 6.0).fillna(0.0)
 
         if shape_tag == "Slow-Early":
-            # Sprint-home false run: tick down inflated late closers
-            # Base impact 10–18% of a PI/GCI band, scaled by SCI and late_excess
             k = 0.10 + 0.08 * max(0.0, sci - 0.60) / 0.40
             w["PI_RS"]  = (w["PI"]  - k * (late_excess / 4.0)).clip(0.0, 10.0)
             w["GCI_RS"] = (w["GCI"] - k * (late_excess / 3.0)).clip(0.0, 10.0)
             fra_applied = 1
-
         elif shape_tag == "Fast-Early":
-            # Strong early speed: small credit to hardy/grinders
             k = 0.08 + 0.07 * max(0.0, sci - 0.60) / 0.40
             w["PI_RS"]  = (w["PI"]  + k * (sturdiness / 4.0)).clip(0.0, 10.0)
             w["GCI_RS"] = (w["GCI"] + k * (sturdiness / 3.0)).clip(0.0, 10.0)
             fra_applied = 1
-
         elif shape_tag in ("Fast-Mid","Slow-Mid"):
-            # Mid-race distortion — keep it very light and symmetric
             km = 0.05 * sci
-            # use deviation of tsSPI from 100 as the mid “excess”
             mid_excess = (pd.to_numeric(w["tsSPI"], errors="coerce") - 100.0).abs().clip(0.0, 6.0).fillna(0.0)
             if shape_tag == "Fast-Mid":
                 w["PI_RS"]  = (w["PI"]  - km * (mid_excess / 4.0)).clip(0.0, 10.0)
@@ -782,12 +766,8 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
                 w["GCI_RS"] = (w["GCI"] + km * (mid_excess / 3.0)).clip(0.0, 10.0)
             fra_applied = 1
 
-    # record attrs (used by headers/UI later)
-    w.attrs["SHAPE_TAG"]   = shape_tag
-    w.attrs["SCI"]         = float(sci)
-    w.attrs["FRA_APPLIED"] = int(fra_applied)
     # ---------- Final rounding ----------
-    for c in ["F200_idx","tsSPI","Accel","Grind","Grind_CG","PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts","EARLY_idx","LATE_idx"]:
+    for c in ["F200_idx","tsSPI","Accel","Grind","Grind_CG","PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
         if c in w.columns:
             w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
 
@@ -848,11 +828,10 @@ if split_step == 200:
 
 # ======================= Sectional Metrics table (incl. RS columns) =====================
 st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
-
 show_cols = [
     "Horse", "Finish_Pos", "RaceTime_s",
     "F200_idx", "tsSPI", "Accel", "Grind", "Grind_CG",
-    "EARLY_idx", "LATE_idx", "GrindAdjPts", "DeltaG",
+    "GrindAdjPts", "DeltaG",
     "PI", "PI_RS", "GCI", "GCI_RS"
 ]
 for c in show_cols:
@@ -870,8 +849,7 @@ st.caption(
     f"CG={'ON' if USE_CG else 'OFF'} (FSR={metrics.attrs.get('FSR',1.0):.3f}; Collapse={metrics.attrs.get('CollapseSeverity',0.0):.1f}).  "
     f"Race Shape={metrics.attrs.get('SHAPE_TAG','EVEN')} (SCI={metrics.attrs.get('SCI',1.0):.2f}; FRA={'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'})."
 )
-
-# (Batch 3 will add visuals, Hidden v2, Ability v2, using PI_RS/GCI_RS where relevant)
+# ===================== end of Batch 2 =====================
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
 from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
