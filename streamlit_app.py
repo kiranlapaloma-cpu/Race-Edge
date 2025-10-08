@@ -407,11 +407,13 @@ def pi_weights_distance_and_context(distance_m: float,
         base = {k: v / s for k, v in base.items()}
     return base
 
-# ---------------- Race Shape v2.1 (indices + absolute-speed fallback) ----------------
+# ---------- Race Shape v2.2 (balanced thresholds; bias-aware) ----------
+from dataclasses import dataclass
+
 @dataclass
 class RaceShapeResult:
-    label: str         # "Fast-Early", "Slow-Early", "Fast-Mid", "Slow-Mid", "Even"
-    confidence: float  # 0..1
+    label: str
+    confidence: float
     details: dict
 
 def _mad_v2(arr):
@@ -421,109 +423,92 @@ def _mad_v2(arr):
     med = np.median(x)
     return 1.4826 * np.median(np.abs(x - med))
 
-def classify_race_shape_v2_1(df: pd.DataFrame, *, distance_m: int, gr_col: str,
+def classify_race_shape_v2_2(df: pd.DataFrame, *, distance_m: int, gr_col: str,
                              fsr: float | None, step: int,
                              min_valid_frac: float = 0.60,
                              boot_n: int = 200, rng_seed: int = 17) -> RaceShapeResult:
+    """Improved: harder to trigger Slow-Early; uses both index + absolute speeds."""
     E = pd.to_numeric(df.get("F200_idx"), errors="coerce")
-    M = pd.to_numeric(df.get("tsSPI"),    errors="coerce")
-    A = pd.to_numeric(df.get("Accel"),    errors="coerce")
-    G = pd.to_numeric(df.get(gr_col),     errors="coerce")
+    M = pd.to_numeric(df.get("tsSPI"), errors="coerce")
+    A = pd.to_numeric(df.get("Accel"), errors="coerce")
+    G = pd.to_numeric(df.get(gr_col), errors="coerce")
     L = 0.6*A + 0.4*G
 
-    n = len(df)
-    vE, vM, vL = float(E.notna().mean()), float(M.notna().mean()), float(L.notna().mean())
-    E_med, M_med, L_med = map(lambda s: float(np.nanmedian(s)), (E, M, L))
-    dE, dM, dL = E_med - 100.0, M_med - 100.0, L_med - 100.0
+    # ----- field medians vs 100 baseline -----
+    E_med, M_med, L_med = map(lambda s: float(np.nanmedian(s)), (E,M,L))
+    dE, dM, dL = E_med-100.0, M_med-100.0, L_med-100.0
 
     def gate_from(series):
-        d = pd.to_numeric(series, errors="coerce") - 100.0
-        s = _mad_v2(d);  s = 2.0 if (not np.isfinite(s) or s <= 0) else s
-        return max(2.0, 0.6*s)
+        s = _mad_v2(series-100.0)
+        if not np.isfinite(s) or s<=0: s=2.5
+        return max(2.5,0.6*s)
 
-    gE, gM, gL = gate_from(E), gate_from(M), gate_from(L)
+    gE,gM,gL = map(gate_from,(E,M,L))
+    # scale by distance
+    if distance_m<=1200: scale=1.0
+    elif distance_m<1800: scale=1.1
+    else: scale=1.25
+    gE*=scale; gM*=scale; gL*=scale
 
-    if distance_m <= 1200: scale = 1.00
-    elif distance_m < 1800: scale = 1.15
-    else: scale = 1.30
-    gE *= scale; gM *= scale; gL *= scale
+    # widen gates on low data quality
+    for v,g in zip((E,M,L),(gE,gM,gL)):
+        if v.notna().mean()<min_valid_frac: g+=0.5
 
-    if vE < min_valid_frac: gE += 0.5
-    if vM < min_valid_frac: gM += 0.5
-    if vL < min_valid_frac: gL += 0.5
+    # confirm modifiers
+    bump_fast=bump_slow=0.0
+    if fsr and np.isfinite(fsr):
+        if fsr<0.98: bump_fast+=0.05
+        elif fsr>1.02: bump_slow+=0.05
 
-    leader_E = float(np.nanmax(E)) if E.notna().any() else np.nan
-    fsr = float(fsr) if (fsr is not None and np.isfinite(fsr)) else np.nan
-    bump_fast = 0.0; bump_slow = 0.0
-    if np.isfinite(leader_E) and np.isfinite(E_med) and (leader_E - E_med) >= 1.0:
-        bump_fast += 0.10
-    if np.isfinite(fsr):
-        if fsr < 0.98: bump_fast += 0.10   # finish weaker than Accel → fast early
-        if fsr > 1.02: bump_slow += 0.10
-
-    def decide(ddE, ddM, ddL):
-        if (ddE >= gE) and (ddL <= -(gL - 0.5)): return "Fast-Early"
-        if (ddE <= -gE) and (ddL >= +(gL - 0.5)): return "Slow-Early"
-        if (ddM >= gM) and (abs(ddE) < gE*0.6) and (abs(ddL) < gL*0.6): return "Fast-Mid"
-        if (ddM <= -gM) and (abs(ddE) < gE*0.6) and (abs(ddL) < gL*0.6): return "Slow-Mid"
+    # ----- core decision -----
+    MARGIN=0.7  # makes “Slow-Early” stricter
+    def decide(de,dm,dl):
+        if (de>=gE+MARGIN) and (dl<=-(gL+MARGIN)): return "Fast-Early"
+        if (de<=-(gE+MARGIN)) and (dl>=+(gL+MARGIN)): return "Slow-Early"
+        if (dm>=gM+MARGIN) and (abs(de)<0.6*gE) and (abs(dl)<0.6*gL): return "Fast-Mid"
+        if (dm<=-(gM+MARGIN)) and (abs(de)<0.6*gE) and (abs(dl)<0.6*gL): return "Slow-Mid"
         return "Even"
 
-    base_label = decide(dE, dM, dL)
+    base_label=decide(dE,dM,dL)
 
-    # Absolute-speed fallback (uses *_spd fields built below)
-    early_spd = float(pd.to_numeric(df.get("_EARLY_spd"), errors="coerce").mean(skipna=True)) if "_EARLY_spd" in df.columns else np.nan
-    if "_ACC_spd" in df.columns and "_GR_spd" in df.columns:
-        late_spd = float(
-            0.6 * pd.to_numeric(df["_ACC_spd"], errors="coerce").mean(skipna=True) +
-            0.4 * pd.to_numeric(df["_GR_spd"],  errors="coerce").mean(skipna=True)
-        )
-    else:
-        late_spd = np.nan
+    # ----- absolute-speed cross-check -----
+    early_spd=float(pd.to_numeric(df.get("_EARLY_spd"),errors="coerce").mean(skipna=True))
+    late_spd=float(pd.to_numeric(df.get("_ACC_spd"),errors="coerce").mean(skipna=True))
+    abs_override=None
+    if np.isfinite(early_spd) and np.isfinite(late_spd) and early_spd>0:
+        ratio=late_spd/early_spd
+        if ratio<=0.93: abs_override="Fast-Early"
+        elif ratio>=1.07: abs_override="Slow-Early"
 
-    abs_override = None
-    if np.isfinite(early_spd) and np.isfinite(late_spd) and early_spd > 0:
-        drop_pct = (early_spd - late_spd) / early_spd
-        rise_pct = (late_spd - early_spd) / early_spd
-        if drop_pct >= 0.07:        # ≥7% slower late than early
-            abs_override = "Fast-Early"
-        elif rise_pct >= 0.07:      # ≥7% faster late than early
-            abs_override = "Slow-Early"
-
-    # Bootstrap over medians
-    final_label = base_label
-    conf = 0.60
-    if n >= 6 and boot_n:
-        rng = np.random.default_rng(rng_seed)
-        idx = df.index.to_numpy()
-        labs = []
+    # ----- bootstrap confidence -----
+    n=len(df); conf=0.6; final_label=base_label
+    if n>=6 and boot_n:
+        rng=np.random.default_rng(rng_seed)
+        idx=df.index.to_numpy()
+        labs=[]
         for _ in range(boot_n):
-            take = rng.choice(idx, size=idx.size, replace=True)
-            Ee = float(np.nanmedian(E.loc[take])); Mm = float(np.nanmedian(M.loc[take])); Ll = float(np.nanmedian(L.loc[take]))
-            labs.append(decide(Ee-100.0, Mm-100.0, Ll-100.0))
+            take=rng.choice(idx,size=n,replace=True)
+            Ee,Mm,Ll=(float(np.nanmedian(E.loc[take])),
+                      float(np.nanmedian(M.loc[take])),
+                      float(np.nanmedian(L.loc[take])))
+            labs.append(decide(Ee-100.0,Mm-100.0,Ll-100.0))
         from collections import Counter
-        c = Counter(labs)
-        if bump_fast > 0: c["Fast-Early"] += int(boot_n*0.03)
-        if bump_slow > 0: c["Slow-Early"] += int(boot_n*0.03)
-        final_label, count = max(c.items(), key=lambda kv: kv[1])
-        conf = count / float(sum(c.values()))
+        c=Counter(labs)
+        if bump_fast>0:c["Fast-Early"]+=int(boot_n*0.03)
+        if bump_slow>0:c["Slow-Early"]+=int(boot_n*0.03)
+        final_label,count=max(c.items(),key=lambda kv:kv[1])
+        conf=count/sum(c.values())
 
-    if abs_override and final_label == "Even":
-        final_label = abs_override
-        conf = max(conf, 0.70)
+    if abs_override and final_label=="Even":
+        final_label=abs_override; conf=max(conf,0.7)
 
-    if final_label == "Fast-Early": conf = min(1.0, conf + bump_fast)
-    if final_label == "Slow-Early": conf = min(1.0, conf + bump_slow)
-
-    details = dict(
-        medians=dict(E=E_med, M=M_med, L=L_med),
-        deltas=dict(dE=dE, dM=dM, dL=dL),
-        gates=dict(gE=gE, gM=gM, gL=gL),
-        valid_frac=dict(E=vE, M=vM, L=vL),
-        leader_E=leader_E, fsr=fsr,
-        early_spd=early_spd, late_spd=late_spd,
-        base_label=base_label, abs_override=abs_override
+    details=dict(
+        medians=dict(E=E_med,M=M_med,L=L_med),
+        deltas=dict(dE=dE,dM=dM,dL=dL),
+        gates=dict(gE=gE,gM=gM,gL=gL),
+        fsr=fsr,abs_override=abs_override
     )
-    return RaceShapeResult(label=final_label, confidence=float(conf), details=details)
+    return RaceShapeResult(label=final_label,confidence=float(conf),details=details)
 
 # -------- Metric builder (handles 100m and 200m) --------
 def build_metrics_and_shape(df_in: pd.DataFrame,
