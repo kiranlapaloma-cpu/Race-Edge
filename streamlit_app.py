@@ -1018,7 +1018,15 @@ else:
         sizes = 60.0 + (plot_df["PI"].clip(0,10) / 10.0) * 200.0
         vmin, vmax = float(plot_df["BAL"].min()), float(plot_df["BAL"].max())
         if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
-            vmin, vmax = 95.0, 105.0
+            # Replace the vmin/vmax/norm section in Shape Map with:
+vmin = float(np.nanmin(cv)) if np.isfinite(cv).any() else -1.0
+vmax = float(np.nanmax(cv)) if np.isfinite(cv).any() else  1.0
+if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+    vmin, vmax = -1.0, 1.0
+EPS = 0.1
+if vmax <= 0.0: vmax = 0.0 + EPS
+if vmin >= 0.0: vmin = 0.0 - EPS
+norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
         norm = TwoSlopeNorm(vcenter=100.0, vmin=vmin, vmax=vmax)
 
         figA, axA = plt.subplots(figsize=(8.6, 6.0))
