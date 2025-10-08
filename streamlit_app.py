@@ -968,102 +968,158 @@ def pct_rank(s):
     r = s.rank(pct=True, method="average")
     return r.fillna(0.0).clip(0.0,1.0)
 
-AM["IAI_pct"]  = pct_rank(AM["IAI"])            # stronger engine → higher
-AM["HID_pct"]  = pct_rank(AM["HiddenScore"])    # hidden upside vs field
-AM["BAL_pct"]  = 1.0 - pct_rank((AM["BAL"] - 100.0).abs())   # closer to 100 → higher
+# ===== Strict Ability v2 — score (with hidden caps) + gate-based tiers =====
+
+# --- Percentile features (within-race) ---
+def pct_rank(s):
+    s = pd.to_numeric(s, errors="coerce")
+    return s.rank(pct=True, method="average").fillna(0.0).clip(0.0, 1.0)
+
+AM["IAI_pct"]  = pct_rank(AM["IAI"])                      # stronger engine → higher
+AM["HID_pct"]  = pct_rank(AM["HiddenScore"])              # hidden upside vs field
+AM["BAL_pct"]  = 1.0 - pct_rank((AM["BAL"]  - 100.0).abs())  # closer to 100 → higher
 AM["COMP_pct"] = 1.0 - pct_rank((AM["COMP"] - 100.0).abs())  # steadier → higher
 
-# Composite Ability Score (0–10, smoothed)
+# --- Hidden contribution caps (prevents hidden-only elites) ---
+def hidden_scale(iai):
+    iai = float(iai) if pd.notna(iai) else np.nan
+    if not np.isfinite(iai): return 0.0
+    if iai < 101.0:  return 0.25   # average engines: very small hidden credit
+    if iai < 101.5:  return 0.50   # decent engines: partial hidden credit
+    return 1.00                    # strong engines: full hidden credit
+
+AM["_hid_scale"] = AM["IAI"].map(hidden_scale)
+
+# --- Composite AbilityScore (0–10) still useful for ordering/plot) ---
 AM["AbilityScore"] = (
       6.5 * AM["IAI_pct"]
-    + 2.5 * AM["HID_pct"]
+    + 2.5 * (AM["HID_pct"] * AM["_hid_scale"])
     + 0.6 * AM["BAL_pct"]
     + 0.4 * AM["COMP_pct"]
 ).clip(0.0, 10.0).round(2)
 
-def ability_tier(x):
-    if pd.isna(x): return ""
-    if x >= 7.5:   return "🥇 Elite"
-    if x >= 6.2:   return "🥈 High"
-    if x >= 4.8:   return "🥉 Competitive"
+# --- Strict tiers (Section E) ---
+# Gates:
+# 🥇 Elite if all:
+#   IAI ≥ 101.8 (or ≥ 102.0 if small field ≤7)
+#   PI ≥ 7.2
+#   GCI ≥ 6.0
+#   IAI_pct ≥ 0.85 (or ≥ 0.90 if small field ≤7)
+#   BAL in [98, 104]
+#   Confidence ∈ {High, Med}
+# 🥈 High if all:
+#   IAI ≥ 101.0
+#   PI ≥ 6.2
+#   IAI_pct ≥ 0.70
+#   BAL in [97, 105]
+# 🥉 Competitive if any:
+#   IAI ≥ 100.4  or  IAI_pct ≥ 0.55  or  PI ≥ 5.4
+# else Ordinary.
+
+# Derived knobs
+field_n = int(len(AM.index))
+small_field = field_n <= 7
+elite_iai_floor = 102.0 if small_field else 101.8
+elite_pct_floor = 0.90  if small_field else 0.85
+
+def in_range(x, lo, hi):
+    x = float(x) if pd.notna(x) else np.nan
+    return np.isfinite(x) and (lo <= x <= hi)
+
+def to_float(x, default=np.nan):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+# Confidence label already computed earlier for the race; ensure present
+if "Confidence" not in AM.columns:
+    def conf_band(n):
+        if n >= 12: return "High"
+        if n >= 8:  return "Med"
+        return "Low"
+    AM["Confidence"] = conf_band(field_n)
+
+def tier_for_row(r):
+    iai      = to_float(r.get("IAI"))
+    pi       = to_float(r.get("PI"))
+    gci      = to_float(r.get("GCI"))
+    iai_pct  = to_float(r.get("IAI_pct"), 0.0)
+    bal      = to_float(r.get("BAL"))
+    conf_ok  = str(r.get("Confidence","")).strip() in ("High","Med")
+
+    # --- Elite gates ---
+    if (
+        np.isfinite(iai) and iai >= elite_iai_floor and
+        np.isfinite(pi)  and pi  >= 7.2 and
+        np.isfinite(gci) and gci >= 6.0 and
+        iai_pct >= elite_pct_floor and
+        in_range(bal, 98.0, 104.0) and
+        conf_ok
+    ):
+        return "🥇 Elite"
+
+    # --- High gates ---
+    if (
+        np.isfinite(iai) and iai >= 101.0 and
+        np.isfinite(pi)  and pi  >= 6.2 and
+        iai_pct >= 0.70 and
+        in_range(bal, 97.0, 105.0)
+    ):
+        return "🥈 High"
+
+    # --- Competitive gates ---
+    if (
+        (np.isfinite(iai) and iai >= 100.4) or
+        iai_pct >= 0.55 or
+        (np.isfinite(pi) and pi >= 5.4)
+    ):
+        return "🥉 Competitive"
+
     return "⚪ Ordinary"
-AM["AbilityTier"] = AM["AbilityScore"].apply(ability_tier)
 
-# Directional lean (sprint/stayer)
-def dir_hint_row(r):
-    dv = float(r.get("Accel", np.nan)) - float(r.get(gr_col, np.nan))
-    if not np.isfinite(dv): return ""
-    if dv >= 2.0:  return "⚡ Sprint-lean (turn of foot)"
-    if dv <= -2.0: return "🪨 Stayer-lean (sustained)"
-    return "⚖ Balanced"
-AM["DirectionHint"] = AM.apply(dir_hint_row, axis=1)
+AM["AbilityTier"] = AM.apply(tier_for_row, axis=1)
 
-# Confidence band by field size
-def conf_band(n):
-    if n >= 12: return "High"
-    if n >= 8:  return "Med"
-    return "Low"
-AM["Confidence"] = conf_band(len(AM.index))
+# (Optional) “Near-Elite” helper column to surface almost-there types
+def near_elite_row(r):
+    iai, pi, gci, iai_pct, bal = map(to_float, (r.get("IAI"), r.get("PI"), r.get("GCI"), r.get("IAI_pct"), r.get("BAL")))
+    hits = 0
+    hits += int(np.isfinite(iai) and iai >= elite_iai_floor)
+    hits += int(np.isfinite(pi)  and pi  >= 7.2)
+    hits += int(np.isfinite(gci) and gci >= 6.0)
+    hits += int(iai_pct >= elite_pct_floor)
+    hits += int(in_range(bal, 98.0, 104.0))
+    return "⭐ Near-Elite" if hits >= 4 and r.get("AbilityTier") != "🥇 Elite" else ""
 
-# ---------- Plot (IAI vs Hidden) ----------
-need_cols_am = {"Horse","IAI","HiddenScore","PI","BAL"}
-if not need_cols_am.issubset(AM.columns):
-    st.info("Ability Matrix: missing columns.")
-else:
-    plot_df = AM.dropna(subset=["IAI","HiddenScore","PI","BAL"]).copy()
-    if plot_df.empty:
-        st.info("Not enough complete data to draw Ability Matrix.")
-    else:
-        x = plot_df["IAI"] - 100.0
-        y = plot_df["HiddenScore"]
-        sizes = 60.0 + (plot_df["PI"].clip(0,10) / 10.0) * 200.0
+AM["NearEliteFlag"] = AM.apply(near_elite_row, axis=1)
 
-        # -------- Fixed safe TwoSlopeNorm setup --------
-        vals = pd.to_numeric(plot_df["BAL"], errors="coerce").to_numpy()
-        vmin, vmax = np.nanmin(vals), np.nanmax(vals)
-        if not np.isfinite(vmin) or not np.isfinite(vmax):
-            vmin, vmax = 99.0, 101.0
-        if vmin == vmax:
-            vmin, vmax = vmin - 1.0, vmax + 1.0
-        EPS = 0.2
-        if vmax <= 100.0: vmax = 100.0 + EPS
-        if vmin >= 100.0: vmin = 100.0 - EPS
-        norm = TwoSlopeNorm(vcenter=100.0, vmin=vmin, vmax=vmax)
-        # ------------------------------------------------
+# --- “Why this tier?” explainer (ticks) ---
+def why_tier_row(r):
+    bits = []
+    conf_ok = str(r.get("Confidence","")).strip() in ("High","Med")
+    bits.append(f"IAI {to_float(r['IAI']):.2f} {'✅' if to_float(r['IAI'])>=elite_iai_floor else ''}")
+    bits.append(f"PI {to_float(r['PI']):.2f} {'✅' if to_float(r['PI'])>=7.2 else ''}")
+    bits.append(f"GCI {to_float(r['GCI']):.2f} {'✅' if to_float(r['GCI'])>=6.0 else ''}")
+    bits.append(f"IAI_pct {to_float(r['IAI_pct']):.2f} {'✅' if to_float(r['IAI_pct'])>=elite_pct_floor else ''}")
+    bal = to_float(r["BAL"])
+    bits.append(f"BAL {bal:.1f} {'✅' if in_range(bal,98,104) else ''}")
+    bits.append(f"Conf {r.get('Confidence','')} {'✅' if conf_ok else ''}")
+    return " · ".join(bits)
 
-        figA, axA = plt.subplots(figsize=(8.6, 6.0))
-        sc = axA.scatter(x, y, s=sizes, c=plot_df["BAL"], cmap="coolwarm", norm=norm,
-                         edgecolor="black", linewidth=0.6, alpha=0.95)
+AM["WhyTier"] = AM.apply(why_tier_row, axis=1)
 
-        label_points_neatly(axA, x.values, y.values, plot_df["Horse"].astype(str).tolist())
-
-        axA.axvline(0.0, color="gray", lw=1.0, ls="--")
-        axA.axhline(1.2, color="gray", lw=0.8, ls=":")
-        axA.set_xlabel("Intrinsic Ability (IAI – 100)  →")
-        axA.set_ylabel("HiddenScore (0–3)  ↑")
-        axA.set_title("Ability Matrix v2 — Size = PI · Colour = BAL (balance)")
-
-        for s, lab in [(60, "PI low"), (160, "PI mid"), (260, "PI high")]:
-            axA.scatter([], [], s=s, label=lab, color="gray", edgecolor="black")
-        axA.legend(loc="upper left", frameon=False, fontsize=8, title="Point size:")
-        cbar = figA.colorbar(sc, ax=axA, fraction=0.05, pad=0.04)
-        cbar.set_label("BAL (100 = balanced late)")
-        axA.grid(True, linestyle=":", alpha=0.25)
-        st.pyplot(figA)
-
-        buf = io.BytesIO()
-        figA.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
-        ability_png = buf.getvalue()
-        st.download_button("Download Ability Matrix (PNG)", ability_png,
-                           file_name="ability_matrix_v2.png", mime="image/png")
-
-# ---------- Table ----------
-am_cols = ["Horse","Finish_Pos","IAI","HiddenScore","BAL","COMP","AbilityScore",
-           "AbilityTier","DirectionHint","Confidence","PI"]
+# --- Refresh plot/table sources (same columns you already render) ---
+am_cols = ["Horse","Finish_Pos","IAI","HiddenScore","BAL","COMP",
+           "AbilityScore","AbilityTier","NearEliteFlag","WhyTier",
+           "DirectionHint","Confidence","PI","GCI"]
 for c in am_cols:
     if c not in AM.columns:
         AM[c] = np.nan
-AM_view = AM.sort_values(["AbilityScore","PI","Finish_Pos"], ascending=[False, False, True])[am_cols]
+AM_view = AM.sort_values(
+    ["AbilityTier","AbilityScore","PI","Finish_Pos"],
+    ascending=[True, False, False, True]
+)[am_cols]
 st.dataframe(AM_view, use_container_width=True)
 
 # ------------------ Hand-off to Batch 4 (DB save/search + PDF) ------------------
