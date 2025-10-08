@@ -56,6 +56,40 @@ def color_cycle(n):
         i += 1
     return out
 
+from matplotlib.colors import TwoSlopeNorm
+
+def _safe_bal_norm(series, center=100.0, pad=0.5):
+    """Return a TwoSlopeNorm that always satisfies vmin < center < vmax.
+    Falls back to a tiny padded range around the data if it's one-sided or flat."""
+    arr = pd.to_numeric(series, errors="coerce").astype(float).to_numpy()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        vmin, vmax = center - 5.0, center + 5.0
+        return TwoSlopeNorm(vcenter=center, vmin=vmin, vmax=vmax)
+
+    vmin = float(np.nanmin(arr))
+    vmax = float(np.nanmax(arr))
+
+    # If all values are the same, make a tiny symmetric band around the value
+    if vmin == vmax:
+        vmin = vmin - max(pad, 0.1)
+        vmax = vmax + max(pad, 0.1)
+
+    # Ensure the center sits strictly inside (vmin, vmax)
+    if vmax <= center:
+        vmax = center + max(pad, (center - vmin) * 0.05 + 0.1)
+    if vmin >= center:
+        vmin = center - max(pad, (vmax - center) * 0.05 + 0.1)
+
+    # Final guard: if still touching, nudge a hair
+    if not (vmin < center < vmax):
+        if vmin >= center:
+            vmin = center - 0.1
+        if vmax <= center:
+            vmax = center + 0.1
+
+    return TwoSlopeNorm(vcenter=center, vmin=vmin, vmax=vmax)
+
 # ----------------------- Sidebar ---------------------------
 with st.sidebar:
     st.markdown(f"### Race Edge v{APP_VERSION}")
@@ -1236,7 +1270,7 @@ else:
         EPS = 1e-3
         if vmin >= 100.0: vmin = 100.0 - EPS
         if vmax <= 100.0: vmax = 100.0 + EPS
-        norm = TwoSlopeNorm(vcenter=100.0, vmin=vmin, vmax=vmax)
+        norm = _safe_bal_norm(plot_df["BAL"], center=100.0)
 
         figA, axA = plt.subplots(figsize=(8.6, 6.0))
         sc = axA.scatter(
