@@ -346,6 +346,207 @@ def grind_speed(row, step):
             return np.nan
         return 200.0 / float(tfin)
 
+# ======================= Race Shape v2 (adaptive + confirm + bootstrap) =======================
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+
+@dataclass
+class RaceShapeResult:
+    label: str
+    confidence: float
+    details: dict
+
+def _mad(x):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0: return np.nan
+    med = np.median(x)
+    return 1.4826 * np.median(np.abs(x - med))
+
+def classify_race_shape_v2(metrics: pd.DataFrame, *, distance_m: int,
+                           gr_col: str|None=None, fsr: float|None=None,
+                           min_valid_frac: float=0.60, boot_n: int=200,
+                           rng_seed: int=17) -> RaceShapeResult:
+    """
+    Inputs
+      metrics : DataFrame with columns ['F200_idx','tsSPI','Accel', gr_col]
+      distance_m : race distance (m)
+      gr_col : 'Grind_CG' (if CG on) or 'Grind'
+      fsr : optional Finish Slowdown Ratio (GR/MID). If None, tries metrics.attrs['FSR'].
+      min_valid_frac : phase must have at least this fraction of valid rows to avoid 'low-signal' widening
+      boot_n : bootstrap resamples for confidence (0 to disable)
+      rng_seed : reproducibility
+
+    Returns RaceShapeResult(label, confidence in [0,1], details dict)
+    """
+    df = metrics.copy()
+    if gr_col is None:
+        gr_col = metrics.attrs.get("GR_COL", "Grind")
+
+    # ------- Build phase series (Early / Mid / Late) -------
+    E_series = pd.to_numeric(df.get("F200_idx"), errors="coerce")  # early engine (first 200m)
+    M_series = pd.to_numeric(df.get("tsSPI"),    errors="coerce")  # sustained mid
+    # Late: emphasize drive (Accel) but include finish (grind)
+    A_series = pd.to_numeric(df.get("Accel"),    errors="coerce")
+    G_series = pd.to_numeric(df.get(gr_col),     errors="coerce")
+    L_series = 0.6*A_series + 0.4*G_series
+
+    # ------- Validity / field size -------
+    n_all   = len(df)
+    vE_frac = float(E_series.notna().mean())
+    vM_frac = float(M_series.notna().mean())
+    vL_frac = float(L_series.notna().mean())
+
+    # ------- Medians vs field-par 100 -------
+    E_med = float(np.nanmedian(E_series))
+    M_med = float(np.nanmedian(M_series))
+    L_med = float(np.nanmedian(L_series))
+
+    ΔE = E_med - 100.0
+    ΔM = M_med - 100.0
+    ΔL = L_med - 100.0
+
+    # ------- Adaptive gates (MAD-based) + distance scaling -------
+    def gate_from(series):
+        d = pd.to_numeric(series, errors="coerce") - 100.0
+        s = _mad(d)
+        if not np.isfinite(s) or s <= 0: s = 2.0
+        return max(2.0, 0.6 * s)
+
+    gateE = gate_from(E_series)
+    gateM = gate_from(M_series)
+    gateL = gate_from(L_series)
+
+    # Distance factor (spr = 1.00; 1400–1800 = 1.15; 2000+ = 1.30)
+    if distance_m <= 1200:
+        scale_dist = 1.00
+    elif distance_m < 1800:
+        scale_dist = 1.15
+    else:
+        scale_dist = 1.30
+
+    gateE *= scale_dist
+    gateM *= scale_dist
+    gateL *= scale_dist
+
+    # Low-signal widening
+    widen = 0.0
+    notes = []
+    if vE_frac < min_valid_frac:
+        gateE += 0.5; widen = max(widen, 0.5); notes.append("low-signal Early")
+    if vM_frac < min_valid_frac:
+        gateM += 0.5; widen = max(widen, 0.5); notes.append("low-signal Mid")
+    if vL_frac < min_valid_frac:
+        gateL += 0.5; widen = max(widen, 0.5); notes.append("low-signal Late")
+
+    # ------- Confirmatory signals: leader & FSR -------
+    # Leader early: the front-runner's early index (proxy = max F200_idx)
+    E_lead = float(np.nanmax(E_series)) if E_series.notna().any() else np.nan
+    fsr = float(fsr) if fsr is not None else float(metrics.attrs.get("FSR", np.nan))
+
+    # Confidence bumps (applied post label decision)
+    bump_fast = 0.0
+    bump_slow = 0.0
+    if np.isfinite(E_lead) and np.isfinite(E_med):
+        if (E_lead - E_med) >= 1.0:
+            bump_fast += 0.10  # leader actually went
+    if np.isfinite(fsr):
+        if fsr < 0.97:  bump_fast += 0.10   # collapse-y late → aligns with strong early
+        if fsr > 1.03:  bump_slow += 0.10   # very slow-early → sprint home
+
+    # ------- Rule-based labels with gentle asymmetry (late gets 0.5pt cushion) -------
+    def label_once(dE, dM, dL):
+        if (dE >= gateE) and (dL <= -(gateL - 0.5)):
+            return "Fast-Early"
+        if (dE <= -gateE) and (dL >= +(gateL - 0.5)):
+            return "Slow-Early"
+        if (dM >= gateM) and (abs(dE) < gateE*0.6) and (abs(dL) < gateL*0.6):
+            return "Fast-Mid"
+        if (dM <= -gateM) and (abs(dE) < gateE*0.6) and (abs(dL) < gateL*0.6):
+            return "Slow-Mid"
+        return "Even"
+
+    base_label = label_once(ΔE, ΔM, ΔL)
+
+    # ------- Bootstrap confidence (resample horses) -------
+    def med(x): 
+        return float(np.nanmedian(pd.to_numeric(x, errors="coerce")))
+    if boot_n and n_all >= 6:
+        rng = np.random.default_rng(rng_seed)
+        labels = []
+        idx_valid = df.index.tolist()
+        for _ in range(boot_n):
+            take = rng.choice(idx_valid, size=len(idx_valid), replace=True)
+            Ee = med(E_series.loc[take]); Mm = med(M_series.loc[take]); Ll = med(L_series.loc[take])
+            labels.append(label_once(Ee-100.0, Mm-100.0, Ll-100.0))
+        # soft tally (plus confirmatory nudges)
+        from collections import Counter
+        c = Counter(labels)
+        # apply tiny priors toward fast/slow if confirmatory bumps present
+        if bump_fast > 0: c["Fast-Early"] += int(boot_n * 0.03)
+        if bump_slow > 0: c["Slow-Early"] += int(boot_n * 0.03)
+        final_label, count = max(c.items(), key=lambda kv: kv[1])
+        conf = count / float(sum(c.values()))
+    else:
+        final_label = base_label
+        conf = 0.60  # default moderate
+
+    # apply bumps aligned with label
+    if final_label == "Fast-Early":
+        conf = min(1.0, conf + bump_fast)
+    elif final_label == "Slow-Early":
+        conf = min(1.0, conf + bump_slow)
+
+    # ------- Composite score (for tie-break debugging/telemetry only) -------
+    # ReLU helpers
+    pos = lambda v: max(0.0, v)
+    neg = lambda v: max(0.0, -v)
+    S_fastE = 0.50*pos(ΔE-gateE) + 0.30*pos((-(ΔL))-(gateL-0.5)) + 0.10*pos(0.97-(fsr if np.isfinite(fsr) else 1.0)) + 0.10*pos((E_lead-E_med) if (np.isfinite(E_lead) and np.isfinite(E_med)) else 0.0)
+    S_slowE = 0.50*pos(neg(ΔE)-gateE) + 0.30*pos(ΔL-(gateL-0.5)) + 0.20*pos((fsr if np.isfinite(fsr) else 1.0)-1.03)
+    S_fastM = 0.70*pos(ΔM-gateM) + 0.15*pos(gateE-abs(ΔE)) + 0.15*pos(gateL-abs(ΔL))
+    S_slowM = 0.70*pos(neg(ΔM)-gateM) + 0.15*pos(gateE-abs(ΔE)) + 0.15*pos(gateL-abs(ΔL))
+    scores = {"Fast-Early":S_fastE, "Slow-Early":S_slowE, "Fast-Mid":S_fastM, "Slow-Mid":S_slowM, "Even":0.0}
+
+    details = dict(
+        distance_m=int(distance_m),
+        n_rows=int(n_all),
+        valid_frac=dict(E=vE_frac, M=vM_frac, L=vL_frac),
+        medians=dict(E=E_med, M=M_med, L=L_med),
+        deltas=dict(ΔE=ΔE, ΔM=ΔM, ΔL=ΔL),
+        gates=dict(E=gateE, M=gateM, L=gateL, widen=widen, scale_dist=scale_dist),
+        leader=dict(E_lead=E_lead, E_med=E_med),
+        fsr=fsr,
+        base_label=base_label,
+        composite_scores=scores,
+        notes=notes
+    )
+
+    return RaceShapeResult(label=final_label, confidence=float(conf), details=details)
+
+# ---------- Example usage (call right after you compute `metrics`) ----------
+try:
+    rs = classify_race_shape_v2(
+        metrics,
+        distance_m=int(race_distance_input),
+        gr_col=metrics.attrs.get("GR_COL", "Grind"),
+        fsr=metrics.attrs.get("FSR", None),
+        boot_n=200  # set 0 to disable bootstrapping if you need speed
+    )
+    # Store into attrs for use elsewhere (CG, Hidden, headers, etc.)
+    metrics.attrs["RaceShape_v2"] = rs.label
+    metrics.attrs["RaceShapeConf_v2"] = rs.confidence
+    metrics.attrs["RaceShapeDetails_v2"] = rs.details
+
+    # Optional: show in UI header
+    st.markdown(
+        f"**Race Shape v2:** {rs.label}  ·  Confidence: {rs.confidence:.0%}  "
+        f"·  ΔE {rs.details['deltas']['ΔE']:+.1f}, ΔM {rs.details['deltas']['ΔM']:+.1f}, ΔL {rs.details['deltas']['ΔL']:+.1f}  "
+        f"·  FSR {rs.details['fsr'] if rs.details['fsr'] is not None else '—'}"
+    )
+except Exception as e:
+    st.warning(f"Race Shape v2 classification failed: {e}")
+    
 # -------- Distance + context weights for PI v3.x --------
 def _lerp(a, b, t):
     return a + (b - a) * float(t)
