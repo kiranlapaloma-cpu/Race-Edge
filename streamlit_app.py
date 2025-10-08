@@ -875,120 +875,91 @@ else:
         st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
         st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
 
-# ======================= Visual 2: Pace Curve — robust to missing data =======================
-st.markdown("## Pace Curve — field average (black) + Top 8 finishers (robust)")
-
+# ======================= Pace Curve — field average (black) + Top 8 finishers =======================
+st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
 pace_png = None
-STEP = metrics.attrs.get("STEP", 100)
 
-def _build_segs(df, distance_m:int, step:int):
-    wanted = [m for m in range(int(distance_m) - step, step-1, -step)]
+if seg_markers or ("Finish_Time" in work.columns):
+    step = metrics.attrs.get("STEP", 100)
+    wanted = [m for m in range(int(race_distance_input) - step, step-1, -step)]
     segs = []
     for m in wanted:
         c = f"{m}_Time"
-        if c in df.columns:
+        if c in work.columns:
             segs.append((m+step, m, float(step), c))
-    if "Finish_Time" in df.columns:
+    if "Finish_Time" in work.columns:
         segs.append((step, 0, float(step), "Finish_Time"))
-    return segs
 
-if seg_markers or ("Finish_Time" in work.columns):
-    segs_raw = _build_segs(work, int(race_distance_input), STEP)
-    if len(segs_raw) == 0:
+    # If nothing valid, bail early
+    if len(segs) == 0:
         st.info("Not enough *_Time columns to draw the pace curve.")
     else:
-        # Keep only segments with at least one valid time across the field
-        def _has_valid(col):
-            s = pd.to_numeric(work[col], errors="coerce")
-            return bool((s > 0).any())
-        segs = [(s,e,L,c) for (s,e,L,c) in segs_raw if _has_valid(c)]
+        # Build speed table with NaN-safe division
+        seg_cols = [c for (_,_,_,c) in segs]
+        times_df = work[seg_cols].apply(pd.to_numeric, errors="coerce")
+        times_df = times_df.mask((times_df <= 0) | (~np.isfinite(times_df)))
+        speed_df = pd.DataFrame(index=work.index)
+        for (s, e, L, c) in segs:
+            speed_df[c] = L / times_df[c]
 
-        if len(segs) < 2:
-            st.info("Too few usable segments after filtering missing/zero times.")
+        # Field average (ignore all-NaN columns gracefully)
+        field_avg = speed_df.mean(axis=0, skipna=True).to_numpy()
+        if not np.isfinite(np.nanmean(field_avg)):
+            st.info("Pace curve: all segments missing/invalid.")
         else:
-            # Compute speeds with NaNs where missing, then robust means
-            cols = [c for (_,_,_,c) in segs]
-            times_df = work[cols].apply(pd.to_numeric, errors="coerce").clip(lower=0).replace(0, np.nan)
-            speed_df = pd.DataFrame(index=work.index)
-            for (s,e,L,c) in segs:
-                speed_df[c] = L / times_df[c]
-
-            # Field average: nanmean across runners for each segment
-            field_avg = np.array([np.nanmean(speed_df[c].to_numpy()) for c in cols])
-            # If the entire array is NaN, abort gracefully
-            if not np.isfinite(field_avg).any():
-                st.info("Pace curve cannot render: all segments are empty after cleaning.")
+            # Choose top-8 lines to draw
+            if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
+                top8 = metrics.sort_values("Finish_Pos").head(8)
+                top8_rule = "Top-8 by Finish_Pos"
             else:
-                # Choose top-8 to draw
-                if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
-                    top8 = metrics.sort_values("Finish_Pos").head(8)
-                    top8_rule = "Top-8 by Finish_Pos"
+                top8 = metrics.sort_values("PI", ascending=False).head(8)
+                top8_rule = "Top-8 by PI"
+
+            x_idx = list(range(len(segs)))
+            def seg_label(s, e, c):
+                return f"{int(s)}→{int(e)}" if c != "Finish_Time" else f"{step}→0 (Finish)"
+            x_labels = [seg_label(s,e,c) for (s,e,_,c) in segs]
+
+            fig2, ax2 = plt.subplots(figsize=(8.8, 5.2), layout="constrained")
+            ax2.plot(x_idx, field_avg, linewidth=2.2, color="black", label="Field average", marker=None)
+
+            palette = color_cycle(len(top8))
+            for i, (_, r) in enumerate(top8.iterrows()):
+                # Pick the row with times for the matching horse
+                if "Horse" in work.columns and "Horse" in metrics.columns:
+                    row0 = work[work["Horse"] == r.get("Horse")]
+                    row_times = row0.iloc[0] if not row0.empty else r
                 else:
-                    top8 = metrics.sort_values("PI", ascending=False).head(8)
-                    top8_rule = "Top-8 by PI"
+                    row_times = r
 
-                # X axis labels
-                x_idx = list(range(len(segs)))
-                def seg_label(s, e, c):
-                    return f"{int(s)}→{int(e)}" if c != "Finish_Time" else f"{STEP}→0 (Finish)"
-                x_labels = [seg_label(s,e,c) for (s,e,_,c) in segs]
+                # Collect speeds for this horse, skipping bad segments
+                y_vals = []
+                for (_, _, L, c) in segs:
+                    t = pd.to_numeric(row_times.get(c, np.nan), errors="coerce")
+                    y = (L / float(t)) if (pd.notna(t) and float(t) > 0.0) else np.nan
+                    y_vals.append(y)
 
-                # Plot
-                fig2, ax2 = plt.subplots(figsize=(9.2, 5.4), layout="constrained")
+                # If this horse has no valid segments, skip plotting it
+                if not np.isfinite(np.nanmean(y_vals)):
+                    continue
 
-                # Field average line (ignore NaNs; matplotlib will gap them)
-                ax2.plot(
-                    x_idx, field_avg, linewidth=2.2, color="black",
-                    label="Field average", marker=None
-                )
+                ax2.plot(x_idx, y_vals, linewidth=1.1, marker="o", markersize=2.5,
+                         label=str(r.get("Horse", "")), color=palette[i])
 
-                # Plot horses with at least two finite points so we get a line, not noise
-                palette = color_cycle(len(top8))
-                plotted_any = False
-                for i, (_, r) in enumerate(top8.iterrows()):
-                    # locate the row with raw times (by Horse if present)
-                    if "Horse" in work.columns and "Horse" in metrics.columns:
-                        row0 = work[work["Horse"] == r.get("Horse")]
-                        row_times = row0.iloc[0] if not row0.empty else r
-                    else:
-                        row_times = r
+            ax2.set_xticks(x_idx)
+            ax2.set_xticklabels(x_labels, rotation=45, ha="right")
+            ax2.set_ylabel("Speed (m/s)")
+            ax2.set_title("Pace over segments (left = early; right = home straight; includes Finish)")
+            ax2.grid(True, linestyle="--", alpha=0.30)
+            ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, frameon=False, fontsize=9)
 
-                    y_vals = []
-                    for (_, _, L, c) in segs:
-                        t = pd.to_numeric(row_times.get(c, np.nan), errors="coerce")
-                        y_vals.append(L / t if pd.notna(t) and t > 0 else np.nan)
-
-                    finite_count = np.isfinite(y_vals).sum()
-                    if finite_count >= 2:
-                        ax2.plot(
-                            x_idx, y_vals, linewidth=1.1, marker="o", markersize=2.6,
-                            label=str(r.get("Horse", "")), color=palette[i]
-                        )
-                        plotted_any = True
-
-                # Labels & legend
-                ax2.set_xticks(x_idx)
-                ax2.set_xticklabels(x_labels, rotation=45, ha="right")
-                ax2.set_ylabel("Speed (m/s)")
-                ax2.set_title("Pace over segments (left = early; right = home straight; handles gaps)")
-                ax2.grid(True, linestyle="--", alpha=0.30)
-
-                # If no horses could be plotted, just show the field average in the legend
-                if plotted_any:
-                    ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, frameon=False, fontsize=9)
-                else:
-                    ax2.legend(loc="upper left", frameon=False, fontsize=9)
-
-                st.pyplot(fig2)
-
-                # Download
-                buf = io.BytesIO()
-                fig2.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
-                pace_png = buf.getvalue()
-                st.download_button("Download pace curve (PNG)", pace_png,
-                                   file_name="pace_curve.png", mime="image/png")
-
-                st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly. Missing splits are left blank (gaps).")
+            st.pyplot(fig2)
+            buf = io.BytesIO()
+            fig2.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
+            pace_png = buf.getvalue()
+            st.download_button("Download pace curve (PNG)", pace_png,
+                               file_name="pace_curve.png", mime="image/png")
+            st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 else:
     st.info("Not enough *_Time columns to draw the pace curve.")
     
@@ -1095,137 +1066,229 @@ hh_view = hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True,False,Fals
 st.dataframe(hh_view, use_container_width=True)
 st.caption("Hidden Horses v2 — RS-aware tiering enabled · 🔥 ≥7.2/6.0 · 🟡 ≥6.2/5.0.")
 
-# ======================= Ability Matrix v2 (strict, safe colour norm) =======================
+# ======================= Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict) =======================
 st.markdown("---")
 st.markdown("## Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict)")
 
-AM = metrics.copy().merge(hh_view[["Horse","HiddenScore"]], on="Horse", how="left").fillna({"HiddenScore":0.0})
-gr_col = metrics.attrs.get("GR_COL","Grind")
+# Merge HiddenScore in
+AM = metrics.copy()
+if "Horse" not in AM.columns:
+    AM["Horse"] = work.get("Horse", "")
+AM = AM.merge(hh_view[["Horse","HiddenScore"]], on="Horse", how="left")
+AM["HiddenScore"] = AM["HiddenScore"].fillna(0.0)
 
-AM["IAI"]=0.35*AM["tsSPI"]+0.25*AM["Accel"]+0.25*AM[gr_col]+0.15*AM["F200_idx"]
-AM["BAL"]=100.0-(AM["Accel"]-AM[gr_col]).abs()/2.0
-AM["COMP"]=100.0-(AM["tsSPI"]-100.0).abs()
+# Use corrected grind if active
+gr_col = metrics.attrs.get("GR_COL", "Grind")
 
-def pct_rank(s): return s.rank(pct=True, method="average").fillna(0.0)
-AM["IAI_pct"]=pct_rank(AM["IAI"]); AM["HID_pct"]=pct_rank(AM["HiddenScore"])
-AM["BAL_pct"]=1.0-pct_rank((AM["BAL"]-100.0).abs()); AM["COMP_pct"]=1.0-pct_rank((AM["COMP"]-100.0).abs())
+# ----- Core components -----
+AM["IAI"]  = 0.35*AM["tsSPI"] + 0.25*AM["Accel"] + 0.25*AM[gr_col] + 0.15*AM["F200_idx"]
+AM["BAL"]  = 100.0 - (AM["Accel"] - AM[gr_col]).abs() / 2.0
+AM["COMP"] = 100.0 - (AM["tsSPI"] - 100.0).abs()
 
+# ----- Percentiles within this race -----
+def pct_rank(s):
+    s = pd.to_numeric(s, errors="coerce")
+    return s.rank(pct=True, method="average").fillna(0.0).clip(0.0, 1.0)
+
+AM["IAI_pct"]  = pct_rank(AM["IAI"])
+AM["HID_pct"]  = pct_rank(AM["HiddenScore"])
+AM["BAL_pct"]  = 1.0 - pct_rank((AM["BAL"]  - 100.0).abs())
+AM["COMP_pct"] = 1.0 - pct_rank((AM["COMP"] - 100.0).abs())
+
+# ----- Hidden contribution caps (blocks hidden-only "elites") -----
 def hidden_scale(iai):
-    if iai < 101.0: return 0.25
-    if iai < 101.5: return 0.50
-    return 1.0
-AM["_hid_scale"]=AM["IAI"].map(hidden_scale)
-AM["AbilityScore"]=(6.5*AM["IAI_pct"]+2.5*(AM["HID_pct"]*AM["_hid_scale"])+0.6*AM["BAL_pct"]+0.4*AM["COMP_pct"]).clip(0,10)
+    iai = float(iai) if pd.notna(iai) else np.nan
+    if not np.isfinite(iai): return 0.0
+    if iai < 101.0:  return 0.25     # average engines
+    if iai < 101.5:  return 0.50     # decent engines
+    return 1.00                      # strong engines
 
-field_n=len(AM)
-AM["Confidence"]="High" if field_n>=12 else "Med" if field_n>=8 else "Low"
+AM["_hid_scale"] = AM["IAI"].map(hidden_scale)
 
-elite_iai_floor=102.0 if field_n<=7 else 101.8
-elite_pct_floor=0.90 if field_n<=7 else 0.85
+# ----- Composite score (for ordering/plot) -----
+AM["AbilityScore"] = (
+      6.5 * AM["IAI_pct"]
+    + 2.5 * (AM["HID_pct"] * AM["_hid_scale"])
+    + 0.6 * AM["BAL_pct"]
+    + 0.4 * AM["COMP_pct"]
+).clip(0.0, 10.0).round(2)
+
+# ----- Confidence by field size -----
+field_n = int(len(AM.index))
+def conf_band(n):
+    if n >= 12: return "High"
+    if n >= 8:  return "Med"
+    return "Low"
+if "Confidence" not in AM.columns:
+    AM["Confidence"] = conf_band(field_n)
+
+# ----- Strict tier gates (Section E) -----
+small_field = field_n <= 7
+elite_iai_floor = 102.0 if small_field else 101.8
+elite_pct_floor = 0.90  if small_field else 0.85
+
+def in_range(x, lo, hi):
+    x = float(x) if pd.notna(x) else np.nan
+    return np.isfinite(x) and (lo <= x <= hi)
+
+def to_float(x, default=np.nan):
+    try:
+        v = float(x);  return v if np.isfinite(v) else default
+    except Exception:
+        return default
 
 def tier_for_row(r):
-    iai,pi,gci,bal=r["IAI"],r["PI"],r["GCI"],r["BAL"]; iai_pct=r["IAI_pct"]
-    conf_ok=r["Confidence"] in ("High","Med")
-    if iai>=elite_iai_floor and pi>=7.2 and gci>=6.0 and iai_pct>=elite_pct_floor and 98<=bal<=104 and conf_ok: return "🥇 Elite"
-    if iai>=101.0 and pi>=6.2 and iai_pct>=0.70 and 97<=bal<=105: return "🥈 High"
-    if iai>=100.4 or iai_pct>=0.55 or pi>=5.4: return "🥉 Competitive"
+    iai      = to_float(r.get("IAI"))
+    pi       = to_float(r.get("PI"))
+    gci      = to_float(r.get("GCI"))
+    iai_pct  = to_float(r.get("IAI_pct"), 0.0)
+    bal      = to_float(r.get("BAL"))
+    conf_ok  = str(r.get("Confidence","")).strip() in ("High","Med")
+
+    # 🥇 Elite — all must pass
+    if (
+        np.isfinite(iai) and iai >= elite_iai_floor and
+        np.isfinite(pi)  and pi  >= 7.2 and
+        np.isfinite(gci) and gci >= 6.0 and
+        iai_pct >= elite_pct_floor and
+        in_range(bal, 98.0, 104.0) and
+        conf_ok
+    ):
+        return "🥇 Elite"
+
+    # 🥈 High — all must pass
+    if (
+        np.isfinite(iai) and iai >= 101.0 and
+        np.isfinite(pi)  and pi  >= 6.2 and
+        iai_pct >= 0.70 and
+        in_range(bal, 97.0, 105.0)
+    ):
+        return "🥈 High"
+
+    # 🥉 Competitive — any
+    if (
+        (np.isfinite(iai) and iai >= 100.4) or
+        iai_pct >= 0.55 or
+        (np.isfinite(pi) and pi >= 5.4)
+    ):
+        return "🥉 Competitive"
+
     return "⚪ Ordinary"
-AM["AbilityTier"]=AM.apply(tier_for_row, axis=1)
 
-# --- Near-Elite helper ---
+AM["AbilityTier"] = AM.apply(tier_for_row, axis=1)
+
+# Near-Elite helper (passes 4/6 elite gates but not all)
 def near_elite_row(r):
-    hits=sum([
-        r["IAI"]>=elite_iai_floor,
-        r["PI"]>=7.2,
-        r["GCI"]>=6.0,
-        r["IAI_pct"]>=elite_pct_floor,
-        98<=r["BAL"]<=104,
-        r["Confidence"] in ("High","Med")
-    ])
-    return "⭐ Near-Elite" if hits>=4 and r["AbilityTier"]!="🥇 Elite" else ""
-AM["NearEliteFlag"]=AM.apply(near_elite_row, axis=1)
+    iai, pi, gci, iai_pct, bal = map(to_float, (r.get("IAI"), r.get("PI"), r.get("GCI"),
+                                                r.get("IAI_pct"), r.get("BAL")))
+    conf_ok  = str(r.get("Confidence","")).strip() in ("High","Med")
+    hits = 0
+    hits += int(np.isfinite(iai) and iai >= elite_iai_floor)
+    hits += int(np.isfinite(pi)  and pi  >= 7.2)
+    hits += int(np.isfinite(gci) and gci >= 6.0)
+    hits += int(iai_pct >= elite_pct_floor)
+    hits += int(in_range(bal, 98.0, 104.0))
+    hits += int(conf_ok)
+    return "⭐ Near-Elite" if (hits >= 4 and r.get("AbilityTier") != "🥇 Elite") else ""
 
-# --- Plot ---
-need_cols_am={"Horse","IAI","HiddenScore","PI","BAL"}
-plot_df=AM.dropna(subset=list(need_cols_am))
-if not plot_df.empty:
-    x=plot_df["IAI"]-100.0; y=plot_df["HiddenScore"]; sizes=60+(plot_df["PI"]/10)*200
-    bal_vals=pd.to_numeric(plot_df["BAL"],errors="coerce")
-    finite_bal=bal_vals[np.isfinite(bal_vals)]
-    if finite_bal.empty: vmin,vmax=99,101
-    else:
-        vmin,vmax=float(finite_bal.min()),float(finite_bal.max())
-        if vmin==vmax: vmin-=0.5; vmax+=0.5
-        if vmax<=100: vmax=100.1
-        if vmin>=100: vmin=99.9
-    norm=TwoSlopeNorm(vcenter=100.0,vmin=vmin,vmax=vmax)
-    figA,axA=plt.subplots(figsize=(8.6,6.0))
-    sc=axA.scatter(x,y,s=sizes,c=plot_df["BAL"],cmap="coolwarm",norm=norm,edgecolor="black",linewidth=0.6,alpha=0.95)
-    label_points_neatly(axA,x.values,y.values,plot_df["Horse"].astype(str).tolist())
-    axA.axvline(0,color="gray",lw=1.0,ls="--"); axA.axhline(1.2,color="gray",lw=0.8,ls=":")
-    axA.set_xlabel("Intrinsic Ability (IAI–100) →"); axA.set_ylabel("HiddenScore (0–3) ↑")
-    axA.set_title("Ability Matrix v2 — Size = PI · Colour = BAL (100 = balanced late)")
-    for s,lab in [(60,"PI low"),(160,"PI mid"),(260,"PI high")]:
-        axA.scatter([],[],s=s,label=lab,color="gray",edgecolor="black")
-    axA.legend(loc="upper left",frameon=False,fontsize=8,title="Point size:")
-    cbar=figA.colorbar(sc,ax=axA,fraction=0.05,pad=0.04); cbar.set_label("BAL (100 = balanced late)")
-    axA.grid(True,linestyle=":",alpha=0.25)
-    st.pyplot(figA)
-    # ---------- Ability Matrix table + CSV download ----------
-# (place this right after the Ability Matrix v2 plot block)
+AM["NearEliteFlag"] = AM.apply(near_elite_row, axis=1)
 
-# Small helper used in the tier explainer
-def _in_range(x, lo, hi):
-    try:
-        x = float(x)
-        return np.isfinite(x) and (lo <= x <= hi)
-    except Exception:
-        return False
-
-def _why_tier_row(r):
+# “Why this tier?” explainer
+def why_tier_row(r):
     conf_ok = str(r.get("Confidence","")).strip() in ("High","Med")
-    parts = []
-    try:
-        parts.append(f"IAI {float(r['IAI']):.2f} {'✅' if float(r['IAI'])>=elite_iai_floor else '❌'}")
-    except: parts.append("IAI —")
-    try:
-        parts.append(f"PI {float(r['PI']):.2f} {'✅' if float(r['PI'])>=7.2 else '❌'}")
-    except: parts.append("PI —")
-    try:
-        parts.append(f"GCI {float(r['GCI']):.2f} {'✅' if float(r['GCI'])>=6.0 else '❌'}")
-    except: parts.append("GCI —")
-    try:
-        parts.append(f"IAI_pct {float(r['IAI_pct']):.2f} {'✅' if float(r['IAI_pct'])>=elite_pct_floor else '❌'}")
-    except: parts.append("IAI_pct —")
-    try:
-        parts.append(f"BAL {float(r['BAL']):.1f} {'✅' if _in_range(r['BAL'],98,104) else '❌'}")
-    except: parts.append("BAL —")
-    parts.append(f"Conf {r.get('Confidence','')} {'✅' if conf_ok else '❌'}")
-    return " · ".join(parts)
+    iai = to_float(r['IAI']); pi = to_float(r['PI']); gci = to_float(r['GCI'])
+    iai_pct = to_float(r['IAI_pct']); bal = to_float(r['BAL'])
+    return " · ".join([
+        f"IAI {iai:.2f} {'✅' if np.isfinite(iai) and iai>=elite_iai_floor else '❌'}",
+        f"PI {pi:.2f} {'✅' if np.isfinite(pi) and pi>=7.2 else '❌'}",
+        f"GCI {gci:.2f} {'✅' if np.isfinite(gci) and gci>=6.0 else '❌'}",
+        f"IAI_pct {iai_pct:.2f} {'✅' if iai_pct>=elite_pct_floor else '❌'}",
+        f"BAL {bal:.1f} {'✅' if in_range(bal,98,104) else '❌'}",
+        f"Conf {r.get('Confidence','')} {'✅' if conf_ok else '❌'}",
+    ])
 
-# Sprint/Stayer direction hint (uses active grind column)
-_gr = metrics.attrs.get("GR_COL","Grind")
-def _dir_hint_row(r):
-    try:
-        dv = float(r.get("Accel", np.nan)) - float(r.get(_gr, np.nan))
+AM["WhyTier"] = AM.apply(why_tier_row, axis=1)
+
+# ---------- Plot (IAI vs Hidden) ----------
+try:
+    ability_png
+except NameError:
+    ability_png = None
+
+need_cols_am = {"Horse","IAI","HiddenScore","PI","BAL"}
+if not need_cols_am.issubset(AM.columns):
+    st.info("Ability Matrix: missing columns to plot.")
+else:
+    plot_df = AM.dropna(subset=["IAI","HiddenScore","PI","BAL"]).copy()
+    if plot_df.empty:
+        st.info("Not enough complete data to draw Ability Matrix.")
+    else:
+        x = plot_df["IAI"] - 100.0          # engine vs par
+        y = plot_df["HiddenScore"]          # hidden 0..3
+        sizes = 60.0 + (plot_df["PI"].clip(0,10) / 10.0) * 200.0
+
+        # ---- Robust colour scale (BAL centered at 100) ----
+        vals = pd.to_numeric(plot_df["BAL"], errors="coerce").to_numpy()
+        vmin = float(np.nanmin(vals)) if np.isfinite(vals).any() else np.nan
+        vmax = float(np.nanmax(vals)) if np.isfinite(vals).any() else np.nan
+        if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmin == vmax):
+            vmin, vmax = 95.0, 105.0
+        EPS = 1e-3
+        if vmin >= 100.0: vmin = 100.0 - EPS
+        if vmax <= 100.0: vmax = 100.0 + EPS
+        norm = TwoSlopeNorm(vcenter=100.0, vmin=vmin, vmax=vmax)
+
+        figA, axA = plt.subplots(figsize=(8.6, 6.0))
+        sc = axA.scatter(
+            x, y,
+            s=sizes,
+            c=plot_df["BAL"],
+            cmap="coolwarm",
+            norm=norm,
+            edgecolor="black",
+            linewidth=0.6,
+            alpha=0.95
+        )
+
+        # label repel (defined earlier)
+        label_points_neatly(axA, x.values, y.values, plot_df["Horse"].astype(str).tolist())
+
+        axA.axvline(0.0, color="gray", lw=1.0, ls="--")
+        axA.axhline(1.2, color="gray", lw=0.8, ls=":")
+        axA.set_xlabel("Intrinsic Ability (IAI – 100)  →")
+        axA.set_ylabel("HiddenScore (0–3)  ↑")
+        axA.set_title("Ability Matrix v2 — Size = PI · Colour = BAL (100 = balanced late)")
+
+        for s, lab in [(60, "PI low"), (160, "PI mid"), (260, "PI high")]:
+            axA.scatter([], [], s=s, label=lab, color="gray", edgecolor="black")
+        axA.legend(loc="upper left", frameon=False, fontsize=8, title="Point size:")
+
+        cbar = figA.colorbar(sc, ax=axA, fraction=0.05, pad=0.04)
+        cbar.set_label("BAL (100 = balanced late)")
+
+        axA.grid(True, linestyle=":", alpha=0.25)
+        st.pyplot(figA)
+
+        # Download image
+        buf = io.BytesIO()
+        figA.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
+        ability_png = buf.getvalue()
+        st.download_button("Download Ability Matrix (PNG)", ability_png,
+                           file_name="ability_matrix_v2.png", mime="image/png")
+
+# ---------- Final table ----------
+if "DirectionHint" not in AM.columns:
+    def dir_hint_row(r):
+        dv = float(r.get("Accel", np.nan)) - float(r.get(gr_col, np.nan))
         if not np.isfinite(dv): return ""
         if dv >= 2.0:  return "⚡ Sprint-lean (turn of foot)"
         if dv <= -2.0: return "🪨 Stayer-lean (sustained)"
         return "⚖ Balanced"
-    except Exception:
-        return ""
+    AM["DirectionHint"] = AM.apply(dir_hint_row, axis=1)
 
-AM["WhyTier"] = AM.apply(_why_tier_row, axis=1)
-if "DirectionHint" not in AM.columns:
-    AM["DirectionHint"] = AM.apply(_dir_hint_row, axis=1)
-
-# Final view (sorted & tidy)
-am_cols = [
-    "Horse","Finish_Pos",
-    "IAI","HiddenScore","BAL","COMP",
-    "AbilityScore","AbilityTier","NearEliteFlag","WhyTier",
-    "DirectionHint","Confidence","PI","GCI"
-]
+am_cols = ["Horse","Finish_Pos","IAI","HiddenScore","BAL","COMP",
+           "AbilityScore","AbilityTier","NearEliteFlag","WhyTier",
+           "DirectionHint","Confidence","PI","GCI"]
 for c in am_cols:
     if c not in AM.columns:
         AM[c] = np.nan
@@ -1234,13 +1297,7 @@ AM_view = AM.sort_values(
     ["AbilityTier","AbilityScore","PI","Finish_Pos"],
     ascending=[True, False, False, True]
 )[am_cols]
-
-st.markdown("### Ability Matrix — table view")
 st.dataframe(AM_view, use_container_width=True)
-
-# Optional: download the table as CSV
-csv_bytes = AM_view.to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Download Ability Matrix (CSV)", csv_bytes, "ability_matrix_v2.csv", "text/csv")
 
 # ======================= Batch 4 — Database, Search & PDF Export (robust) =======================
 import sqlite3, io, os
@@ -1258,7 +1315,7 @@ except Exception:
     HAS_RL = False
 
 # ---------- DB path (honours sidebar input from Batch 1) ----------
-DB_PATH = db_path if "db_path" in globals() else "race_edge.db"
+DB_PATH = db_path  # use the same path chosen in the sidebar
 
 # ---------- Initialise DB (idempotent) ----------
 def init_db_safe(path: str = DB_PATH):
