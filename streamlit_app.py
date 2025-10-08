@@ -756,13 +756,12 @@ st.caption(
 )
 
 # (Batch 3 will add visuals, Hidden v2, Ability v2, using PI_RS/GCI_RS where relevant)
-# ======================= Batch 3 — Visuals + Hidden Horses v2 + Ability Matrix v2 =======================
+# ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
 from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.lines import Line2D
-import io
 
-# ----------------------- Label repel (fallback, no external deps) -----------------------
+# ----------------------- Label repel (built-in fallback) -----------------------
 def _repel_labels_builtin(ax, x, y, labels, *, init_shift=0.18, k_attract=0.006, k_repel=0.012, max_iter=250):
     trans=ax.transData; renderer=ax.figure.canvas.get_renderer()
     xy=np.column_stack([x,y]).astype(float); offs=np.zeros_like(xy)
@@ -791,11 +790,6 @@ def _repel_labels_builtin(ax, x, y, labels, *, init_shift=0.18, k_attract=0.006,
                     tx,ty=t.get_position()
                     px=trans.transform((tx,ty))+s*np.array([dx,dy])
                     t.set_position(inv.transform(px)); moved=True
-        for t,(xi,yi) in zip(texts,xy):
-            tx,ty=t.get_position(); pt=trans.transform((tx,ty)); pp=trans.transform((xi,yi))
-            d=((pt[0]-pp[0])**2+(pt[1]-pp[1])**2)**0.5; tgt=25.0
-            if abs(d-tgt)>1.0:
-                v=(pt-pp)/(d+1e-9); pt2=pt+v*(0.6*(tgt-d)); t.set_position(inv.transform(pt2)); moved=True
         if not moved: break
     for t,ln,(xi,yi) in zip(texts,lines,xy):
         tx,ty=t.get_position(); ln.set_data([xi,tx],[yi,ty])
@@ -816,185 +810,247 @@ def label_points_neatly(ax, x, y, names):
         _repel_labels_builtin(ax, x, y, names)
 
 # ======================= Visual 1: Sectional Shape Map =======================
-st.markdown("## Sectional Shape Map — Accel vs Grind (colour = tsSPI, size = PI_RS)")
+st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
+shape_map_png = None
 GR_COL = metrics.attrs.get("GR_COL","Grind")
 
-need_cols={"Horse","Accel",GR_COL,"tsSPI","PI_RS"}
-if need_cols.issubset(metrics.columns):
-    dfm = metrics[list(need_cols)].copy()
+need_cols={"Horse","Accel",GR_COL,"tsSPI","PI"}
+if not need_cols.issubset(metrics.columns):
+    st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
+else:
+    dfm = metrics.loc[:, ["Horse","Accel",GR_COL,"tsSPI","PI"]].copy()
+    for c in ["Accel",GR_COL,"tsSPI","PI"]:
+        dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
     dfm = dfm.dropna(subset=["Accel",GR_COL,"tsSPI"])
-    if not dfm.empty:
+    if dfm.empty:
+        st.info("Not enough data to draw the shape map.")
+    else:
         dfm["AccelΔ"]=dfm["Accel"]-100.0
         dfm["GrindΔ"]=dfm[GR_COL]-100.0
         dfm["tsSPIΔ"]=dfm["tsSPI"]-100.0
-        xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy()
-        cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI_RS"].to_numpy()
         names=dfm["Horse"].astype(str).to_list()
+        xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy()
+        cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI"].fillna(0).to_numpy()
 
-        lim=max(4.5,float(np.nanmax(np.abs(np.concatenate([xv,yv])))))+0.5
-        norm=TwoSlopeNorm(vcenter=0.0,vmin=np.nanmin(cv),vmax=np.nanmax(cv))
-        sizes=40+((piv-np.nanmin(piv))/(np.nanmax(piv)-np.nanmin(piv)+1e-9))*100
+        span=max(4.5,float(np.nanmax(np.abs(np.concatenate([xv,yv])))))
+        lim=np.ceil(span/1.5)*1.5
 
-        fig,ax=plt.subplots(figsize=(7.6,6.0))
-        ax.axvline(0,color="grey",lw=1,ls="--"); ax.axhline(0,color="grey",lw=1,ls="--")
-        ax.scatter(xv,yv,s=sizes,c=cv,cmap="coolwarm",norm=norm,edgecolor="black",lw=0.5)
+        DOT_MIN, DOT_MAX = 40.0, 140.0
+        pmin,pmax=np.nanmin(piv),np.nanmax(piv)
+        sizes=np.full_like(xv,DOT_MIN) if not np.isfinite(pmin) or not np.isfinite(pmax) \
+               else DOT_MIN+(piv-pmin)/(pmax-pmin+1e-9)*(DOT_MAX-DOT_MIN)
+
+        fig, ax = plt.subplots(figsize=(7.8,6.2))
+        # quadrant tint (stronger alpha)
+        TINT=0.12
+        ax.add_patch(Rectangle((0,0),lim,lim,facecolor="#4daf4a",alpha=TINT,zorder=0))
+        ax.add_patch(Rectangle((-lim,0),lim,lim,facecolor="#377eb8",alpha=TINT,zorder=0))
+        ax.add_patch(Rectangle((0,-lim),lim,lim,facecolor="#ff7f00",alpha=TINT,zorder=0))
+        ax.add_patch(Rectangle((-lim,-lim),lim,lim,facecolor="#984ea3",alpha=TINT,zorder=0))
+        ax.axvline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
+        ax.axhline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
+
+        vmin,vmax=np.nanmin(cv),np.nanmax(cv)
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin==vmax:
+            vmin,vmax=-1.0,1.0
+        norm=TwoSlopeNorm(vcenter=0.0,vmin=vmin,vmax=vmax)
+
+        sc=ax.scatter(xv,yv,s=sizes,c=cv,cmap="coolwarm",norm=norm,
+                      edgecolor="black",linewidth=0.6,alpha=0.95)
         label_points_neatly(ax,xv,yv,names)
+
         ax.set_xlim(-lim,lim); ax.set_ylim(-lim,lim)
-        ax.set_xlabel("Acceleration Δ (400–200 zone)"); ax.set_ylabel("Grind Δ (Finish phase)")
-        ax.set_title("Quadrants – Top: grinders · Right: accelerators · Colour = tsSPI Δ")
+        ax.set_xlabel("Acceleration vs field (points) →")
+        ax.set_ylabel(("Corrected " if USE_CG else "")+"Grind vs field (points) ↑")
+        ax.set_title("Quadrants: +X=Accel (400→200) · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
+        s_ex=[DOT_MIN,0.5*(DOT_MIN+DOT_MAX),DOT_MAX]
+        h_ex=[Line2D([0],[0],marker='o',color='w',markerfacecolor='gray',
+                     markersize=np.sqrt(s/np.pi),markeredgecolor='black') for s in s_ex]
+        ax.legend(h_ex,["PI low","PI mid","PI high"],loc="upper left",frameon=False,fontsize=8)
+        cbar=fig.colorbar(sc,ax=ax,fraction=0.046,pad=0.04); cbar.set_label("tsSPI − 100")
+        ax.grid(True,linestyle=":",alpha=0.25)
         st.pyplot(fig)
-else:
-    st.info("Not enough data to draw the shape map.")
+        buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=300,bbox_inches="tight")
+        shape_map_png=buf.getvalue()
+        st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
+        st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
 
-# ======================= Visual 2: Pace Curve (NaN-safe) =======================
-st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
-pace_png = None
-
-step = metrics.attrs.get("STEP", 100)
-markers = collect_markers(work)
-
-if not markers and "Finish_Time" not in work.columns:
-    st.info("Not enough *_Time columns to draw the pace curve.")
-else:
-    # Build candidate segment list
-    wanted = [m for m in range(int(race_distance_input) - step, step - 1, -step)]
-    segs_all = []
-    for m in wanted:
-        c = f"{m}_Time"
-        if c in work.columns:
-            segs_all.append((m + step, m, float(step), c))
-    if "Finish_Time" in work.columns:
-        segs_all.append((step, 0, float(step), "Finish_Time"))
-
-    if len(segs_all) == 0:
-        st.info("No valid segments found to plot.")
-    else:
-        # Build time frame; allow NaNs and zeros → treated as missing
-        time_cols = [c for (_, _, _, c) in segs_all]
-        times_df = work[time_cols].apply(pd.to_numeric, errors="coerce")
-        times_df = times_df.where(times_df > 0)  # <=0 becomes NaN
-
-        # Keep only segments that have at least one valid time in the field
-        valid_mask = times_df.notna().sum(axis=0) > 0
-        segs = [seg for seg, keep in zip(segs_all, valid_mask.tolist()) if keep]
-        if len(segs) == 0:
-            st.info("All segment columns are empty for this race.")
-        else:
-            # Field average speed per kept segment
-            speed_df = pd.DataFrame(index=work.index)
-            for (s, e, L, c) in segs:
-                col_speeds = L / times_df[c]
-                speed_df[c] = col_speeds  # will be NaN where time is NaN
-
-            field_avg = speed_df.mean(axis=0, skipna=True).to_numpy()
-
-            # Select series to overlay
-            if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
-                topN = metrics.sort_values("Finish_Pos").head(8)
-                top_rule = "Top-8 by Finish_Pos"
-            else:
-                topN = metrics.sort_values("PI_RS" if "PI_RS" in metrics.columns else "PI",
-                                           ascending=False).head(8)
-                top_rule = "Top-8 by PI"
-
-            # X-axis labels
-            x_idx = list(range(len(segs)))
-            def seg_label(s, e, c):
-                return f"{int(s)}→{int(e)}" if c != "Finish_Time" else f"{step}→0 (Finish)"
-            x_labels = [seg_label(s, e, c) for (s, e, _, c) in segs]
-
-            # Plot
-            fig2, ax2 = plt.subplots(figsize=(8.8, 5.2), layout="constrained")
-            ax2.plot(x_idx, field_avg, linewidth=2.2, color="black", label="Field average")
-
-            palette = color_cycle(len(topN))
-            for i, (_, r) in enumerate(topN.iterrows()):
-                # Build per-horse speeds, NaN-safe
-                y_vals = []
-                for (_, _, L, c) in segs:
-                    t = pd.to_numeric(r.get(c, np.nan), errors="coerce")
-                    y_vals.append(L / t if (pd.notna(t) and t > 0) else np.nan)
-                # Plot only if at least one valid point
-                if np.isfinite(np.nanmax(y_vals)) and np.isfinite(np.nanmin(y_vals)):
-                    ax2.plot(x_idx, y_vals, linewidth=1.1, marker="o", markersize=2.5,
-                             label=str(r.get("Horse", "")), color=palette[i], alpha=0.9)
-
-            ax2.set_xticks(x_idx)
-            ax2.set_xticklabels(x_labels, rotation=45, ha="right")
-            ax2.set_ylabel("Speed (m/s)")
-            ax2.set_title("Pace over segments (left = early; right = home straight; includes Finish)")
-            ax2.grid(True, linestyle="--", alpha=0.30)
-            ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, frameon=False, fontsize=9)
-
-            st.pyplot(fig2)
-
-            buf = io.BytesIO()
-            fig2.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
-            pace_png = buf.getvalue()
-            st.download_button("Download pace curve (PNG)", pace_png,
-                               file_name="pace_curve.png", mime="image/png")
-
-            st.caption(f"Plotted segments with at least one valid time. Top-8 plotted: {top_rule}.")
-
-# ======================= Hidden Horses v2 =======================
+# ======================= Hidden Horses (v2, shape-aware) =======================
 st.markdown("## Hidden Horses v2 (Shape-aware)")
-hh=metrics.copy(); gr_col=GR_COL
-ts=winsorize(pd.to_numeric(hh["tsSPI"],errors="coerce"))
-ac=winsorize(pd.to_numeric(hh["Accel"],errors="coerce"))
-gr=winsorize(pd.to_numeric(hh[gr_col],errors="coerce"))
 
-def z(s):
-    m=np.nanmedian(s); sd=mad_std(s); return (s-m)/(sd if sd>0 else 1)
-hh["SOS"]=0.45*z(ts)+0.35*z(ac)+0.20*z(gr)
-bias=(ac.median()-100)-(gr.median()-100)
-B=min(1.0,abs(bias)/4); S=ac-gr
-hh["ASI2"]=(B*((-S).clip(lower=0) if bias>=0 else S.clip(lower=0))/5).fillna(0)
+hh = metrics.copy()
+gr_col = metrics.attrs.get("GR_COL", "Grind")
+
+# --- SOS (robust z-score blend) ---
+need_cols = {"tsSPI", "Accel", gr_col}
+if need_cols.issubset(hh.columns) and len(hh) > 0:
+    ts_w = winsorize(pd.to_numeric(hh["tsSPI"], errors="coerce"))
+    ac_w = winsorize(pd.to_numeric(hh["Accel"], errors="coerce"))
+    gr_w = winsorize(pd.to_numeric(hh[gr_col], errors="coerce"))
+
+    def rz(s):
+        mu, sd = np.nanmedian(s), mad_std(s)
+        return (s - mu) / (sd if np.isfinite(sd) and sd > 0 else 1.0)
+
+    z_ts, z_ac, z_gr = rz(ts_w), rz(ac_w), rz(gr_w)
+    hh["SOS_raw"] = 0.45*z_ts + 0.35*z_ac + 0.20*z_gr
+    q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
+    denom = max(q95 - q5, 1.0)
+    hh["SOS"] = (2.0 * (hh["SOS_raw"] - q5) / denom).clip(0, 2)
+else:
+    hh["SOS"] = 0.0
+
+# --- ASI² (bias awareness) ---
+acc_med = pd.to_numeric(hh.get("Accel"), errors="coerce").median(skipna=True)
+grd_med = pd.to_numeric(hh.get(gr_col), errors="coerce").median(skipna=True)
+bias = (acc_med - 100.0) - (grd_med - 100.0)
+B = min(1.0, abs(bias) / 4.0)
+S = pd.to_numeric(hh.get("Accel"), errors="coerce") - pd.to_numeric(hh.get(gr_col), errors="coerce")
+hh["ASI2"] = (B * (-S if bias >= 0 else S).clip(lower=0.0) / 5.0).fillna(0.0)
+
+# --- TFS (trip friction) ---
 def tfs_row(r):
-    segs=[c for c in ["300_Time","200_Time","100_Time"] if c in r.index]
-    v=[step/pd.to_numeric(r[c],errors="coerce") for c in segs if pd.notna(r[c])]
-    return 100*np.std(v)/np.nanmean(v) if len(v)>=2 else np.nan
-hh["TFS"]=hh.apply(tfs_row,axis=1)
-gate=3.5 if race_distance_input<1800 else 3.0
-hh["TFS_plus"]=hh["TFS"].apply(lambda x:0 if pd.isna(x) or x<gate else min(0.6,(x-gate)/3))
-hh["UEI"]=hh.apply(lambda r:0.3 if r["tsSPI"]>=102 and r[gr_col]>=102 and r["Accel"]<=100 else 0,axis=1)
-hh["HiddenScore"]=(0.55*hh["SOS"]+0.3*hh["ASI2"]+0.1*hh["TFS_plus"]+0.05*hh["UEI"]).clip(0,3)
-hh["Tier"]=hh["HiddenScore"].apply(lambda s:"🔥" if s>=1.8 else ("🟡" if s>=1.2 else ""))
-hh_view=hh[["Horse","Finish_Pos","PI_RS","GCI_RS","HiddenScore","Tier"]].sort_values(["HiddenScore"],ascending=False)
-st.dataframe(hh_view,use_container_width=True)
+    last_cols = [c for c in ["300_Time", "200_Time", "100_Time"] if c in r.index]
+    spds = [metrics.attrs.get("STEP",100) / as_num(r.get(c)) for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
+    if len(spds) < 2: return np.nan
+    sigma = np.std(spds, ddof=0)
+    mid = as_num(r.get("_MID_spd"))
+    return np.nan if not np.isfinite(mid) or mid <= 0 else 100.0 * (sigma / mid)
 
-# ======================= Ability Matrix v2 (uses PI_RS/GCI_RS) =======================
-st.markdown("## Ability Matrix v2 (uses PI_RS + GCI_RS)")
-AM=metrics.merge(hh[["Horse","HiddenScore"]],on="Horse",how="left").fillna(0)
-gr_col=metrics.attrs.get("GR_COL","Grind")
+hh["TFS"] = hh.apply(tfs_row, axis=1)
+D_rounded = int(np.ceil(float(race_distance_input)/200.0)*200)
+gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
+hh["TFS_plus"] = hh["TFS"].apply(lambda x: 0.0 if pd.isna(x) or x < gate else min(0.6, (x-gate)/3.0))
+
+# --- UEI (underused engine) ---
+def uei_row(r):
+    ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
+    if any(pd.isna([ts,ac,gr])): return 0.0
+    val = 0.0
+    if ts >= 102 and ac <= 98 and gr <= 98:
+        val = 0.3 + 0.3 * min((ts-102)/3.0, 1.0)
+    if ts >= 102 and gr >= 102 and ac <= 100:
+        val = max(val, 0.3 + 0.3 * min(((ts-102)+(gr-102))/6.0, 1.0))
+    return round(val, 3)
+hh["UEI"] = hh.apply(uei_row, axis=1)
+
+# --- HiddenScore ---
+hidden = (0.55*hh["SOS"] + 0.30*hh["ASI2"] + 0.10*hh["TFS_plus"] + 0.05*hh["UEI"]).fillna(0.0)
+if len(hh) <= 6: hidden *= 0.9
+h_med, h_mad = float(np.nanmedian(hidden)), float(np.nanmedian(np.abs(hidden - np.nanmedian(hidden))))
+h_sigma = max(1e-6, 1.4826*h_mad)
+hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
+
+# --- Tier logic (race-shape-aware) ---
+def hh_tier_row(r):
+    pi_rs, gci_rs = as_num(r.get("PI_RS")), as_num(r.get("GCI_RS"))
+    if np.isfinite(pi_rs) and np.isfinite(gci_rs):
+        if pi_rs >= 7.2 and gci_rs >= 6.0: return "🔥 Top Hidden"
+        if pi_rs >= 6.2 and gci_rs >= 5.0: return "🟡 Notable Hidden"
+        return ""
+    hs = as_num(r.get("HiddenScore"))
+    if not np.isfinite(hs): return ""
+    if hs >= 1.8: return "🔥 Top Hidden"
+    if hs >= 1.2: return "🟡 Notable Hidden"
+    return ""
+hh["Tier"] = hh.apply(hh_tier_row, axis=1)
+
+# --- Descriptive note ---
+def hh_note(r):
+    pi_rs, gci_rs = as_num(r.get("PI_RS")), as_num(r.get("GCI_RS"))
+    bits=[]
+    if np.isfinite(pi_rs) and np.isfinite(gci_rs):
+        bits.append(f"PI_RS {pi_rs:.2f}, GCI_RS {gci_rs:.2f}")
+    else:
+        if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
+        asi2 = as_num(r.get("ASI2"))
+        if asi2 >= 0.8: bits.append("ran against strong bias")
+        elif asi2 >= 0.4: bits.append("ran against bias")
+        if as_num(r.get("TFS_plus")) > 0: bits.append("trip friction late")
+        if as_num(r.get("UEI")) >= 0.5: bits.append("latent potential if shape flips")
+    return "; ".join(bits).capitalize()+"."
+hh["Note"] = hh.apply(hh_note, axis=1)
+
+cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+for c in cols_hh:
+    if c not in hh.columns: hh[c] = np.nan
+hh_view = hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True,False,False])[cols_hh]
+st.dataframe(hh_view, use_container_width=True)
+st.caption("Hidden Horses v2 — RS-aware tiering enabled · 🔥 ≥7.2/6.0 · 🟡 ≥6.2/5.0.")
+
+# ======================= Ability Matrix v2 (strict, safe colour norm) =======================
+st.markdown("---")
+st.markdown("## Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict)")
+
+AM = metrics.copy().merge(hh_view[["Horse","HiddenScore"]], on="Horse", how="left").fillna({"HiddenScore":0.0})
+gr_col = metrics.attrs.get("GR_COL","Grind")
+
 AM["IAI"]=0.35*AM["tsSPI"]+0.25*AM["Accel"]+0.25*AM[gr_col]+0.15*AM["F200_idx"]
-AM["BAL"]=100-(AM["Accel"]-AM[gr_col]).abs()/2; AM["COMP"]=100-(AM["tsSPI"]-100).abs()
-def pct_rank(s): return s.rank(pct=True).fillna(0)
+AM["BAL"]=100.0-(AM["Accel"]-AM[gr_col]).abs()/2.0
+AM["COMP"]=100.0-(AM["tsSPI"]-100.0).abs()
+
+def pct_rank(s): return s.rank(pct=True, method="average").fillna(0.0)
 AM["IAI_pct"]=pct_rank(AM["IAI"]); AM["HID_pct"]=pct_rank(AM["HiddenScore"])
-AM["BAL_pct"]=1-pct_rank((AM["BAL"]-100).abs()); AM["COMP_pct"]=1-pct_rank((AM["COMP"]-100).abs())
-AM["AbilityScore"]=(6.5*AM["IAI_pct"]+2.5*AM["HID_pct"]+0.6*AM["BAL_pct"]+0.4*AM["COMP_pct"]).clip(0,10)
+AM["BAL_pct"]=1.0-pct_rank((AM["BAL"]-100.0).abs()); AM["COMP_pct"]=1.0-pct_rank((AM["COMP"]-100.0).abs())
 
-# ---- Tier logic ----
-def tier(r):
-    iai,pi,gci=r["IAI"],r["PI_RS"],r["GCI_RS"]
-    if iai>=101.8 and pi>=7.2 and gci>=6: return "🥇 Elite"
-    if iai>=101.0 and pi>=6.2: return "🥈 High"
-    if iai>=100.4 or pi>=5.4: return "🥉 Comp"
-    return "⚪ Ord"
-AM["Tier"]=AM.apply(tier,axis=1)
+def hidden_scale(iai):
+    if iai < 101.0: return 0.25
+    if iai < 101.5: return 0.50
+    return 1.0
+AM["_hid_scale"]=AM["IAI"].map(hidden_scale)
+AM["AbilityScore"]=(6.5*AM["IAI_pct"]+2.5*(AM["HID_pct"]*AM["_hid_scale"])+0.6*AM["BAL_pct"]+0.4*AM["COMP_pct"]).clip(0,10)
 
-# ---- Plot IAI vs Hidden ----
-plot_df=AM.dropna(subset=["IAI","HiddenScore"])
+field_n=len(AM)
+AM["Confidence"]="High" if field_n>=12 else "Med" if field_n>=8 else "Low"
+
+elite_iai_floor=102.0 if field_n<=7 else 101.8
+elite_pct_floor=0.90 if field_n<=7 else 0.85
+
+def tier_for_row(r):
+    iai,pi,gci,bal=r["IAI"],r["PI"],r["GCI"],r["BAL"]; iai_pct=r["IAI_pct"]
+    conf_ok=r["Confidence"] in ("High","Med")
+    if iai>=elite_iai_floor and pi>=7.2 and gci>=6.0 and iai_pct>=elite_pct_floor and 98<=bal<=104 and conf_ok: return "🥇 Elite"
+    if iai>=101.0 and pi>=6.2 and iai_pct>=0.70 and 97<=bal<=105: return "🥈 High"
+    if iai>=100.4 or iai_pct>=0.55 or pi>=5.4: return "🥉 Competitive"
+    return "⚪ Ordinary"
+AM["AbilityTier"]=AM.apply(tier_for_row, axis=1)
+
+# --- Near-Elite helper ---
+def near_elite_row(r):
+    hits=sum([
+        r["IAI"]>=elite_iai_floor,
+        r["PI"]>=7.2,
+        r["GCI"]>=6.0,
+        r["IAI_pct"]>=elite_pct_floor,
+        98<=r["BAL"]<=104,
+        r["Confidence"] in ("High","Med")
+    ])
+    return "⭐ Near-Elite" if hits>=4 and r["AbilityTier"]!="🥇 Elite" else ""
+AM["NearEliteFlag"]=AM.apply(near_elite_row, axis=1)
+
+# --- Plot ---
+need_cols_am={"Horse","IAI","HiddenScore","PI","BAL"}
+plot_df=AM.dropna(subset=list(need_cols_am))
 if not plot_df.empty:
-    x=plot_df["IAI"]-100; y=plot_df["HiddenScore"]
-    sizes=60+(plot_df["PI_RS"]/10)*200
-    norm=TwoSlopeNorm(vcenter=100,vmin=plot_df["BAL"].min(),vmax=plot_df["BAL"].max())
-    figA,axA=plt.subplots(figsize=(8.4,6))
-    sc=axA.scatter(x,y,s=sizes,c=plot_df["BAL"],cmap="coolwarm",norm=norm,edgecolor="black",lw=0.5)
-    label_points_neatly(axA,x,y,plot_df["Horse"].astype(str).tolist())
-    axA.axvline(0,color="grey",lw=1,ls="--"); axA.axhline(1.2,color="grey",lw=0.8,ls=":")
-    axA.set_xlabel("Intrinsic Ability (IAI – 100)"); axA.set_ylabel("Hidden Score (0–3)")
-    axA.set_title("Ability Matrix – Size = PI_RS · Colour = BAL (100 = balanced)")
-    cbar=figA.colorbar(sc,ax=axA); cbar.set_label("BAL")
+    x=plot_df["IAI"]-100.0; y=plot_df["HiddenScore"]; sizes=60+(plot_df["PI"]/10)*200
+    bal_vals=pd.to_numeric(plot_df["BAL"],errors="coerce")
+    finite_bal=bal_vals[np.isfinite(bal_vals)]
+    if finite_bal.empty: vmin,vmax=99,101
+    else:
+        vmin,vmax=float(finite_bal.min()),float(finite_bal.max())
+        if vmin==vmax: vmin-=0.5; vmax+=0.5
+        if vmax<=100: vmax=100.1
+        if vmin>=100: vmin=99.9
+    norm=TwoSlopeNorm(vcenter=100.0,vmin=vmin,vmax=vmax)
+    figA,axA=plt.subplots(figsize=(8.6,6.0))
+    sc=axA.scatter(x,y,s=sizes,c=plot_df["BAL"],cmap="coolwarm",norm=norm,edgecolor="black",linewidth=0.6,alpha=0.95)
+    label_points_neatly(axA,x.values,y.values,plot_df["Horse"].astype(str).tolist())
+    axA.axvline(0,color="gray",lw=1.0,ls="--"); axA.axhline(1.2,color="gray",lw=0.8,ls=":")
+    axA.set_xlabel("Intrinsic Ability (IAI–100) →"); axA.set_ylabel("HiddenScore (0–3) ↑")
+    axA.set_title("Ability Matrix v2 — Size = PI · Colour = BAL (100 = balanced late)")
+    for s,lab in [(60,"PI low"),(160,"PI mid"),(260,"PI high")]:
+        axA.scatter([],[],s=s,label=lab,color="gray",edgecolor="black")
+    axA.legend(loc="upper left",frameon=False,fontsize=8,title="Point size:")
+    cbar=figA.colorbar(sc,ax=axA,fraction=0.05,pad=0.04); cbar.set_label("BAL (100 = balanced late)")
+    axA.grid(True,linestyle=":",alpha=0.25)
     st.pyplot(figA)
-
-st.caption("Ability Matrix v2 · IAI from core sectionals · Hidden = latent upside · BAL = finish balance · Tier via IAI+PI_RS+GCI_RS")
