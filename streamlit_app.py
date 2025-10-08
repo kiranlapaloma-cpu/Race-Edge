@@ -285,8 +285,16 @@ def build_metrics(df_in: pd.DataFrame, D_actual_m: float, use_cg: bool, dampen_c
     w["Grind"]    = speed_to_index(pd.to_numeric(w["_GR_spd"],   errors="coerce"))
 
     # ---------- Corrected Grind (CG) ----------
-    ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
-    GR_field  = pd.to_numeric(w["_GR_spd"],  errors="coerce").mean(skipna=True)
+    ACC_series = pd.to_numeric(w["_ACC_spd"], errors="coerce")
+    GR_series  = pd.to_numeric(w["_GR_spd"],  errors="coerce")
+
+    if ACC_series.notna().any() and GR_series.notna().any():
+        ACC_field = ACC_series.mean()
+        GR_field  = GR_series.mean()
+    else:
+        ACC_field = np.nan
+        GR_field  = np.nan
+
     FSR = float(GR_field / ACC_field) if (ACC_field and ACC_field > 0 and math.isfinite(ACC_field) and math.isfinite(GR_field)) else np.nan
     if not math.isfinite(FSR):
         FSR = 1.0
@@ -790,13 +798,31 @@ else:
         x = plot_df["IAI"] - 100.0
         y = plot_df["HiddenScore"]
         sizes = 60.0 + (plot_df["PI"].clip(0,10) / 10.0) * 200.0
-        vmin, vmax = float(plot_df["BAL"].min()), float(plot_df["BAL"].max())
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+
+        # --- Robust BAL colour scale with TwoSlopeNorm (vcenter=100) ---
+        bal = plot_df["BAL"].astype(float)
+        vmin = float(np.nanmin(bal)) if bal.notna().any() else np.nan
+        vmax = float(np.nanmax(bal)) if bal.notna().any() else np.nan
+
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
             vmin, vmax = 95.0, 105.0
+
+        spread = max(0.1, vmax - vmin)
+        pad = max(0.5, 0.25 * spread)
+
+        if vmax <= 100.0:
+            vmin = min(vmin, 100.0 - pad)
+            vmax = 100.0 + pad
+        elif vmin >= 100.0:
+            vmin = 100.0 - pad
+            vmax = max(vmax, 100.0 + pad)
+        elif spread < 1e-6:
+            vmin, vmax = 99.5, 100.5
+
         norm = TwoSlopeNorm(vcenter=100.0, vmin=vmin, vmax=vmax)
 
         figA, axA = plt.subplots(figsize=(8.6, 6.0))
-        sc = axA.scatter(x, y, s=sizes, c=plot_df["BAL"], cmap="coolwarm", norm=norm,
+        sc = axA.scatter(x, y, s=sizes, c=bal, cmap="coolwarm", norm=norm,
                          edgecolor="black", linewidth=0.6, alpha=0.95)
 
         for xi, yi, nm in zip(x, y, plot_df["Horse"].astype(str).tolist()):
@@ -859,7 +885,7 @@ def make_pdf_report(*, distance_m:int, metrics_table_df:pd.DataFrame,
     # Header
     story.append(Paragraph(f"Race Distance: <b>{int(distance_m)}m</b>", H))
     if integrity_text:
-        story.append(Paragraph(f"<font color='#b36b00'>⚠ {integrity_text}</font>", P))
+        story.append(Paragraph(f"<font color='#b36b00'>⚠ {integrity_line()}</font>", P))
     if cg_note:
         story.append(Paragraph(cg_note, P))
     story.append(Spacer(0, 6))
