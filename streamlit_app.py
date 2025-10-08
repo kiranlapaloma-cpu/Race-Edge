@@ -1067,3 +1067,173 @@ AM_view = AM.sort_values(["AbilityScore","PI","Finish_Pos"], ascending=[False, F
 st.dataframe(AM_view, use_container_width=True)
 
 # ------------------ Hand-off to Batch 4 (DB save/search + PDF) ------------------
+# ======================= Batch 4 — Database, Search & PDF Export =======================
+import sqlite3
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.units import cm
+
+DB_PATH = "race_edge.db"
+
+# ----------------------- Database Setup -----------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS races (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        race_date TEXT,
+        race_name TEXT,
+        distance INTEGER,
+        horse TEXT,
+        finish_pos INTEGER,
+        iai REAL,
+        hidden REAL,
+        ability REAL,
+        tier TEXT,
+        direction TEXT,
+        confidence TEXT,
+        pi REAL,
+        gci REAL,
+        UNIQUE(race_date, race_name, horse)
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ----------------------- Store race to DB -----------------------
+def save_race_to_db(date, name, distance, am_df):
+    conn = sqlite3.connect(DB_PATH)
+    am_df = am_df.fillna("")
+    for _, r in am_df.iterrows():
+        conn.execute("""
+        INSERT OR REPLACE INTO races
+        (race_date, race_name, distance, horse, finish_pos, iai, hidden,
+         ability, tier, direction, confidence, pi, gci)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            date, name, distance,
+            str(r.get("Horse","")),
+            int(r.get("Finish_Pos") or 0),
+            float(r.get("IAI") or 0),
+            float(r.get("HiddenScore") or 0),
+            float(r.get("AbilityScore") or 0),
+            str(r.get("AbilityTier") or ""),
+            str(r.get("DirectionHint") or ""),
+            str(r.get("Confidence") or ""),
+            float(r.get("PI") or 0),
+            float(r.get("GCI") or 0)
+        ))
+    conn.commit()
+    conn.close()
+
+# ----------------------- Horse Search -----------------------
+st.markdown("---")
+st.markdown("### 🐎 Horse Database Search")
+
+search_name = st.text_input("Search horse name (exact or partial):").strip()
+if search_name:
+    conn = sqlite3.connect(DB_PATH)
+    df_search = pd.read_sql_query(
+        f"SELECT * FROM races WHERE horse LIKE ?", conn, params=[f"%{search_name}%"]
+    )
+    conn.close()
+    if df_search.empty:
+        st.info("No records found.")
+    else:
+        df_search = df_search.sort_values(["race_date","distance"], ascending=[False, True])
+        st.dataframe(df_search, use_container_width=True)
+        st.caption("Showing stored performances for matching horses.")
+else:
+    st.caption("Type a horse name to query stored performances.")
+
+# ----------------------- Save current race -----------------------
+st.markdown("### 💾 Save current race to database")
+race_date = st.text_input("Race date (YYYY-MM-DD):", "")
+race_name = st.text_input("Race name or track:", "")
+if st.button("Save this race to DB"):
+    if race_date and race_name and not AM_view.empty:
+        save_race_to_db(race_date, race_name, int(race_distance_input), AM_view)
+        st.success(f"Saved {len(AM_view)} horses from {race_name} ({race_date}).")
+    else:
+        st.warning("Please provide race date, race name, and ensure Ability Matrix table is loaded.")
+
+# ----------------------- PDF Report Builder -----------------------
+st.markdown("---")
+st.markdown("### 📥 Export Complete Race Report (PDF)")
+
+def make_pdf_report(distance_m:int, metrics_table_df:pd.DataFrame,
+                    shape_png:bytes|None, pace_png:bytes|None,
+                    ability_png:bytes|None, ability_table_df:pd.DataFrame,
+                    hidden_table_df:pd.DataFrame, race_title:str):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
+                            leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    styles = getSampleStyleSheet()
+    story = [Paragraph(f"<b>{race_title}</b> — {distance_m} m", styles["Heading1"]), Spacer(0,6)]
+
+    # Sectional Metrics
+    story.append(Paragraph("Sectional Metrics", styles["Heading3"]))
+    tbl_df = metrics_table_df.copy().fillna("").astype(str)
+    data = [list(tbl_df.columns)] + tbl_df.values.tolist()
+    t = Table(data, repeatRows=1)
+    t.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+        ('GRID',(0,0),(-1,-1),0.25,colors.whitesmoke),
+        ('FONTSIZE',(0,1),(-1,-1),8)
+    ]))
+    story.append(t); story.append(Spacer(0,10))
+
+    # Images
+    if shape_png:
+        story.append(Paragraph("Sectional Shape Map", styles["Heading3"]))
+        story.append(Image(io.BytesIO(shape_png), width=24*cm, height=17*cm, kind="proportional"))
+        story.append(Spacer(0,8))
+    if pace_png:
+        story.append(Paragraph("Pace Curve", styles["Heading3"]))
+        story.append(Image(io.BytesIO(pace_png), width=24*cm, height=15*cm, kind="proportional"))
+        story.append(Spacer(0,8))
+    if ability_png:
+        story.append(Paragraph("Ability Matrix", styles["Heading3"]))
+        story.append(Image(io.BytesIO(ability_png), width=24*cm, height=16*cm, kind="proportional"))
+        story.append(Spacer(0,8))
+
+    # Hidden Horses table
+    flagged = hidden_table_df[hidden_table_df["Tier"] != ""].copy()
+    story.append(Paragraph("Hidden Horses (flagged)", styles["Heading3"]))
+    if not flagged.empty:
+        data_hh = [list(flagged.columns)] + flagged.fillna("").astype(str).values.tolist()
+        t2 = Table(data_hh, repeatRows=1)
+        t2.setStyle(TableStyle([
+            ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
+            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+            ('GRID',(0,0),(-1,-1),0.25,colors.whitesmoke),
+            ('FONTSIZE',(0,1),(-1,-1),8)
+        ]))
+        story.append(t2)
+    else:
+        story.append(Paragraph("No horses flagged as Hidden in this race.", styles["Normal"]))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+if st.button("Generate PDF Report"):
+    pdf_buf = make_pdf_report(
+        distance_m=int(race_distance_input),
+        metrics_table_df=display_df,
+        shape_png=shape_map_png,
+        pace_png=pace_png,
+        ability_png=ability_png,
+        ability_table_df=AM_view,
+        hidden_table_df=hh_view,
+        race_title=f"Race Analysis — {int(race_distance_input)} m"
+    )
+    st.download_button("📥 Download PDF", data=pdf_buf.getvalue(),
+                       file_name=f"RaceEdge_{int(race_distance_input)}m_Report.pdf",
+                       mime="application/pdf")
