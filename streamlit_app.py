@@ -874,4 +874,182 @@ else:
         shape_map_png=buf.getvalue()
         st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
         st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
-        
+        # ======================= Hidden Horses (v2, shape-aware) =======================
+st.markdown("## Hidden Horses v2 (Shape-aware)")
+
+hh = metrics.copy()
+gr_col = metrics.attrs.get("GR_COL", "Grind")
+
+# --- SOS (robust z-score blend) ---
+need_cols = {"tsSPI", "Accel", gr_col}
+if need_cols.issubset(hh.columns) and len(hh) > 0:
+    ts_w = winsorize(pd.to_numeric(hh["tsSPI"], errors="coerce"))
+    ac_w = winsorize(pd.to_numeric(hh["Accel"], errors="coerce"))
+    gr_w = winsorize(pd.to_numeric(hh[gr_col], errors="coerce"))
+
+    def rz(s):
+        mu, sd = np.nanmedian(s), mad_std(s)
+        return (s - mu) / (sd if np.isfinite(sd) and sd > 0 else 1.0)
+
+    z_ts, z_ac, z_gr = rz(ts_w), rz(ac_w), rz(gr_w)
+    hh["SOS_raw"] = 0.45*z_ts + 0.35*z_ac + 0.20*z_gr
+    q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
+    denom = max(q95 - q5, 1.0)
+    hh["SOS"] = (2.0 * (hh["SOS_raw"] - q5) / denom).clip(0, 2)
+else:
+    hh["SOS"] = 0.0
+
+# --- ASI² (bias awareness) ---
+acc_med = pd.to_numeric(hh.get("Accel"), errors="coerce").median(skipna=True)
+grd_med = pd.to_numeric(hh.get(gr_col), errors="coerce").median(skipna=True)
+bias = (acc_med - 100.0) - (grd_med - 100.0)
+B = min(1.0, abs(bias) / 4.0)
+S = pd.to_numeric(hh.get("Accel"), errors="coerce") - pd.to_numeric(hh.get(gr_col), errors="coerce")
+hh["ASI2"] = (B * (-S if bias >= 0 else S).clip(lower=0.0) / 5.0).fillna(0.0)
+
+# --- TFS (trip friction) ---
+def tfs_row(r):
+    last_cols = [c for c in ["300_Time", "200_Time", "100_Time"] if c in r.index]
+    spds = [metrics.attrs.get("STEP",100) / as_num(r.get(c)) for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
+    if len(spds) < 2: return np.nan
+    sigma = np.std(spds, ddof=0)
+    mid = as_num(r.get("_MID_spd"))
+    return np.nan if not np.isfinite(mid) or mid <= 0 else 100.0 * (sigma / mid)
+
+hh["TFS"] = hh.apply(tfs_row, axis=1)
+D_rounded = int(np.ceil(float(race_distance_input)/200.0)*200)
+gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
+hh["TFS_plus"] = hh["TFS"].apply(lambda x: 0.0 if pd.isna(x) or x < gate else min(0.6, (x-gate)/3.0))
+
+# --- UEI (underused engine) ---
+def uei_row(r):
+    ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
+    if any(pd.isna([ts,ac,gr])): return 0.0
+    val = 0.0
+    if ts >= 102 and ac <= 98 and gr <= 98:
+        val = 0.3 + 0.3 * min((ts-102)/3.0, 1.0)
+    if ts >= 102 and gr >= 102 and ac <= 100:
+        val = max(val, 0.3 + 0.3 * min(((ts-102)+(gr-102))/6.0, 1.0))
+    return round(val, 3)
+hh["UEI"] = hh.apply(uei_row, axis=1)
+
+# --- HiddenScore ---
+hidden = (0.55*hh["SOS"] + 0.30*hh["ASI2"] + 0.10*hh["TFS_plus"] + 0.05*hh["UEI"]).fillna(0.0)
+if len(hh) <= 6: hidden *= 0.9
+h_med, h_mad = float(np.nanmedian(hidden)), float(np.nanmedian(np.abs(hidden - np.nanmedian(hidden))))
+h_sigma = max(1e-6, 1.4826*h_mad)
+hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
+
+# --- Tier logic (race-shape-aware) ---
+def hh_tier_row(r):
+    pi_rs, gci_rs = as_num(r.get("PI_RS")), as_num(r.get("GCI_RS"))
+    if np.isfinite(pi_rs) and np.isfinite(gci_rs):
+        if pi_rs >= 7.2 and gci_rs >= 6.0: return "🔥 Top Hidden"
+        if pi_rs >= 6.2 and gci_rs >= 5.0: return "🟡 Notable Hidden"
+        return ""
+    hs = as_num(r.get("HiddenScore"))
+    if not np.isfinite(hs): return ""
+    if hs >= 1.8: return "🔥 Top Hidden"
+    if hs >= 1.2: return "🟡 Notable Hidden"
+    return ""
+hh["Tier"] = hh.apply(hh_tier_row, axis=1)
+
+# --- Descriptive note ---
+def hh_note(r):
+    pi_rs, gci_rs = as_num(r.get("PI_RS")), as_num(r.get("GCI_RS"))
+    bits=[]
+    if np.isfinite(pi_rs) and np.isfinite(gci_rs):
+        bits.append(f"PI_RS {pi_rs:.2f}, GCI_RS {gci_rs:.2f}")
+    else:
+        if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
+        asi2 = as_num(r.get("ASI2"))
+        if asi2 >= 0.8: bits.append("ran against strong bias")
+        elif asi2 >= 0.4: bits.append("ran against bias")
+        if as_num(r.get("TFS_plus")) > 0: bits.append("trip friction late")
+        if as_num(r.get("UEI")) >= 0.5: bits.append("latent potential if shape flips")
+    return "; ".join(bits).capitalize()+"."
+hh["Note"] = hh.apply(hh_note, axis=1)
+
+cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+for c in cols_hh:
+    if c not in hh.columns: hh[c] = np.nan
+hh_view = hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True,False,False])[cols_hh]
+st.dataframe(hh_view, use_container_width=True)
+st.caption("Hidden Horses v2 — RS-aware tiering enabled · 🔥 ≥7.2/6.0 · 🟡 ≥6.2/5.0.")
+
+# ======================= Ability Matrix v2 (strict, safe colour norm) =======================
+st.markdown("---")
+st.markdown("## Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict)")
+
+AM = metrics.copy().merge(hh_view[["Horse","HiddenScore"]], on="Horse", how="left").fillna({"HiddenScore":0.0})
+gr_col = metrics.attrs.get("GR_COL","Grind")
+
+AM["IAI"]=0.35*AM["tsSPI"]+0.25*AM["Accel"]+0.25*AM[gr_col]+0.15*AM["F200_idx"]
+AM["BAL"]=100.0-(AM["Accel"]-AM[gr_col]).abs()/2.0
+AM["COMP"]=100.0-(AM["tsSPI"]-100.0).abs()
+
+def pct_rank(s): return s.rank(pct=True, method="average").fillna(0.0)
+AM["IAI_pct"]=pct_rank(AM["IAI"]); AM["HID_pct"]=pct_rank(AM["HiddenScore"])
+AM["BAL_pct"]=1.0-pct_rank((AM["BAL"]-100.0).abs()); AM["COMP_pct"]=1.0-pct_rank((AM["COMP"]-100.0).abs())
+
+def hidden_scale(iai):
+    if iai < 101.0: return 0.25
+    if iai < 101.5: return 0.50
+    return 1.0
+AM["_hid_scale"]=AM["IAI"].map(hidden_scale)
+AM["AbilityScore"]=(6.5*AM["IAI_pct"]+2.5*(AM["HID_pct"]*AM["_hid_scale"])+0.6*AM["BAL_pct"]+0.4*AM["COMP_pct"]).clip(0,10)
+
+field_n=len(AM)
+AM["Confidence"]="High" if field_n>=12 else "Med" if field_n>=8 else "Low"
+
+elite_iai_floor=102.0 if field_n<=7 else 101.8
+elite_pct_floor=0.90 if field_n<=7 else 0.85
+
+def tier_for_row(r):
+    iai,pi,gci,bal=r["IAI"],r["PI"],r["GCI"],r["BAL"]; iai_pct=r["IAI_pct"]
+    conf_ok=r["Confidence"] in ("High","Med")
+    if iai>=elite_iai_floor and pi>=7.2 and gci>=6.0 and iai_pct>=elite_pct_floor and 98<=bal<=104 and conf_ok: return "🥇 Elite"
+    if iai>=101.0 and pi>=6.2 and iai_pct>=0.70 and 97<=bal<=105: return "🥈 High"
+    if iai>=100.4 or iai_pct>=0.55 or pi>=5.4: return "🥉 Competitive"
+    return "⚪ Ordinary"
+AM["AbilityTier"]=AM.apply(tier_for_row, axis=1)
+
+# --- Near-Elite helper ---
+def near_elite_row(r):
+    hits=sum([
+        r["IAI"]>=elite_iai_floor,
+        r["PI"]>=7.2,
+        r["GCI"]>=6.0,
+        r["IAI_pct"]>=elite_pct_floor,
+        98<=r["BAL"]<=104,
+        r["Confidence"] in ("High","Med")
+    ])
+    return "⭐ Near-Elite" if hits>=4 and r["AbilityTier"]!="🥇 Elite" else ""
+AM["NearEliteFlag"]=AM.apply(near_elite_row, axis=1)
+
+# --- Plot ---
+need_cols_am={"Horse","IAI","HiddenScore","PI","BAL"}
+plot_df=AM.dropna(subset=list(need_cols_am))
+if not plot_df.empty:
+    x=plot_df["IAI"]-100.0; y=plot_df["HiddenScore"]; sizes=60+(plot_df["PI"]/10)*200
+    bal_vals=pd.to_numeric(plot_df["BAL"],errors="coerce")
+    finite_bal=bal_vals[np.isfinite(bal_vals)]
+    if finite_bal.empty: vmin,vmax=99,101
+    else:
+        vmin,vmax=float(finite_bal.min()),float(finite_bal.max())
+        if vmin==vmax: vmin-=0.5; vmax+=0.5
+        if vmax<=100: vmax=100.1
+        if vmin>=100: vmin=99.9
+    norm=TwoSlopeNorm(vcenter=100.0,vmin=vmin,vmax=vmax)
+    figA,axA=plt.subplots(figsize=(8.6,6.0))
+    sc=axA.scatter(x,y,s=sizes,c=plot_df["BAL"],cmap="coolwarm",norm=norm,edgecolor="black",linewidth=0.6,alpha=0.95)
+    label_points_neatly(axA,x.values,y.values,plot_df["Horse"].astype(str).tolist())
+    axA.axvline(0,color="gray",lw=1.0,ls="--"); axA.axhline(1.2,color="gray",lw=0.8,ls=":")
+    axA.set_xlabel("Intrinsic Ability (IAI–100) →"); axA.set_ylabel("HiddenScore (0–3) ↑")
+    axA.set_title("Ability Matrix v2 — Size = PI · Colour = BAL (100 = balanced late)")
+    for s,lab in [(60,"PI low"),(160,"PI mid"),(260,"PI high")]:
+        axA.scatter([],[],s=s,label=lab,color="gray",edgecolor="black")
+    axA.legend(loc="upper left",frameon=False,fontsize=8,title="Point size:")
+    cbar=figA.colorbar(sc,ax=axA,fraction=0.05,pad=0.04); cbar.set_label("BAL (100 = balanced late)")
+    axA.grid(True,linestyle=":",alpha=0.25)
+    st.pyplot(figA)
