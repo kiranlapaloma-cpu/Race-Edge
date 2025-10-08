@@ -1122,6 +1122,59 @@ AM_view = AM.sort_values(
 )[am_cols]
 st.dataframe(AM_view, use_container_width=True)
 
+# ---------- Plot (IAI vs Hidden) ----------
+need_cols_am = {"Horse","IAI","HiddenScore","PI","BAL"}
+if not need_cols_am.issubset(AM.columns):
+    st.info("Ability Matrix: missing columns.")
+else:
+    plot_df = AM.dropna(subset=["IAI","HiddenScore","PI","BAL"]).copy()
+    if plot_df.empty:
+        st.info("Not enough complete data to draw Ability Matrix.")
+    else:
+        x = plot_df["IAI"] - 100.0
+        y = plot_df["HiddenScore"]
+        sizes = 60.0 + (plot_df["PI"].clip(0,10) / 10.0) * 200.0
+
+        # -------- Fixed safe TwoSlopeNorm setup --------
+        vals = pd.to_numeric(plot_df["BAL"], errors="coerce").to_numpy()
+        vmin, vmax = np.nanmin(vals), np.nanmax(vals)
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            vmin, vmax = 99.0, 101.0
+        if vmin == vmax:
+            vmin, vmax = vmin - 1.0, vmax + 1.0
+        EPS = 0.2
+        if vmax <= 100.0: vmax = 100.0 + EPS
+        if vmin >= 100.0: vmin = 100.0 - EPS
+        norm = TwoSlopeNorm(vcenter=100.0, vmin=vmin, vmax=vmax)
+        # ------------------------------------------------
+
+        figA, axA = plt.subplots(figsize=(8.6, 6.0))
+        sc = axA.scatter(x, y, s=sizes, c=plot_df["BAL"], cmap="coolwarm", norm=norm,
+                         edgecolor="black", linewidth=0.6, alpha=0.95)
+
+        label_points_neatly(axA, x.values, y.values, plot_df["Horse"].astype(str).tolist())
+
+        axA.axvline(0.0, color="gray", lw=1.0, ls="--")
+        axA.axhline(1.2, color="gray", lw=0.8, ls=":")
+        axA.set_xlabel("Intrinsic Ability (IAI – 100)  →")
+        axA.set_ylabel("HiddenScore (0–3)  ↑")
+        axA.set_title("Ability Matrix v2 — Size = PI · Colour = BAL (balance)")
+
+        for s, lab in [(60, "PI low"), (160, "PI mid"), (260, "PI high")]:
+            axA.scatter([], [], s=s, label=lab, color="gray", edgecolor="black")
+        axA.legend(loc="upper left", frameon=False, fontsize=8, title="Point size:")
+        cbar = figA.colorbar(sc, ax=axA, fraction=0.05, pad=0.04)
+        cbar.set_label("BAL (100 = balanced late)")
+        axA.grid(True, linestyle=":", alpha=0.25)
+        st.pyplot(figA)
+
+        buf = io.BytesIO()
+        figA.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
+        ability_png = buf.getvalue()
+        st.download_button("Download Ability Matrix (PNG)", ability_png,
+                           file_name="ability_matrix_v2.png", mime="image/png")
+
+
 # ------------------ Hand-off to Batch 4 (DB save/search + PDF) ------------------
 # ======================= Batch 4 — Database, Search & PDF Export =======================
 import sqlite3
