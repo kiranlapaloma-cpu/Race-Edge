@@ -292,12 +292,13 @@ if split_step == 200:
 # -------------------------------------------------------------------------
 # Hand-off: Batch 2 will compute metrics and the Race Shape module (SED/FRA/SCI)
 # ======================= Batch 2 — Metrics Engine + Race Shape (SED/SCI/FRA) =======================
+# (Drop-in replacement)
+
 import math
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
 
-# -------- Small helpers used here (uses your existing as_num, mad_std, winsorize) --------
+# -------- Stage helpers (100m/200m aware) --------
 def collect_markers(df):
     marks = []
     for c in df.columns:
@@ -345,8 +346,9 @@ def grind_speed(row, step):
             return np.nan
         return 200.0 / float(tfin)
 
-# -------- Distance/context weights for PI v3.x (unchanged) --------
-def _lerp(a, b, t): return a + (b - a) * float(t)
+# -------- Distance + context weights for PI v3.x --------
+def _lerp(a, b, t):
+    return a + (b - a) * float(t)
 
 def _interpolate_weights(dm, a_dm, a_w, b_dm, b_w):
     span = float(b_dm - a_dm)
@@ -385,17 +387,18 @@ def pi_weights_distance_and_context(distance_m: float,
         ts = max(0.0, 1.0 - F200 - ACC - grind)
         base = {"F200_idx":F200, "tsSPI":ts, "Accel":ACC, "Grind":grind}
 
+    # Context tweak based on within-race bias (Accel vs Grind medians)
     acc_med = float(acc_median) if acc_median is not None else None
     grd_med = float(grd_median) if grd_median is not None else None
     if acc_med is not None and grd_med is not None and math.isfinite(acc_med) and math.isfinite(grd_med):
         bias = acc_med - grd_med
-        scale = math.tanh(abs(bias) / 6.0)
+        scale = math.tanh(abs(bias) / 6.0)          # sensitivity curve
         max_shift = 0.02 * scale
         F200 = base["F200_idx"]; ts = base["tsSPI"]; ACC = base["Accel"]; GR = base["Grind"]
-        if bias > 0:
+        if bias > 0:           # acceleration rewarded → rebalance a touch toward Grind
             delta = min(max_shift, ACC - 0.26)
             ACC -= delta; GR += delta
-        elif bias < 0:
+        elif bias < 0:         # grinding rewarded → swing a hair back to Accel
             delta = min(max_shift, GR - 0.18)
             GR  -= delta; ACC += delta
         GR = min(GR, 0.40)
@@ -406,109 +409,6 @@ def pi_weights_distance_and_context(distance_m: float,
     if abs(s - 1.0) > 1e-6:
         base = {k: v / s for k, v in base.items()}
     return base
-
-# ---------- Race Shape v2.2 (balanced thresholds; bias-aware) ----------
-from dataclasses import dataclass
-
-@dataclass
-class RaceShapeResult:
-    label: str
-    confidence: float
-    details: dict
-
-def _mad_v2(arr):
-    x = np.asarray(pd.to_numeric(arr, errors="coerce"), dtype=float)
-    x = x[np.isfinite(x)]
-    if x.size == 0: return np.nan
-    med = np.median(x)
-    return 1.4826 * np.median(np.abs(x - med))
-
-def classify_race_shape_v2_2(df: pd.DataFrame, *, distance_m: int, gr_col: str,
-                             fsr: float | None, step: int,
-                             min_valid_frac: float = 0.60,
-                             boot_n: int = 200, rng_seed: int = 17) -> RaceShapeResult:
-    """Improved: harder to trigger Slow-Early; uses both index + absolute speeds."""
-    E = pd.to_numeric(df.get("F200_idx"), errors="coerce")
-    M = pd.to_numeric(df.get("tsSPI"), errors="coerce")
-    A = pd.to_numeric(df.get("Accel"), errors="coerce")
-    G = pd.to_numeric(df.get(gr_col), errors="coerce")
-    L = 0.6*A + 0.4*G
-
-    # ----- field medians vs 100 baseline -----
-    E_med, M_med, L_med = map(lambda s: float(np.nanmedian(s)), (E,M,L))
-    dE, dM, dL = E_med-100.0, M_med-100.0, L_med-100.0
-
-    def gate_from(series):
-        s = _mad_v2(series-100.0)
-        if not np.isfinite(s) or s<=0: s=2.5
-        return max(2.5,0.6*s)
-
-    gE,gM,gL = map(gate_from,(E,M,L))
-    # scale by distance
-    if distance_m<=1200: scale=1.0
-    elif distance_m<1800: scale=1.1
-    else: scale=1.25
-    gE*=scale; gM*=scale; gL*=scale
-
-    # widen gates on low data quality
-    for v,g in zip((E,M,L),(gE,gM,gL)):
-        if v.notna().mean()<min_valid_frac: g+=0.5
-
-    # confirm modifiers
-    bump_fast=bump_slow=0.0
-    if fsr and np.isfinite(fsr):
-        if fsr<0.98: bump_fast+=0.05
-        elif fsr>1.02: bump_slow+=0.05
-
-    # ----- core decision -----
-    MARGIN=0.7  # makes “Slow-Early” stricter
-    def decide(de,dm,dl):
-        if (de>=gE+MARGIN) and (dl<=-(gL+MARGIN)): return "Fast-Early"
-        if (de<=-(gE+MARGIN)) and (dl>=+(gL+MARGIN)): return "Slow-Early"
-        if (dm>=gM+MARGIN) and (abs(de)<0.6*gE) and (abs(dl)<0.6*gL): return "Fast-Mid"
-        if (dm<=-(gM+MARGIN)) and (abs(de)<0.6*gE) and (abs(dl)<0.6*gL): return "Slow-Mid"
-        return "Even"
-
-    base_label=decide(dE,dM,dL)
-
-    # ----- absolute-speed cross-check -----
-    early_spd=float(pd.to_numeric(df.get("_EARLY_spd"),errors="coerce").mean(skipna=True))
-    late_spd=float(pd.to_numeric(df.get("_ACC_spd"),errors="coerce").mean(skipna=True))
-    abs_override=None
-    if np.isfinite(early_spd) and np.isfinite(late_spd) and early_spd>0:
-        ratio=late_spd/early_spd
-        if ratio<=0.93: abs_override="Fast-Early"
-        elif ratio>=1.07: abs_override="Slow-Early"
-
-    # ----- bootstrap confidence -----
-    n=len(df); conf=0.6; final_label=base_label
-    if n>=6 and boot_n:
-        rng=np.random.default_rng(rng_seed)
-        idx=df.index.to_numpy()
-        labs=[]
-        for _ in range(boot_n):
-            take=rng.choice(idx,size=n,replace=True)
-            Ee,Mm,Ll=(float(np.nanmedian(E.loc[take])),
-                      float(np.nanmedian(M.loc[take])),
-                      float(np.nanmedian(L.loc[take])))
-            labs.append(decide(Ee-100.0,Mm-100.0,Ll-100.0))
-        from collections import Counter
-        c=Counter(labs)
-        if bump_fast>0:c["Fast-Early"]+=int(boot_n*0.03)
-        if bump_slow>0:c["Slow-Early"]+=int(boot_n*0.03)
-        final_label,count=max(c.items(),key=lambda kv:kv[1])
-        conf=count/sum(c.values())
-
-    if abs_override and final_label=="Even":
-        final_label=abs_override; conf=max(conf,0.7)
-
-    details=dict(
-        medians=dict(E=E_med,M=M_med,L=L_med),
-        deltas=dict(dE=dE,dM=dM,dL=dL),
-        gates=dict(gE=gE,gM=gM,gL=gL),
-        fsr=fsr,abs_override=abs_override
-    )
-    return RaceShapeResult(label=final_label,confidence=float(conf),details=details)
 
 # -------- Metric builder (handles 100m and 200m) --------
 def build_metrics_and_shape(df_in: pd.DataFrame,
@@ -526,7 +426,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
 
     seg_markers = collect_markers(w)
 
-    # Per-segment speeds (m/s)
+    # Per-segment speeds
     for m in seg_markers:
         w[f"spd_{m}"] = (step * 1.0) / as_num(w.get(f"{m}_Time"))
     w["spd_Finish"] = (100.0 if step == 100 else 200.0) / as_num(w.get("Finish_Time")) if "Finish_Time" in w.columns else np.nan
@@ -560,7 +460,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     tssp_cols = [c for c in tssp_cols if c in w.columns]
     w["_MID_spd"] = w.apply(lambda r: stage_speed(r, tssp_cols, float(step)), axis=1)
 
-    # Accel: 600→200 (100m: 500,400,300,200; 200m: 600,400)
+    # Accel: 600→200
     if step == 100:
         accel_cols = [c for c in [f"{m}_Time" for m in [500,400,300,200]] if c in w.columns]
     else:
@@ -570,7 +470,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     # Grind (finish)
     w["_GR_spd"] = w.apply(lambda r: grind_speed(r, step), axis=1)
 
-    # ---------- Map speeds → indices (robust) ----------
+    # ---------- Map speeds → indices (robust, small-field stabilizers) ----------
     def shrink_center(idx_series):
         x = idx_series.dropna().values
         N_eff = len(x)
@@ -630,6 +530,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["FinisherFactor"] = w["DeltaG"].map(finisher_factor_row)
     w["GrindAdjPts"] = (CollapseSeverity * (1.0 - w["FinisherFactor"])).round(2)
 
+    # Subtract adj (cap fades for big late fades)
     w["Grind_CG"] = (w["Grind"] - w["GrindAdjPts"]).clip(lower=90.0, upper=110.0)
     def fade_cap(g, dg):
         if not math.isfinite(g) or not math.isfinite(dg): return g
@@ -643,6 +544,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     grd_med = (w["Grind_CG"] if use_cg else w["Grind"]).median(skipna=True)
     PI_W = pi_weights_distance_and_context(float(D), acc_med, grd_med)
 
+    # Optional dampen on collapse
     if use_cg and dampen_cg and CollapseSeverity >= 3.0:
         d = min(0.02 + 0.01 * (CollapseSeverity - 3.0), 0.08)
         shift = min(d, PI_W["Grind"])
@@ -717,133 +619,119 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
 
     w["GCI"] = gci_vals
 
-    # ---------- RACE SHAPE MODULE (SED / SCI / FRA) ----------
-shape_tag   = "EVEN"
-sci         = 1.0
-fra_applied = 0
+    # ---------- RACE SHAPE MODULE v2.2 (conservative SLOW/FAST + SCI) ----------
+    shape_tag   = "EVEN"
+    sci         = 1.0
+    fra_applied = 0
 
-if use_race_shape:
-    # ---- Compute EARLY/LATE indices explicitly so they appear in the table ----
-    # EARLY = the two segments immediately before the tsSPI window
-    if step == 100:
-        early_markers = [int(D - 100), int(D - 200)]
-    else:  # 200m data
-        early_markers = [int(D - 200)]
-    early_cols = [f"{m}_Time" for m in early_markers if f"{m}_Time" in w.columns]
+    if use_race_shape:
+        # Ensure EARLY/LATE indices ALWAYS exist for the table
+        if step == 100:
+            early_markers = [int(D - 100), int(D - 200)]
+        else:
+            early_markers = [int(D - 200)]
+        early_cols = [f"{m}_Time" for m in early_markers if f"{m}_Time" in w.columns]
 
-    # LATE = acceleration zone (already what your Accel uses)
-    if step == 100:
-        late_cols = [c for c in [f"{m}_Time" for m in [500, 400, 300, 200]] if c in w.columns]
-    else:
-        late_cols = [c for c in [f"{m}_Time" for m in [600, 400]] if c in w.columns]
+        if step == 100:
+            late_cols = [c for c in [f"{m}_Time" for m in [500, 400, 300, 200]] if c in w.columns]
+        else:
+            late_cols = [c for c in [f"{m}_Time" for m in [600, 400]] if c in w.columns]
 
-    w["_EARLY_spd"] = w.apply(lambda r: stage_speed(r, early_cols, float(step)) if early_cols else np.nan, axis=1)
-    w["_LATE_spd"]  = w.apply(lambda r: stage_speed(r, late_cols,  float(step)) if late_cols  else np.nan, axis=1)
+        w["_EARLY_spd"] = w.apply(lambda r: stage_speed(r, early_cols, float(step)) if early_cols else np.nan, axis=1)
+        w["_LATE_spd"]  = w.apply(lambda r: stage_speed(r, late_cols,  float(step)) if late_cols  else np.nan, axis=1)
 
-    # Map to vs-field indices (so these columns are available for your table)
-    w["EARLY_idx"] = speed_to_index(pd.to_numeric(w["_EARLY_spd"], errors="coerce"))
-    w["LATE_idx"]  = speed_to_index(pd.to_numeric(w["_LATE_spd"],  errors="coerce"))
+        w["EARLY_idx"] = speed_to_index(pd.to_numeric(w["_EARLY_spd"], errors="coerce"))
+        w["LATE_idx"]  = speed_to_index(pd.to_numeric(w["_LATE_spd"],  errors="coerce"))
 
-    # ---- Robust race-shape classification (v2.2, conservative) ----
-    # Use medians of indices (not raw speeds)
-    E_med = float(pd.to_numeric(w["EARLY_idx"], errors="coerce").median(skipna=True))
-    M_med = float(pd.to_numeric(w["tsSPI"],     errors="coerce").median(skipna=True))
-    # For "late" we lean on what actually turns the race: Accel+Grind blend
-    L_med = float((0.6*pd.to_numeric(w["Accel"], errors="coerce") +
-                   0.4*pd.to_numeric(w[GR_COL],   errors="coerce")).median(skipna=True))
+        E_med = float(pd.to_numeric(w["EARLY_idx"], errors="coerce").median(skipna=True))
+        M_med = float(pd.to_numeric(w["tsSPI"],     errors="coerce").median(skipna=True))
+        L_med = float((0.6*pd.to_numeric(w["Accel"], errors="coerce") +
+                       0.4*pd.to_numeric(w[GR_COL],   errors="coerce")).median(skipna=True))
 
-    dE, dM, dL = (E_med - 100.0), (M_med - 100.0), (L_med - 100.0)
+        dE, dM, dL = (E_med - 100.0), (M_med - 100.0), (L_med - 100.0)
 
-    def _gate(series, base=2.2):
-        z = pd.to_numeric(series, errors="coerce") - 100.0
-        s = mad_std(z)
-        s = 2.0 if (not np.isfinite(s) or s <= 0) else s
-        return max(base, 0.6*s)
+        def _gate(series, base=2.2):
+            z = pd.to_numeric(series, errors="coerce") - 100.0
+            s = mad_std(z)
+            s = 2.0 if (not np.isfinite(s) or s <= 0) else s
+            return max(base, 0.6*s)
 
-    gE = _gate(w["EARLY_idx"])
-    gL = _gate(0.6*w["Accel"] + 0.4*w[GR_COL])
+        gE = _gate(w["EARLY_idx"])
+        gL = _gate(0.6*w["Accel"] + 0.4*w[GR_COL])
 
-    # distance scaling is mild so 1200–1400m doesn’t over-trigger slow/fast
-    if   D <= 1200: scale = 1.00
-    elif D <  1800: scale = 1.10
-    else:           scale = 1.20
-    gE *= scale; gL *= scale
+        if   D <= 1200: scale = 1.00
+        elif D <  1800: scale = 1.10
+        else:           scale = 1.20
+        gE *= scale; gL *= scale
 
-    # SCI: fraction of horses whose (LATE−EARLY) shows the same sign by > 1pt
-    delta_EL = (pd.to_numeric(w["LATE_idx"], errors="coerce") -
-                pd.to_numeric(w["EARLY_idx"], errors="coerce"))
-    sci_plus  = float((delta_EL >  +1.0).mean()) if delta_EL.notna().any() else np.nan
-    sci_minus = float((delta_EL <  -1.0).mean()) if delta_EL.notna().any() else np.nan
+        delta_EL = (pd.to_numeric(w["LATE_idx"], errors="coerce") -
+                    pd.to_numeric(w["EARLY_idx"], errors="coerce"))
+        sci_plus  = float((delta_EL >  +1.0).mean()) if delta_EL.notna().any() else np.nan
+        sci_minus = float((delta_EL <  -1.0).mean()) if delta_EL.notna().any() else np.nan
 
-    # Confirmatory helpers
-    fsr_val = float(FSR) if np.isfinite(FSR) else np.nan
-    confirm_slow = (np.isfinite(fsr_val) and fsr_val >= 1.03)
-    confirm_fast = (np.isfinite(fsr_val) and fsr_val <= 0.97)
+        fsr_val = float(FSR) if np.isfinite(FSR) else np.nan
+        confirm_slow = (np.isfinite(fsr_val) and fsr_val >= 1.03)
+        confirm_fast = (np.isfinite(fsr_val) and fsr_val <= 0.97)
 
-    # Decision (conservative): need BOTH limbs + separation + reasonable SCI + middling mid-pace
-    slow_early = (dE <= -gE) and (dL >= +gL) and ((dL - dE) >= 3.5) \
-                 and (sci_plus >= 0.55 if np.isfinite(sci_plus) else True) \
-                 and (99.0 <= M_med <= 101.8)
-    fast_early = (dE >= +gE) and (dL <= -gL) and ((dE - dL) >= 3.5) \
-                 and (sci_minus >= 0.55 if np.isfinite(sci_minus) else True) \
-                 and (98.2 <= M_med <= 101.8)
+        slow_early = (dE <= -gE) and (dL >= +gL) and ((dL - dE) >= 3.5) \
+                     and (sci_plus >= 0.55 if np.isfinite(sci_plus) else True) \
+                     and (99.0 <= M_med <= 101.8)
+        fast_early = (dE >= +gE) and (dL <= -gL) and ((dE - dL) >= 3.5) \
+                     and (sci_minus >= 0.55 if np.isfinite(sci_minus) else True) \
+                     and (98.2 <= M_med <= 101.8)
 
-    if slow_early and confirm_slow:
-        shape_tag = "SLOW_EARLY"
-    elif fast_early and confirm_fast:
-        shape_tag = "FAST_EARLY"
-    else:
-        # If confirmers don’t agree, only upgrade to a tag when SCI is strong
-        if slow_early and (sci_plus >= 0.65):
+        if slow_early and confirm_slow:
             shape_tag = "SLOW_EARLY"
-        elif fast_early and (sci_minus >= 0.65):
+        elif fast_early and confirm_fast:
             shape_tag = "FAST_EARLY"
         else:
-            shape_tag = "EVEN"
+            if slow_early and (sci_plus >= 0.65):
+                shape_tag = "SLOW_EARLY"
+            elif fast_early and (sci_minus >= 0.65):
+                shape_tag = "FAST_EARLY"
+            else:
+                shape_tag = "EVEN"
 
-    # Choose SCI aligned with the chosen tag (or “evenness”)
-    if shape_tag == "SLOW_EARLY":
-        sci = float(sci_plus if np.isfinite(sci_plus) else 1.0)
-    elif shape_tag == "FAST_EARLY":
-        sci = float(sci_minus if np.isfinite(sci_minus) else 1.0)
+        if shape_tag == "SLOW_EARLY":
+            sci = float(sci_plus if np.isfinite(sci_plus) else 1.0)
+        elif shape_tag == "FAST_EARLY":
+            sci = float(sci_minus if np.isfinite(sci_minus) else 1.0)
+        else:
+            sci = float((delta_EL.abs() <= 1.5).mean()) if delta_EL.notna().any() else 1.0
+
+        # FRA (False-Run Adjustment) — mild, only if SCI is decent
+        w["PI_RS"]  = w["PI"].astype(float)
+        w["GCI_RS"] = w["GCI"].astype(float)
+
+        if (shape_tag == "SLOW_EARLY") and (sci >= 0.60):
+            f = 0.12 + 0.08 * (sci - 0.60) / 0.40
+            late_excess = ((pd.to_numeric(w["Accel"], errors="coerce") +
+                            pd.to_numeric(w[GR_COL],   errors="coerce"))/2.0 - 100.0
+                          ).clip(lower=0.0, upper=8.0).fillna(0.0)
+            w["PI_RS"]  = (w["PI"]  - f * (late_excess / 4.0)).clip(0.0, 10.0)
+            w["GCI_RS"] = (w["GCI"] - f * (late_excess / 3.0)).clip(0.0, 10.0)
+            fra_applied = 1
+
+        elif (shape_tag == "FAST_EARLY") and (sci >= 0.60):
+            f2 = 0.10 + 0.05 * (sci - 0.60) / 0.40
+            sturdiness = ((pd.to_numeric(w[GR_COL], errors="coerce") - 100.0)
+                          - (100.0 - pd.to_numeric(w["Accel"], errors="coerce")).clip(lower=0.0)
+                         ).clip(lower=0.0, upper=6.0).fillna(0.0)
+            w["PI_RS"]  = (w["PI"]  + f2 * (sturdiness / 4.0)).clip(0.0, 10.0)
+            w["GCI_RS"] = (w["GCI"] + f2 * (sturdiness / 3.0)).clip(0.0, 10.0)
+            fra_applied = 1
+
     else:
-        sci = float((delta_EL.abs() <= 1.5).mean()) if delta_EL.notna().any() else 1.0
+        # race shape OFF → passthrough
+        w["PI_RS"]  = w["PI"].astype(float)
+        w["GCI_RS"] = w["GCI"].astype(float)
 
-    # ---- FRA (False-Run Adjustment) — mild, and only when SCI is decent ----
-    w["PI_RS"]  = w["PI"].astype(float)
-    w["GCI_RS"] = w["GCI"].astype(float)
+    # ---------- Final rounding ----------
+    for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
+              "PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
+        if c in w.columns:
+            w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
 
-    if (shape_tag == "SLOW_EARLY") and (sci >= 0.60):
-        # trim inflation primarily from late-lean profiles
-        f = 0.12 + 0.08 * (sci - 0.60) / 0.40   # 12–20 bps at SCI 0.6→1.0
-        late_excess = ((pd.to_numeric(w["Accel"], errors="coerce") +
-                        pd.to_numeric(w[GR_COL],   errors="coerce"))/2.0 - 100.0
-                      ).clip(lower=0.0, upper=8.0).fillna(0.0)
-        w["PI_RS"]  = (w["PI"]  - f * (late_excess / 4.0)).clip(0.0, 10.0)
-        w["GCI_RS"] = (w["GCI"] - f * (late_excess / 3.0)).clip(0.0, 10.0)
-        fra_applied = 1
-
-    elif (shape_tag == "FAST_EARLY") and (sci >= 0.60):
-        # give small credit to hardy profiles
-        f2 = 0.10 + 0.05 * (sci - 0.60) / 0.40   # 10–15 bps
-        sturdiness = ((pd.to_numeric(w[GR_COL], errors="coerce") - 100.0)
-                      - (100.0 - pd.to_numeric(w["Accel"], errors="coerce")).clip(lower=0.0)
-                     ).clip(lower=0.0, upper=6.0).fillna(0.0)
-        w["PI_RS"]  = (w["PI"]  + f2 * (sturdiness / 4.0)).clip(0.0, 10.0)
-        w["GCI_RS"] = (w["GCI"] + f2 * (sturdiness / 3.0)).clip(0.0, 10.0)
-        fra_applied = 1
-
-else:
-    # race shape OFF → passthrough
-    w["PI_RS"]  = w["PI"].astype(float)
-    w["GCI_RS"] = w["GCI"].astype(float)
-
-# ---------- Final rounding ----------
-for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG","PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
-    if c in w.columns:
-        w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
-
-    
     # ---------- Attach race-level diagnostics ----------
     w.attrs["FSR"] = float(FSR)
     w.attrs["CollapseSeverity"] = float(CollapseSeverity)
@@ -881,18 +769,15 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-# ======================= Data Integrity & Header (post compute) =======================
-# (Relies on integrity_scan defined earlier in Batch 1)
-
+# ======================= Data Integrity & Header (post compute) ==========================
 integrity_text, missing_cols, invalid_counts = integrity_scan(work, race_distance_input, split_step)
 
 st.markdown(
-    f"## Race Distance: **{int(race_distance_input)}m**  |  Split step: **{int(split_step)}m**  "
+    f"## Race Distance: **{int(race_distance_input)}m**  |  Split step: **{split_step}m**  "
     f"|  Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  "
     f"|  SCI: **{metrics.attrs.get('SCI',1.0):.2f}**  "
     f"|  FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
 )
-
 if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
     bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
     warn = []
@@ -902,13 +787,16 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
 if split_step == 200:
     st.caption("Finish column assumed to be the 200→0 segment (`Finish_Time`).")
 
-# ======================= Sectional Metrics table (incl. RS columns) =====================
+# ======================= Sectional Metrics table (incl. RS & EARLY/LATE) =====================
 st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
+
 show_cols = [
-    "Horse","Finish_Pos","RaceTime_s",
-    "F200_idx","tsSPI","Accel","Grind","Grind_CG",
-    "EARLY_idx","LATE_idx","GrindAdjPts","DeltaG",
-    "PI","PI_RS","GCI","GCI_RS"
+    "Horse", "Finish_Pos", "RaceTime_s",
+    "F200_idx", "tsSPI", "Accel",
+    "Grind", "Grind_CG",
+    "EARLY_idx", "LATE_idx",
+    "GrindAdjPts", "DeltaG",
+    "PI", "PI_RS", "GCI", "GCI_RS"
 ]
 for c in show_cols:
     if c not in metrics.columns:
@@ -917,17 +805,14 @@ for c in show_cols:
 display_df = metrics[show_cols].copy()
 _finish_sort = display_df["Finish_Pos"].fillna(1e9)
 display_df = display_df.assign(_FinishSort=_finish_sort)
-# Sort primarily by PI_RS (shape-adjusted), then finishing position
 display_df = display_df.sort_values(["PI_RS","_FinishSort"], ascending=[False, True]).drop(columns=["_FinishSort"])
-
 st.dataframe(display_df, use_container_width=True)
 
 st.caption(
-    f"CG={'ON' if USE_CG else 'OFF'} (FSR={metrics.attrs.get('FSR',1.0):.3f}; "
-    f"Collapse={metrics.attrs.get('CollapseSeverity',0.0):.1f}).  "
-    f"Race Shape={metrics.attrs.get('SHAPE_TAG','EVEN')} "
-    f"(SCI={metrics.attrs.get('SCI',1.0):.2f}; FRA={'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'})."
+    f"CG={'ON' if USE_CG else 'OFF'} (FSR={metrics.attrs.get('FSR',1.0):.3f}; Collapse={metrics.attrs.get('CollapseSeverity',0.0):.1f}).  "
+    f"Race Shape={metrics.attrs.get('SHAPE_TAG','EVEN')} (SCI={metrics.attrs.get('SCI',1.0):.2f}; FRA={'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'})."
 )
+# ======================= End of Batch 2 =======================
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
 from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
