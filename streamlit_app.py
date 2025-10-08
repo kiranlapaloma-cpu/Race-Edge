@@ -843,19 +843,7 @@ for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG","
     if c in w.columns:
         w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
 
-# Attach race-level diagnostics
-w.attrs["GR_COL"]         = GR_COL
-w.attrs["STEP"]           = step
-w.attrs["SHAPE_TAG"]      = shape_tag
-w.attrs["SCI"]            = float(sci)
-w.attrs["FRA_APPLIED"]    = int(fra_applied)
-
-    # ---------- Final rounding ----------
-    for c in ["F200_idx","tsSPI","Accel","Grind","Grind_CG","PI","PI_RS","GCI","GCI_RS",
-              "RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts","_EARLY_spd","_ACC_spd","_GR_spd"]:
-        if c in w.columns:
-            w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
-
+    
     # ---------- Attach race-level diagnostics ----------
     w.attrs["FSR"] = float(FSR)
     w.attrs["CollapseSeverity"] = float(CollapseSeverity)
