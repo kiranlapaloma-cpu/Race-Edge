@@ -1150,23 +1150,9 @@ need_cols_am={"Horse","IAI","HiddenScore","PI","BAL"}
 plot_df=AM.dropna(subset=list(need_cols_am))
 if not plot_df.empty:
     x=plot_df["IAI"]-100.0; y=plot_df["HiddenScore"]; sizes=60+(plot_df["PI"]/10)*200
-    # ---- Color scale for BAL (100-centered) ----
-vals = pd.to_numeric(plot_df["BAL"], errors="coerce").to_numpy()
-vmin = float(np.nanmin(vals)) if np.isfinite(vals).any() else np.nan
-vmax = float(np.nanmax(vals)) if np.isfinite(vals).any() else np.nan
-
-# Safe defaults if empty/flat
-if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmin == vmax):
-    vmin, vmax = 95.0, 105.0
-
-# Ensure strict ascending order around 100 for TwoSlopeNorm
-EPS = 1e-3
-if vmin >= 100.0:
-    vmin = 100.0 - EPS
-if vmax <= 100.0:
-    vmax = 100.0 + EPS
-
-norm = TwoSlopeNorm(vcenter=100.0, vmin=vmin, vmax=vmax)
+    bal_vals=pd.to_numeric(plot_df["BAL"],errors="coerce")
+    finite_bal=bal_vals[np.isfinite(bal_vals)]
+    if finite_bal.empty: vmin,vmax=99,101
     else:
         vmin,vmax=float(finite_bal.min()),float(finite_bal.max())
         if vmin==vmax: vmin-=0.5; vmax+=0.5
