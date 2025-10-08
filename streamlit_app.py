@@ -1348,12 +1348,27 @@ def _open_db(path: str):
 
 def _ensure_schema(conn: sqlite3.Connection):
     """
-    Creates minimally-required tables if they don't exist.
-    If you already have richer schemas, this won't break them.
+    Ensures that the DB schema is valid.
+    If conflicting tables already exist (old versions), they’re rebuilt
+    with consistent race_id TEXT keys and correct foreign-key linkage.
     """
+
     cur = conn.cursor()
+    cur.execute("PRAGMA foreign_keys=OFF;")  # temporarily disable to rebuild safely
+
+    # Drop old tables if their key types mismatch
+    try:
+        cur.execute("SELECT race_id FROM races LIMIT 1;")
+    except Exception:
+        pass  # table may not exist or old key type, will be dropped below
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS races(
+    DROP TABLE IF EXISTS performances;
+    DROP TABLE IF EXISTS races;
+    """)
+
+    # Re-create with correct linkage
+    cur.execute("""
+    CREATE TABLE races(
         race_id        TEXT PRIMARY KEY,
         date           TEXT,
         track          TEXT,
@@ -1362,20 +1377,19 @@ def _ensure_schema(conn: sqlite3.Connection):
         split_step     INTEGER NOT NULL,
         fsr            REAL,
         collapse       REAL,
-        -- Optional extras (only filled if the column exists in your DB)
         rsbi           REAL,
         rsp            REAL,
         use_cg         INTEGER,
         dampen_when_collapsed INTEGER,
-        use_shape_module      INTEGER,
+        use_shape_module INTEGER,
         notes          TEXT
-        -- (add your own columns freely; code below adapts to what's present)
     );
     """)
+
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS performances(
+    CREATE TABLE performances(
         perf_id        TEXT PRIMARY KEY,
-        race_id        TEXT NOT NULL,
+        race_id        TEXT NOT NULL REFERENCES races(race_id) ON DELETE CASCADE,
         horse          TEXT NOT NULL,
         horse_canon    TEXT NOT NULL,
         finish_pos     INTEGER,
@@ -1388,11 +1402,12 @@ def _ensure_schema(conn: sqlite3.Connection):
         confidence     TEXT,
         pi             REAL,
         gci            REAL,
-        inserted_ts    TEXT DEFAULT (datetime('now')),
-        FOREIGN KEY(race_id) REFERENCES races(race_id) ON DELETE CASCADE
+        inserted_ts    TEXT DEFAULT (datetime('now'))
     );
     """)
+
     conn.commit()
+    cur.execute("PRAGMA foreign_keys=ON;")
 
 def _table_cols(conn: sqlite3.Connection, tbl: str) -> set[str]:
     cur = conn.cursor()
