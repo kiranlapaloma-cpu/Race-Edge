@@ -736,7 +736,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         # _ACC_spd/_GR_spd already defined
 
         # 1) Classify
-        rs = classify_race_shape_v2_1(
+        rs = classify_race_shape_v2_2(
             w, distance_m=int(D), gr_col=GR_COL, fsr=FSR, step=step,
             min_valid_frac=0.60, boot_n=200, rng_seed=17
         )
