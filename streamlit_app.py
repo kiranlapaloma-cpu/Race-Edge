@@ -136,17 +136,17 @@ CREATE INDEX IF NOT EXISTS idx_races_date ON races(date);
 if not up:
     st.stop()
 
-# ----------------------- Header normalization ----------------
 def normalize_headers(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """
-    Normalize common variants:
-      - 'finish_time' or 'finish_split' or 'finish' -> Finish_Time
-      - 'XXXX_time' or 'XXXX_split' -> XXXX_Time (XXXX = 100..4000)
-      - 'finish_pos' -> Finish_Pos
+    Normalize common variants (case-insensitive):
+      • '<meters>_time' or '<meters>m_time'  -> '<meters>_Time'
+      • '<meters>_split' or '<meters>m_split'-> '<meters>_Time'
+      • 'finish_time' / 'finish_split' / 'finish' -> 'Finish_Time'
+      • 'finish_pos' -> 'Finish_Pos'
     """
     notes = []
-    cols = list(df.columns)
-    lmap = {c.lower().strip().replace(" ", "_").replace("-", "_"): c for c in cols}
+    # Build a lookup of lowercased keys -> original column names
+    lmap = {c.lower().strip().replace(" ", "_").replace("-", "_"): c for c in df.columns}
 
     def alias(src_key, alias_col):
         nonlocal df, notes
@@ -154,14 +154,14 @@ def normalize_headers(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
             df[alias_col] = df[lmap[src_key]]
             notes.append(f"Aliased `{lmap[src_key]}` → `{alias_col}`")
 
-    if "finish_time" in lmap:
-        alias("finish_time", "Finish_Time")
-    if "finish_split" in lmap or "finish" in lmap:
-        alias("finish_split" if "finish_split" in lmap else "finish", "Finish_Time")
-    if "finish_pos" in lmap:
-        alias("finish_pos", "Finish_Pos")
+    # Finish column variants
+    for k in ("finish_time", "finish_split", "finish"):
+        alias(k, "Finish_Time")
+    alias("finish_pos", "Finish_Pos")
 
-    pat = re.compile(r"^(\d{2,4})_(time|split)$")
+    # Segment columns: accept optional trailing 'm' before the underscore
+    # Matches: '1200_time', '1200m_time', '800_split', '800m_split', etc.
+    pat = re.compile(r"^(\d{2,4})m?_(time|split)$")
     for lk, orig in lmap.items():
         m = pat.match(lk)
         if m:
