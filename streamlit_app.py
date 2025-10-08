@@ -939,7 +939,7 @@ hh_view = hh.sort_values(["Tier", "HiddenScore", "PI"], ascending=[True, False, 
 st.dataframe(hh_view, use_container_width=True)
 st.caption("Hidden Horses v2: SOS (robust outlier), ASI² (against shape), TFS (trip friction), UEI (underused engine). Tier: 🔥 ≥1.8, 🟡 ≥1.2.")
 
-# ======================= Ability Matrix v2 (percentile-based) =======================
+# ======================= Ability Matrix v2 (fixed & stable) =======================
 st.markdown("---")
 st.markdown("## Ability Matrix v2 — Intrinsic vs Hidden Ability")
 
@@ -949,6 +949,7 @@ AM = AM.merge(hh_view[["Horse","HiddenScore"]], on="Horse", how="left")
 AM["HiddenScore"] = AM["HiddenScore"].fillna(0.0)
 
 # Intrinsic Ability Index (IAI) uses corrected grind when active
+gr_col = metrics.attrs.get("GR_COL","Grind")
 AM["IAI"]  = 0.35*AM["tsSPI"] + 0.25*AM["Accel"] + 0.25*AM[gr_col] + 0.15*AM["F200_idx"]
 AM["BAL"]  = 100.0 - (AM["Accel"] - AM[gr_col]).abs() / 2.0
 AM["COMP"] = 100.0 - (AM["tsSPI"] - 100.0).abs()
@@ -958,7 +959,8 @@ def robust_z(s):
     s = pd.to_numeric(s, errors="coerce")
     med = np.nanmedian(s)
     sig = mad_std(s - med)
-    if not np.isfinite(sig) or sig == 0: return pd.Series(np.zeros(len(s)), index=s.index)
+    if not np.isfinite(sig) or sig == 0:
+        return pd.Series(np.zeros(len(s)), index=s.index)
     return (s - med) / sig
 
 def pct_rank(s):
@@ -971,8 +973,7 @@ AM["HID_pct"]  = pct_rank(AM["HiddenScore"])    # hidden upside vs field
 AM["BAL_pct"]  = 1.0 - pct_rank((AM["BAL"] - 100.0).abs())   # closer to 100 → higher
 AM["COMP_pct"] = 1.0 - pct_rank((AM["COMP"] - 100.0).abs())  # steadier → higher
 
-# Score (softened so fewer “Ordinary”)
-# 0..10 scale: heavier on intrinsic, meaningful on hidden, small bonuses on balance/consistency
+# Composite Ability Score (0–10, smoothed)
 AM["AbilityScore"] = (
       6.5 * AM["IAI_pct"]
     + 2.5 * AM["HID_pct"]
@@ -988,7 +989,7 @@ def ability_tier(x):
     return "⚪ Ordinary"
 AM["AbilityTier"] = AM["AbilityScore"].apply(ability_tier)
 
-# Directional hint (sprint vs staying lean)
+# Directional lean (sprint/stayer)
 def dir_hint_row(r):
     dv = float(r.get("Accel", np.nan)) - float(r.get(gr_col, np.nan))
     if not np.isfinite(dv): return ""
@@ -1016,18 +1017,19 @@ else:
         x = plot_df["IAI"] - 100.0
         y = plot_df["HiddenScore"]
         sizes = 60.0 + (plot_df["PI"].clip(0,10) / 10.0) * 200.0
-        vmin, vmax = float(plot_df["BAL"].min()), float(plot_df["BAL"].max())
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
-            # Replace the vmin/vmax/norm section in Shape Map with:
-vmin = float(np.nanmin(cv)) if np.isfinite(cv).any() else -1.0
-vmax = float(np.nanmax(cv)) if np.isfinite(cv).any() else  1.0
-if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
-    vmin, vmax = -1.0, 1.0
-EPS = 0.1
-if vmax <= 0.0: vmax = 0.0 + EPS
-if vmin >= 0.0: vmin = 0.0 - EPS
-norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
+
+        # -------- Fixed safe TwoSlopeNorm setup --------
+        vals = pd.to_numeric(plot_df["BAL"], errors="coerce").to_numpy()
+        vmin, vmax = np.nanmin(vals), np.nanmax(vals)
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            vmin, vmax = 99.0, 101.0
+        if vmin == vmax:
+            vmin, vmax = vmin - 1.0, vmax + 1.0
+        EPS = 0.2
+        if vmax <= 100.0: vmax = 100.0 + EPS
+        if vmin >= 100.0: vmin = 100.0 - EPS
         norm = TwoSlopeNorm(vcenter=100.0, vmin=vmin, vmax=vmax)
+        # ------------------------------------------------
 
         figA, axA = plt.subplots(figsize=(8.6, 6.0))
         sc = axA.scatter(x, y, s=sizes, c=plot_df["BAL"], cmap="coolwarm", norm=norm,
@@ -1055,6 +1057,14 @@ norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
         st.download_button("Download Ability Matrix (PNG)", ability_png,
                            file_name="ability_matrix_v2.png", mime="image/png")
 
+# ---------- Table ----------
+am_cols = ["Horse","Finish_Pos","IAI","HiddenScore","BAL","COMP","AbilityScore",
+           "AbilityTier","DirectionHint","Confidence","PI"]
+for c in am_cols:
+    if c not in AM.columns:
+        AM[c] = np.nan
+AM_view = AM.sort_values(["AbilityScore","PI","Finish_Pos"], ascending=[False, False, True])[am_cols]
+st.dataframe(AM_view, use_container_width=True)
 # ---------- Table ----------
 am_cols = ["Horse","Finish_Pos","IAI","HiddenScore","BAL","COMP","AbilityScore","AbilityTier","DirectionHint","Confidence","PI"]
 for c in am_cols:
