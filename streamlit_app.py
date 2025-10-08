@@ -828,6 +828,54 @@ except Exception as e:
     st.error("Metric computation failed.")
     st.exception(e)
     st.stop()
+
+# ======================= Data Integrity & Header (post compute) =======================
+# (Relies on integrity_scan defined earlier in Batch 1)
+
+integrity_text, missing_cols, invalid_counts = integrity_scan(work, race_distance_input, split_step)
+
+st.markdown(
+    f"## Race Distance: **{int(race_distance_input)}m**  |  Split step: **{int(split_step)}m**  "
+    f"|  Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  "
+    f"|  SCI: **{metrics.attrs.get('SCI',1.0):.2f}**  "
+    f"|  FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
+)
+
+if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
+    bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
+    warn = []
+    if missing_cols: warn.append("Missing: " + ", ".join(missing_cols))
+    if bads: warn.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
+    if warn: st.markdown(f"*(⚠ {' • '.join(warn)})*")
+if split_step == 200:
+    st.caption("Finish column assumed to be the 200→0 segment (`Finish_Time`).")
+
+# ======================= Sectional Metrics table (incl. RS columns) =====================
+st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
+show_cols = [
+    "Horse","Finish_Pos","RaceTime_s",
+    "F200_idx","tsSPI","Accel","Grind","Grind_CG",
+    "EARLY_idx","LATE_idx","GrindAdjPts","DeltaG",
+    "PI","PI_RS","GCI","GCI_RS"
+]
+for c in show_cols:
+    if c not in metrics.columns:
+        metrics[c] = np.nan
+
+display_df = metrics[show_cols].copy()
+_finish_sort = display_df["Finish_Pos"].fillna(1e9)
+display_df = display_df.assign(_FinishSort=_finish_sort)
+# Sort primarily by PI_RS (shape-adjusted), then finishing position
+display_df = display_df.sort_values(["PI_RS","_FinishSort"], ascending=[False, True]).drop(columns=["_FinishSort"])
+
+st.dataframe(display_df, use_container_width=True)
+
+st.caption(
+    f"CG={'ON' if USE_CG else 'OFF'} (FSR={metrics.attrs.get('FSR',1.0):.3f}; "
+    f"Collapse={metrics.attrs.get('CollapseSeverity',0.0):.1f}).  "
+    f"Race Shape={metrics.attrs.get('SHAPE_TAG','EVEN')} "
+    f"(SCI={metrics.attrs.get('SCI',1.0):.2f}; FRA={'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'})."
+)
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
 from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
