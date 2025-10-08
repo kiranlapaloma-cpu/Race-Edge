@@ -1349,24 +1349,23 @@ def _open_db(path: str):
 def _ensure_schema(conn: sqlite3.Connection):
     """
     Ensures that the DB schema is valid.
-    If conflicting tables already exist (old versions), they’re rebuilt
-    with consistent race_id TEXT keys and correct foreign-key linkage.
+    Drops and recreates tables if mismatched, with consistent TEXT race_id linkage.
     """
 
     cur = conn.cursor()
-    cur.execute("PRAGMA foreign_keys=OFF;")  # temporarily disable to rebuild safely
+    cur.execute("PRAGMA foreign_keys=OFF;")
 
-    # Drop old tables if their key types mismatch
+    # Drop old tables safely — one per execute() to avoid multi-statement error
     try:
-        cur.execute("SELECT race_id FROM races LIMIT 1;")
-    except Exception:
-        pass  # table may not exist or old key type, will be dropped below
-    cur.execute("""
-    DROP TABLE IF EXISTS performances;
-    DROP TABLE IF EXISTS races;
-    """)
+        cur.execute("DROP TABLE IF EXISTS performances;")
+    except Exception as e:
+        print("Drop performances failed:", e)
+    try:
+        cur.execute("DROP TABLE IF EXISTS races;")
+    except Exception as e:
+        print("Drop races failed:", e)
 
-    # Re-create with correct linkage
+    # Recreate tables with consistent TEXT race_id
     cur.execute("""
     CREATE TABLE races(
         race_id        TEXT PRIMARY KEY,
