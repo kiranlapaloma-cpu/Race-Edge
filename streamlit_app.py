@@ -261,6 +261,82 @@ if alias_notes and SHOW_WARNINGS:
 st.markdown("### Raw Table")
 st.dataframe(work.head(12), use_container_width=True)
 
+# ======================= Weight Adjustment UI =======================
+st.markdown("### Weight Adjustment (optional)")
+
+# Toggle to enable/disable the whole feature
+USE_WEIGHT = st.toggle(
+    "Apply weight adjustment (normalize to a baseline)",
+    value=False,
+    help="When ON, sectional indices are adjusted to a baseline carried weight."
+)
+
+col_w1, col_w2 = st.columns([1, 1])
+with col_w1:
+    WEIGHT_BASELINE = st.number_input(
+        "Baseline carried weight (kg)",
+        min_value=40.0, max_value=70.0, value=60.0, step=0.5,
+        help="Indices will be normalized as if every horse carried this weight."
+    )
+with col_w2:
+    WEIGHT_SENS_PER_KG = st.number_input(
+        "Per-kg sensitivity (fraction of index per kg)",
+        min_value=0.0000, max_value=0.0100, value=0.0011, step=0.0001,
+        help="0.0011 ≈ 0.11% index change per kg (conservative)."
+    )
+
+# Build the editable weights table
+# 1) Try file column 'horse weight' (case-insensitive)
+weight_col = None
+for c in work.columns:
+    if str(c).strip().lower() == "horse weight":
+        weight_col = c
+        break
+
+weights_src = None
+if weight_col is not None:
+    # Use values from the file
+    weights_src = pd.to_numeric(work[weight_col], errors="coerce")
+else:
+    # Prefill with baseline (you can what-if edit below)
+    weights_src = pd.Series([WEIGHT_BASELINE] * len(work), index=work.index)
+
+# Build an editor table keyed by Horse
+w_edit = pd.DataFrame({
+    "Horse": work.get("Horse", pd.Series([f"H{i+1}" for i in range(len(work))])),
+    "Weight_kg": weights_src
+})
+
+# Keep it stable across re-runs
+if "WE_TABLE" not in st.session_state:
+    st.session_state.WE_TABLE = w_edit.copy()
+else:
+    # if the upload changed, re-sync length & horses
+    if len(st.session_state.WE_TABLE) != len(w_edit):
+        st.session_state.WE_TABLE = w_edit.copy()
+
+st.caption("Edit weights to test scenarios (if the file didn’t provide them).")
+st.session_state.WE_TABLE = st.data_editor(
+    st.session_state.WE_TABLE,
+    num_rows="dynamic",
+    use_container_width=True,
+    hide_index=True
+)
+
+# Build a name→kg map we can pass into Batch 2
+WEIGHTS_MAP = {}
+try:
+    for _, r in st.session_state.WE_TABLE.iterrows():
+        nm = str(r.get("Horse", "")).strip()
+        kg = pd.to_numeric(r.get("Weight_kg"), errors="coerce")
+        if nm:
+            WEIGHTS_MAP[nm] = float(kg) if pd.notna(kg) else float(WEIGHT_BASELINE)
+except Exception:
+    # fall back to baseline if anything goes wrong
+    for nm in work.get("Horse", []):
+        WEIGHTS_MAP[str(nm)] = float(WEIGHT_BASELINE)
+# ===================== end Weight UI =====================
+
 # ----------------------- Integrity helpers (odds-aware) -------------------
 def expected_segments_from_df(df: pd.DataFrame) -> list[str]:
     """
