@@ -511,10 +511,20 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
                             kg_effect_pct: float = 0.60,
                             debug: bool = False):
                             # NEW (Batch 1 weight UI provides these):
-                            use_weight: bool = False,
-                            weights_map: dict | None = None,
-                            weight_baseline: float = 60.0,
-                            weight_sens_per_kg: float = 0.0011)
+                            def build_metrics_and_shape(
+    df_in: pd.DataFrame,
+    D_actual_m: float,
+    step: int,
+    use_cg: bool,
+    dampen_cg: bool,
+    use_race_shape: bool,
+    use_weight: bool = False,
+    baseline_kg: float = 60.0,
+    kg_effect_pct: float = 0.60,
+    weight_sens_per_kg: float = 0.0011,
+    debug: bool = False
+):
+                
     w = df_in.copy()
 
     # Finish_Pos as numeric if present
