@@ -702,7 +702,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True),
         pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True)
         # (no going arg -> defaults to Good)
-    )
+    
     wPACE = Wg["Accel"] + Wg["Grind"]; wSS = Wg["tsSPI"]; wEFF = max(0.0, 1.0 - (wT + wPACE + wSS))
 
     def _map_pct(x, lo=98.0, hi=104.0):
