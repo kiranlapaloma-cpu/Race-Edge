@@ -613,7 +613,63 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["F200_idx"] = _speed_to_idx(w["_F_spd"])
     w["tsSPI"]    = _speed_to_idx(w["_MID_spd"])
     w["Accel"]    = _speed_to_idx(w["_ACC_spd"])
-    w["Grind"]    = _speed_to_idx(w["_GR_spd"])
+    w["Grind"]    = _speed_to_idx(w["_GR_spd"])    
+                                # -------- Weight normalization of sectional indices (optional) --------
+    if use_weight:
+        # Build a vector of weights for each row (by Horse name → kg)
+        w_horse = w.get("Horse", pd.Series([""] * len(w))).astype(str)
+        kg_vec = []
+        for nm in w_horse:
+            kg = None
+            if isinstance(weights_map, dict):
+                kg = weights_map.get(str(nm).strip())
+            if kg is None or not np.isfinite(kg):
+                kg = float(weight_baseline)
+            kg_vec.append(float(kg))
+        kg_vec = np.asarray(kg_vec, dtype=float)
+
+        # delta vs baseline (positive = carried more than baseline)
+        dkg = kg_vec - float(weight_baseline)
+
+        # Per-phase sensitivity multipliers (relative influence of weight)
+        PHASE_MULT = {
+            "F200_idx": 1.25,
+            "tsSPI":    1.00,
+            "Accel":    1.10,
+            "Grind":    0.80,
+        }
+
+        # Helper: apply a multiplicative factor to an index series
+        def _apply_weight(series_name):
+            s = pd.to_numeric(w[series_name], errors="coerce").astype(float).to_numpy()
+            # Factor >1 if horse carried LESS than baseline; <1 if more
+            # factor = 1 + base_sens * phase_mult * (baseline - kg)
+            mult = 1.0 + float(weight_sens_per_kg) * PHASE_MULT[series_name] * (float(weight_baseline) - kg_vec)
+            # keep sane bounds
+            mult = np.clip(mult, 0.90, 1.10)
+            return s * mult
+
+        # Create adjusted columns and use them downstream
+        w["F200_W"] = _apply_weight("F200_idx")
+        w["tsSPI_W"] = _apply_weight("tsSPI")
+        w["Accel_W"] = _apply_weight("Accel")
+        w["Grind_W"] = _apply_weight("Grind")
+
+        # For readability in tables
+        for nm in ("F200_W","tsSPI_W","Accel_W","Grind_W"):
+            w[nm] = pd.to_numeric(w[nm], errors="coerce")
+
+        # From here on, PI/GCI should use the *_W fields instead of raw
+        F200_COL = "F200_W"
+        MID_COL  = "tsSPI_W"
+        ACC_COL  = "Accel_W"
+        GR_COL_RAW = "Grind_W"
+    else:
+        F200_COL = "F200_idx"
+        MID_COL  = "tsSPI"
+        ACC_COL  = "Accel"
+        GR_COL_RAW = "Grind"
+                    
 
     # ----- Corrected Grind (CG) -----
     ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
