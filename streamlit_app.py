@@ -291,8 +291,9 @@ if split_step == 200:
 
 # -------------------------------------------------------------------------
 # Hand-off: Batch 2 will compute metrics and the Race Shape module (SED/FRA/SCI)
+# Hand-off: Batch 2 will compute metrics and the Race Shape module (SED/FRA/SCI)
 # ======================= Batch 2 — Metrics Engine + Race Shape (SED/SCI/FRA) =======================
-# (Drop-in replacement)
+# (Drop-in replacement with Adaptive F-windows + Finish-Pos inference)
 
 import math
 import numpy as np
@@ -420,8 +421,13 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
                             debug: bool):
     w = df_in.copy()
 
-    # Normalize finish pos
-    if "Finish_Pos" in w.columns:
+    # ---------- Finish_Pos inference (if missing or mostly empty) ----------
+    finish_inferred = 0
+    if "Finish_Pos" not in w.columns or (pd.to_numeric(w["Finish_Pos"], errors="coerce").isna().mean() > 0.70):
+        # Try to infer by RaceTime_s later; for now keep a placeholder
+        w["Finish_Pos"] = np.nan
+        finish_inferred = 1
+    else:
         w["Finish_Pos"] = as_num(w["Finish_Pos"])
 
     seg_markers = collect_markers(w)
@@ -441,23 +447,83 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     else:
         w["RaceTime_s"] = as_num(w.get("Race Time", np.nan))
 
+    # If we decided to infer Finish_Pos, do it now (after RaceTime_s exists)
+    if finish_inferred == 1:
+        # Prefer ascending RaceTime_s; fallback to row order; stable tie-break on Horse
+        tmp = w.reset_index(drop=False).rename(columns={"index":"_row"})
+        tmp["_rt"] = pd.to_numeric(tmp["RaceTime_s"], errors="coerce")
+        tmp["_horse"] = tmp.get("Horse", "").astype(str)
+        tmp = tmp.sort_values(by=["_rt","_horse","_row"], ascending=[True, True, True]).reset_index(drop=True)
+        tmp["Finish_Pos"] = np.arange(1, len(tmp)+1)
+        w = tmp.sort_values("_row").drop(columns=["_row","_rt","_horse"]).reset_index(drop=True)
+
     # ---------- Build stage composite speeds ----------
     D = float(D_actual_m)
 
-    # F200
-    if step == 100:
-        f200_cols = [c for c in [f"{int(D-100)}_Time", f"{int(D-200)}_Time"] if c in w.columns]
-        f200_dist = 100.0 * len(f200_cols)
-    else:
-        c = f"{int(D-200)}_Time"
-        f200_cols = [c] if c in w.columns else []
-        f200_dist = 200.0 * len(f200_cols)
-    w["_F200_spd"] = w.apply(lambda r: (f200_dist / sum_times(r, f200_cols)) if len(f200_cols)>=1 and pd.notna(sum_times(r, f200_cols)) and sum_times(r, f200_cols)>0 else np.nan, axis=1)
+    # ===== Adaptive F-window (FIRST 200 rules you specified) =====
+    # We compute an "F-window speed" as distance_over_time of the *first* portion of the race.
+    # step==100: F200 or F150 (…50 distances) using weighted time
+    # step==200: F{L0} where L0 is the first segment length (200 / 160 / 100 / 250 / remainder)
+    def fwindow_speed_100(row, Dm):
+        # Always use two 100m splits (D-100 and D-200) if available
+        t1 = as_num(row.get(f"{int(Dm-100)}_Time"))
+        t2 = as_num(row.get(f"{int(Dm-200)}_Time"))
+        if pd.isna(t1) or t1 <= 0 or pd.isna(t2) or t2 <= 0:
+            return np.nan
+        if int(Dm) % 100 == 50:
+            # F150: 50m of t1 + 100m of t2
+            eff_time = 0.5*float(t1) + 1.0*float(t2)
+            eff_dist = 150.0
+        else:
+            # F200 standard
+            eff_time = float(t1) + float(t2)
+            eff_dist = 200.0
+        return eff_dist / eff_time if eff_time > 0 else np.nan
 
-    # tsSPI: (D-300)…600 for 100m; (D-400)…600 for 200m
-    tssp_start = int(D - (300 if step == 100 else 400))
-    tssp_cols = make_range_cols(D, tssp_start, 600, step)
-    tssp_cols = [c for c in tssp_cols if c in w.columns]
+    def first_segment_length_200(Dm):
+        r = int(Dm) % 200
+        if r == 0:
+            return 200
+        if r == 160:
+            return 160
+        if r == 100:
+            return 100
+        if r == 50:
+            # operator quirk: first panel often covers 250m
+            return 250
+        return r if r > 0 else 200
+
+    def fwindow_speed_200(row, Dm):
+        L0 = first_segment_length_200(Dm)
+        # Column label equals the segment *end* marker: D-L0
+        col = f"{int(Dm - L0)}_Time"
+        t = as_num(row.get(col))
+        if pd.isna(t) or t <= 0:
+            return np.nan
+        return float(L0) / float(t)
+
+    # Compute F-window speed and map to F200_idx-like index
+    if step == 100:
+        w["_FW_spd"] = w.apply(lambda r: fwindow_speed_100(r, D), axis=1)
+    else:
+        w["_FW_spd"] = w.apply(lambda r: fwindow_speed_200(r, D), axis=1)
+
+    # tsSPI window (also adaptive start in stubs)
+    if step == 100:
+        # If distance ends with …50 → start at D-150; else D-300
+        tssp_start = int(D - (150 if (int(D) % 100 == 50) else 300))
+    else:
+        # 200m splits:
+        r = int(D) % 200
+        if r == 160:
+            tssp_start = int(D - 150)
+        elif r == 50:
+            tssp_start = int(D - 250)
+        elif r == 100:
+            tssp_start = int(D - 100)
+        else:
+            tssp_start = int(D - 400)
+    tssp_cols = [c for c in make_range_cols(D, tssp_start, 600, step) if c in w.columns]
     w["_MID_spd"] = w.apply(lambda r: stage_speed(r, tssp_cols, float(step)), axis=1)
 
     # Accel: 600→200
@@ -503,7 +569,8 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         idx = variance_floor(idx)
         return idx
 
-    w["F200_idx"] = speed_to_index(pd.to_numeric(w["_F200_spd"], errors="coerce"))
+    # Map: FW → F200_idx slot (name kept for UI continuity)
+    w["F200_idx"] = speed_to_index(pd.to_numeric(w["_FW_spd"], errors="coerce"))
     w["tsSPI"]    = speed_to_index(pd.to_numeric(w["_MID_spd"],  errors="coerce"))
     w["Accel"]    = speed_to_index(pd.to_numeric(w["_ACC_spd"],  errors="coerce"))
     w["Grind"]    = speed_to_index(pd.to_numeric(w["_GR_spd"],   errors="coerce"))
@@ -619,7 +686,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
 
     w["GCI"] = gci_vals
 
-    # ---------- RACE SHAPE MODULE v2.2 (conservative SLOW/FAST + SCI) ----------
+    # ---------- RACE SHAPE MODULE v2.2 (EARLY/LATE/SCI + FRA) ----------
     shape_tag   = "EVEN"
     sci         = 1.0
     fra_applied = 0
@@ -629,7 +696,10 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         if step == 100:
             early_markers = [int(D - 100), int(D - 200)]
         else:
-            early_markers = [int(D - 200)]
+            # first segment length for 200m data drives the earliest window we can measure, but
+            # we still compute EARLY as the mean of the first "panel" only to avoid gaps
+            L0 = int(first_segment_length_200(D))
+            early_markers = [int(D - min(L0, 200))]
         early_cols = [f"{m}_Time" for m in early_markers if f"{m}_Time" in w.columns]
 
         if step == 100:
@@ -726,7 +796,6 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         w["PI_RS"]  = w["PI"].astype(float)
         w["GCI_RS"] = w["GCI"].astype(float)
 
-                                
     # ---------- Final rounding ----------
     for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
               "PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
@@ -741,6 +810,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w.attrs["SHAPE_TAG"] = shape_tag
     w.attrs["SCI"] = float(sci)
     w.attrs["FRA_APPLIED"] = int(fra_applied)
+    w.attrs["Finish_Pos_Inferred"] = int(finish_inferred)
 
     if debug:
         st.write({
@@ -749,7 +819,8 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
             "PI_W": PI_W,
             "SHAPE_TAG": shape_tag,
             "SCI": sci,
-            "FRA_APPLIED": fra_applied
+            "FRA_APPLIED": fra_applied,
+            "Finish_Pos_Inferred": finish_inferred
         })
 
     return w, seg_markers
@@ -777,7 +848,8 @@ st.markdown(
     f"## Race Distance: **{int(race_distance_input)}m**  |  Split step: **{split_step}m**  "
     f"|  Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  "
     f"|  SCI: **{metrics.attrs.get('SCI',1.0):.2f}**  "
-    f"|  FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
+    f"|  FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**  "
+    f"|  Finish Pos: **{'Inferred' if metrics.attrs.get('Finish_Pos_Inferred',0)==1 else 'From file'}**"
 )
 if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
     bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
@@ -786,7 +858,7 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
     if bads: warn.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
     if warn: st.markdown(f"*(⚠ {' • '.join(warn)})*")
 if split_step == 200:
-    st.caption("Finish column assumed to be the 200→0 segment (`Finish_Time`).")
+    st.caption("First panel & F-window adapted to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish column still represents 200→0.")
 
 # ======================= Sectional Metrics table (incl. RS & EARLY/LATE) =====================
 st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
@@ -813,6 +885,7 @@ st.caption(
     f"CG={'ON' if USE_CG else 'OFF'} (FSR={metrics.attrs.get('FSR',1.0):.3f}; Collapse={metrics.attrs.get('CollapseSeverity',0.0):.1f}).  "
     f"Race Shape={metrics.attrs.get('SHAPE_TAG','EVEN')} (SCI={metrics.attrs.get('SCI',1.0):.2f}; FRA={'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'})."
 )
+
 # ======================= End of Batch 2 =======================
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
 from matplotlib.patches import Rectangle
