@@ -506,7 +506,10 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
                             use_cg: bool,
                             dampen_cg: bool,
                             use_race_shape: bool,
-                            debug: bool,
+                            use_weight: bool = False,
+                            baseline_kg: float = 60.0,
+                            kg_effect_pct: float = 0.60,
+                            debug: bool = False):
                             # NEW (Batch 1 weight UI provides these):
                             use_weight: bool = False,
                             weights_map: dict | None = None,
@@ -928,7 +931,11 @@ try:
     USE_CG,
     DAMPEN_CG,
     USE_RACE_SHAPE,
-    DEBUG,
+    USE_WEIGHT,          # <- from your sidebar
+    BASELINE_KG,         # <- from your sidebar
+    KG_EFFECT_PCT,       # <- from your sidebar (e.g., 0.60 for 0.60% per kg)
+    DEBUG
+)
     # --- new weight controls from Batch 1 ---
     use_weight=USE_WEIGHT,
     weights_map=WEIGHTS_MAP,
