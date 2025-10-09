@@ -525,13 +525,13 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     debug: bool = False
 ):
                 
-    w = df_in.copy()
+        w = df_in.copy()
 
-    # Finish_Pos as numeric if present
-    if "Finish_Pos" in w.columns:
-        w["Finish_Pos"] = as_num(w["Finish_Pos"])
+        # Finish_Pos as numeric if present
+        if "Finish_Pos" in w.columns:
+            w["Finish_Pos"] = as_num(w["Finish_Pos"])
 
-    seg_markers = collect_markers(w)
+        seg_markers = collect_markers(w)
 
     # Per-segment speeds
     for m in seg_markers:
