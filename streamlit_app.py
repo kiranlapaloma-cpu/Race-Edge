@@ -377,6 +377,72 @@ import numpy as np
 import pandas as pd
 
 # ----------------------- Stage helpers -----------------------
+# ----------------------- Integrity helpers (100/200 m aware; odd distances OK) -------------------
+def expected_segments(distance_m: float, step: int, *, from_existing: list[str] | None = None) -> list[str]:
+    """
+    Build the list of expected *_Time columns for integrity display.
+
+    • If from_existing is provided (list of actual *_Time columns found), we
+      just use those (sorted high→low) and append Finish_Time if present.
+    • Else, we align the first marker to the FLOOR multiple of step, not D-step.
+      e.g. 1250 @ 100m → 1200,1100,...,100 and then Finish_Time.
+           1450 @ 200m → 1400,1200,...,200 and then Finish_Time.
+    """
+    if from_existing:
+        marks = []
+        for c in from_existing:
+            if c.endswith("_Time") and c != "Finish_Time":
+                try:
+                    marks.append(int(c.split("_")[0]))
+                except Exception:
+                    pass
+        marks = sorted(set(marks), reverse=True)
+        want = [f"{m}_Time" for m in marks]
+        if "Finish_Time" in from_existing:
+            want.append("Finish_Time")
+        return want
+
+    D = int(distance_m)
+    step = int(step)
+    start = (D // step) * step               # floor to clean hundred/two-hundred
+    if start == 0: start = step
+    want = [f"{m}_Time" for m in range(start, step-1, -step)]
+    want.append("Finish_Time")
+    return want
+
+def integrity_scan(df: pd.DataFrame, distance_m: float, step: int):
+    """
+    Friendly integrity line:
+    • We no longer accuse the file of “missing 1150/1050…” for 1250 races.
+    • We only warn about: completely missing all segment columns,
+      missing Finish_Time, and any nonpositive / nonnumeric values present.
+    """
+    # What *_Time columns do we actually have?
+    actual_cols = [c for c in df.columns if c.endswith("_Time")]
+    # Expected, aligned to the file’s reality
+    exp_cols = expected_segments(distance_m, step, from_existing=actual_cols)
+
+    missing = [c for c in exp_cols if c not in df.columns]
+    invalid_counts = {}
+    for c in exp_cols:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce")
+            invalid_counts[c] = int(((s <= 0) | s.isna()).sum())
+
+    msgs = []
+    # Only warn “Missing segments” when we have literally none
+    have_any_split = any(c.endswith("_Time") and c != "Finish_Time" for c in df.columns)
+    if not have_any_split:
+        msgs.append("No segment columns found")
+    # Finish_Time is important to call out explicitly
+    if "Finish_Time" not in df.columns:
+        msgs.append("Finish_Time missing")
+    # Invalid values message (suppress zeros for columns that don’t exist)
+    bads = [f"{k} ({v} rows)" for k, v in invalid_counts.items() if v > 0]
+    if bads:
+        msgs.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
+
+    return " • ".join(msgs), missing, invalid_counts
 def collect_markers(df):
     marks = []
     for c in df.columns:
@@ -435,17 +501,84 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         w[f"spd_{m}"] = (step * 1.0) / as_num(w.get(f"{m}_Time"))
     w["spd_Finish"] = (100.0 if step==100 else 200.0) / as_num(w.get("Finish_Time")) if "Finish_Time" in w.columns else np.nan
 
-    # -------- Stage composites --------
-    f_cols = [f"{int(D-100)}_Time", f"{int(D-200)}_Time"]
-    f_cols = [c for c in f_cols if c in w.columns]
-    w["_F_spd"] = w.apply(lambda r: stage_speed(r,f_cols,100.0),axis=1)
+        # -------- Stage composites (ADAPTIVE to odd distances) --------
+    seg_markers = collect_markers(w)
+    step = int(step)
 
-    mid_cols = [f"{m}_Time" for m in range(int(D-300 if step==100 else D-400),600-1,-step) if f"{m}_Time" in w.columns]
-    w["_MID_spd"]=w.apply(lambda r:stage_speed(r,mid_cols,float(step)),axis=1)
+    def _adaptive_f_window_cols(D, step, markers):
+        """
+        Early window:
+          100m splits:
+            • D ends with 50  → F150 = [D-50, D-150] if present
+            • else            → F200 = [D-100, D-200]
+          200m splits (use first panel's true span):
+            • first span ~160 → F160 = [first marker]
+            • first span ~250 → F250 = [first marker]
+            • first span ~100 → F100 = [first marker]
+            • normal even     → F200 = [D-200]
+        """
+        if not markers:
+            return [], 0.0
+        first_m = int(markers[0])
+        first_span = float(D - first_m)
 
-    acc_cols=[f"{m}_Time" for m in ([500,400,300,200] if step==100 else [600,400]) if f"{m}_Time" in w.columns]
-    w["_ACC_spd"]=w.apply(lambda r:stage_speed(r,acc_cols,float(step)),axis=1)
-    w["_GR_spd"]=w.apply(lambda r:grind_speed(r,step),axis=1)
+        if step == 100:
+            if int(D) % 100 == 50:
+                want = [int(D - 50), int(D - 150)]
+            else:
+                want = [int(D - 100), int(D - 200)]
+            cols = [f"{m}_Time" for m in want if f"{m}_Time" in w.columns]
+            dist = 50.0 + 100.0 if (len(cols) == 2 and int(D) % 100 == 50) else 100.0 * len(cols)
+            return cols, dist
+
+        # step == 200
+        col = f"{first_m}_Time"
+        if col not in w.columns:
+            return [], 0.0
+        if first_span <= 120:  dist = 100.0
+        elif first_span <= 180: dist = 160.0
+        elif first_span <= 220: dist = 200.0
+        else:                   dist = 250.0
+        return [col], dist
+
+    def _adaptive_tssp_start(D, step, markers):
+        """
+        MID window (tsSPI) start:
+          100m:   D-300 normally, D-150 for D%100==50 (e.g., 1250)
+          200m:   depends on first span (≈100/160/200/250) → start at D-100/150/400/250
+        """
+        if step == 100:
+            return int(D - 150) if (int(D) % 100 == 50) else int(D - 300)
+        if not markers:
+            return int(D - 400)
+        first_m = int(markers[0])
+        first_span = float(D - first_m)
+        if first_span <= 120:   return int(D - 100)
+        if first_span <= 180:   return int(D - 150)
+        if first_span <= 220:   return int(D - 400)
+        return int(D - 250)
+
+    # F-window speed
+    f_cols, f_dist = _adaptive_f_window_cols(D, step, seg_markers)
+    w["_F_spd"] = w.apply(
+        lambda r: (f_dist / sum_times(r, f_cols)) if (f_cols and pd.notna(sum_times(r, f_cols)) and sum_times(r, f_cols) > 0)
+        else np.nan, axis=1
+    )
+
+    # MID (tsSPI) speed
+    tssp_start = _adaptive_tssp_start(D, step, seg_markers)
+    mid_cols = [c for c in [f"{m}_Time" for m in range(tssp_start, 600-1, -step)] if c in w.columns]
+    w["_MID_spd"] = w.apply(lambda r: stage_speed(r, mid_cols, float(step)), axis=1)
+
+    # Accel (unchanged windows)
+    if step == 100:
+        acc_cols = [c for c in [f"{m}_Time" for m in [500, 400, 300, 200]] if c in w.columns]
+    else:
+        acc_cols = [c for c in [f"{m}_Time" for m in [600, 400]] if c in w.columns]
+    w["_ACC_spd"] = w.apply(lambda r: stage_speed(r, acc_cols, float(step)), axis=1)
+
+    # Grind (unchanged)
+    w["_GR_spd"] = w.apply(lambda r: grind_speed(r, step), axis=1)
 
     # -------- Speed→index conversion --------
     def speed_to_index(spd):
