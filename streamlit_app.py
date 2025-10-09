@@ -1515,6 +1515,7 @@ def _ensure_schema(conn: sqlite3.Connection):
         use_cg         INTEGER,
         dampen_when_collapsed INTEGER,
         use_shape_module INTEGER,
+        going          TEXT,
         notes          TEXT
     );
     """)
@@ -1589,11 +1590,16 @@ def _export_pdf_report(*,
     cg  = "ON" if USE_CG else "OFF"
     cg_line = f"CG: {cg}"
     if fsr is not None:
+        cg_line = f"CG: {cg}"
+    if fsr is not None:
         cg_line += f" · FSR={float(fsr):.3f}"
     if cs is not None:
         cg_line += f" · CollapseSeverity={float(cs):.1f} pts"
     if step is not None:
         cg_line += f" · Splits: {int(step)} m"
+    going_pdf = metrics.attrs.get("GOING", None)
+    if going_pdf:
+        cg_line += f" · Going: {going_pdf}"
     story.append(Paragraph(cg_line, styles["Normal"]))
     story.append(Spacer(0, 6))
 
@@ -1691,6 +1697,7 @@ def _save_current_race_to_db(db_path: str,
         "race_no": _rno,
         "distance_m": int(race_distance_input),
         "split_step": step,
+        "going": metrics.attrs.get("GOING", "Good"),
         "fsr": fsr_val,
         "collapse": collapse_pt,
         # Optional, only written if columns exist in your DB
