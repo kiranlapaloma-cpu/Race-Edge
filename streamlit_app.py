@@ -647,10 +647,26 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["Grind_CG"] = [ _fade_cap(g, dg) for g, dg in zip(w["Grind_CG"], w["DeltaG"]) ]
 
     # ----- PI v3.2 -----
-    GR_COL = "Grind_CG" if use_cg else "Grind"
-    PI_W = pi_weights_distance_and_context(D,
-                                           pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True),
-                                           pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True))
+        GR_COL = "Grind_CG" if use_cg else "Grind"
+    acc_med = pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True)
+    grd_med = pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True)
+
+    # Pull going context from the outer scope (set in sidebar)
+    global GOING_TYPE, USE_GOING_ADJUST
+    going_for_pi = GOING_TYPE if ('USE_GOING_ADJUST' in globals() and USE_GOING_ADJUST) else "Good"
+
+    PI_W, PI_META = pi_weights_distance_and_context(
+        D,
+        acc_med,
+        grd_med,
+        going=going_for_pi,
+        field_n=len(w),
+        return_meta=True
+    )
+
+    # Store for captions/DB/PDF
+    w.attrs["GOING"] = going_for_pi
+    w.attrs["PI_GOING_META"] = PI_META
     if use_cg and dampen_cg and CollapseSeverity >= 3.0:
         d = min(0.02 + 0.01*(CollapseSeverity-3.0), 0.08)
         shift = min(d, PI_W["Grind"])
@@ -681,9 +697,12 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         except Exception: winner_time = None
 
     wT = 0.25
-    Wg = pi_weights_distance_and_context(D,
-                                         pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True),
-                                         pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True))
+        Wg = pi_weights_distance_and_context(
+        D,
+        pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True),
+        pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True)
+        # (no going arg -> defaults to Good)
+    )
     wPACE = Wg["Accel"] + Wg["Grind"]; wSS = Wg["tsSPI"]; wEFF = max(0.0, 1.0 - (wT + wPACE + wSS))
 
     def _map_pct(x, lo=98.0, hi=104.0):
