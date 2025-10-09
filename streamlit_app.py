@@ -1005,16 +1005,44 @@ else:
 st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
 pace_png = None
 
-if seg_markers or ("Finish_Time" in work.columns):
-    step = metrics.attrs.get("STEP", 100)
-    wanted = [m for m in range(int(race_distance_input) - step, step-1, -step)]
-    segs = []
-    for m in wanted:
-        c = f"{m}_Time"
-        if c in work.columns:
-            segs.append((m+step, m, float(step), c))
-    if "Finish_Time" in work.columns:
-        segs.append((step, 0, float(step), "Finish_Time"))
+# Build segments from actual columns so odd distances (1250/1160/1450…) plot correctly
+step = metrics.attrs.get("STEP", 100)
+
+# Collect *_Time markers that really exist, highest first
+marks = collect_markers(work)  # e.g. [1200,1100,...,100]
+segs = []
+
+# First leg: from D to first marker (may be 50, 100, 160, 250…)
+if marks:
+    first = int(marks[0])
+    first_len = float(max(1.0, float(race_distance_input) - first))
+    if f"{first}_Time" in work.columns:
+        segs.append((int(race_distance_input), first, first_len, f"{first}_Time"))
+
+# Middle legs: successive marker gaps (usually 100 or 200)
+for a, b in zip(marks, marks[1:]):
+    if f"{a}_Time" in work.columns:
+        segs.append((a, b, float(a - b), f"{a}_Time"))
+
+# Finish leg: always add Finish_Time if present
+if "Finish_Time" in work.columns:
+    fin_len = 100.0 if step == 100 else 200.0
+    segs.append((step, 0, fin_len, "Finish_Time"))
+
+if len(segs) == 0:
+    st.info("Not enough *_Time columns to draw the pace curve.")
+else:
+    seg_cols = [c for (_,_,_,c) in segs]
+    times_df = work[seg_cols].apply(pd.to_numeric, errors="coerce").mask(lambda df: (df <= 0) | (~np.isfinite(df)))
+    speed_df = pd.DataFrame(index=work.index)
+    for (_, _, L, c) in segs:
+        speed_df[c] = float(L) / times_df[c]
+
+    field_avg = speed_df.mean(axis=0, skipna=True).to_numpy()
+    if not np.isfinite(np.nanmean(field_avg)):
+        st.info("Pace curve: all segments missing/invalid.")
+    else:
+        # … (leave the rest of your plotting code unchanged)
 
     # If nothing valid, bail early
     if len(segs) == 0:
