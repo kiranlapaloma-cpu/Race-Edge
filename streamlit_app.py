@@ -1112,7 +1112,7 @@ D    = float(race_distance_input)
 
 # Build segments from the columns that actually exist.
 # Each segment is (label, length_m, src_col). We purposely give every segment a UNIQUE KEY.
-marks = _collect_markers(work)  # e.g. [1200,1100,1000,...] for a 1250 race (100m splits)
+marks = collect_markers(work)  # e.g. [1200,1100,1000,...] for a 1250 race (100m splits)
 
 segs = []
 if marks:
