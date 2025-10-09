@@ -692,6 +692,46 @@ def build_metrics_and_shape(
         w["Accel_eff"] = pd.to_numeric(w["Accel"],    errors="coerce")
         w["Grind_eff"] = pd.to_numeric(w["Grind"],    errors="coerce")
 
+    # ------- Weight knobs: guard safe defaults if sidebar vars missing -------
+USE_WEIGHT          = bool(globals().get("USE_WEIGHT", False))
+BASELINE_KG         = float(globals().get("BASELINE_KG", 60.0))
+KG_EFFECT_PCT       = float(globals().get("KG_EFFECT_PCT", 0.60))          # % of core metric affected
+WEIGHT_SENS_PER_KG  = float(globals().get("WEIGHT_SENS_PER_KG", 0.0011))   # points-per-kg sensitivity
+WEIGHTS_MAP         = globals().get("WEIGHTS_MAP", None)  # dict {horse -> kg} or None
+
+# If your uploaded file already has per-horse weights in a column, you can
+# auto-build a map here as a fallback (will not override an existing WEIGHTS_MAP):
+if WEIGHTS_MAP is None and "Horse" in work.columns and "Horse Weight" in work.columns:
+    wm = (
+        work[["Horse", "Horse Weight"]]
+        .dropna()
+        .assign(**{"Horse Weight": pd.to_numeric(work["Horse Weight"], errors="coerce")})
+    )
+    if not wm.empty:
+        WEIGHTS_MAP = dict(zip(wm["Horse"].astype(str), wm["Horse Weight"].astype(float)))
+
+# ------- Compute metrics + race shape (fully keyworded to avoid order bugs) -------
+try:
+    metrics, seg_markers = build_metrics_and_shape(
+        df_in=work,
+        D_actual_m=float(race_distance_input),
+        step=int(split_step),
+        use_cg=USE_CG,
+        dampen_cg=DAMPEN_CG,
+        use_race_shape=USE_RACE_SHAPE,
+        # weight module
+        use_weight=USE_WEIGHT,
+        baseline_kg=BASELINE_KG,
+        kg_effect_pct=KG_EFFECT_PCT,
+        weight_sens_per_kg=WEIGHT_SENS_PER_KG,
+        weights_map=WEIGHTS_MAP,
+        debug=DEBUG,
+    )
+except Exception as e:
+    st.error("Metric computation failed.")
+    st.exception(e)
+    st.stop()
+
     # ---------- Corrected Grind (CG) ----------
     ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
     GR_field  = pd.to_numeric(w["_GR_spd"],  errors="coerce").mean(skipna=True)
