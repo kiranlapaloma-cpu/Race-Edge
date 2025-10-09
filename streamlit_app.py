@@ -475,8 +475,23 @@ def _interp_weights(dm, a_dm, a_w, b_dm, b_w):
         "Grind":    _lerp(a_w["Grind"],    b_w["Grind"],    t),
     }
 
-def pi_weights_distance_and_context(distance_m: float, acc_med: float|None, grd_med: float|None) -> dict:
+def pi_weights_distance_and_context(
+    distance_m: float,
+    acc_med: float|None,
+    grd_med: float|None,
+    going: str = "Good",
+    field_n: int | None = None,
+    return_meta: bool = False
+) -> dict | tuple[dict, dict]:
+    """
+    Returns PI weights (sum=1). If return_meta=True, also returns a meta dict
+    describing the going multipliers actually applied.
+    Going affects PI weighting ONLY (not indices or GCI).
+    """
+
     dm = float(distance_m or 1200)
+
+    # ---- Base by distance (your current logic) ----
     if dm <= 1000:
         base = {"F200_idx":0.12,"tsSPI":0.35,"Accel":0.36,"Grind":0.17}
     elif dm < 1100:
@@ -496,7 +511,7 @@ def pi_weights_distance_and_context(distance_m: float, acc_med: float|None, grd_
         ts = max(0.0, 1.0 - F200 - ACC - grind)
         base = {"F200_idx":F200,"tsSPI":ts,"Accel":ACC,"Grind":grind}
 
-    # mild context nudge
+    # ---- Mild context nudge (your bias step) ----
     if acc_med is not None and grd_med is not None and math.isfinite(acc_med) and math.isfinite(grd_med):
         bias = acc_med - grd_med
         scale = math.tanh(abs(bias) / 6.0)
@@ -509,9 +524,57 @@ def pi_weights_distance_and_context(distance_m: float, acc_med: float|None, grd_
         GR = min(GR, 0.40); ts = max(0.0, 1.0 - F200 - ACC - GR)
         base = {"F200_idx":F200,"tsSPI":ts,"Accel":ACC,"Grind":GR}
 
-    s = sum(base.values())
-    if abs(s - 1.0) > 1e-6: base = {k: v/s for k, v in base.items()}
-    return base
+    # ---- Going modulation (affects PI weighting ONLY) ----
+    # Field-size damper: full effect by 12+ runners; scale down in small fields
+    n = max(1, int(field_n or 12))
+    field_scale = min(1.0, n / 12.0)
+
+    # Going multipliers (before renormalization)
+    # Good = neutral (all 1.0)
+    # Firm: reward Accel & F200; soften Grind & tsSPI
+    # Soft: reward Grind & tsSPI; soften Accel & F200
+    # Heavy: stronger version of Soft
+    if going == "Firm":
+        amp_main, amp_side = 0.06, 0.03
+        mult = {
+            "Accel":    1.0 + amp_main * field_scale,
+            "F200_idx": 1.0 + amp_side * field_scale,
+            "Grind":    1.0 - amp_main * field_scale,
+            "tsSPI":    1.0 - amp_side * field_scale,
+        }
+    elif going == "Soft":
+        amp_main, amp_side = 0.06, 0.03
+        mult = {
+            "Accel":    1.0 - amp_main * field_scale,
+            "F200_idx": 1.0 - amp_side * field_scale,
+            "Grind":    1.0 + amp_main * field_scale,
+            "tsSPI":    1.0 + amp_side * field_scale,
+        }
+    elif going == "Heavy":
+        amp_main, amp_side = 0.10, 0.05
+        mult = {
+            "Accel":    1.0 - amp_main * field_scale,
+            "F200_idx": 1.0 - amp_side * field_scale,
+            "Grind":    1.0 + amp_main * field_scale,
+            "tsSPI":    1.0 + amp_side * field_scale,
+        }
+    else:  # "Good" or unknown
+        mult = {"F200_idx":1.0, "tsSPI":1.0, "Accel":1.0, "Grind":1.0}
+
+    weighted = {k: base[k] * mult[k] for k in base.keys()}
+    s = sum(weighted.values()) or 1.0
+    out = {k: v / s for k, v in weighted.items()}
+
+    if not return_meta:
+        return out
+    meta = {
+        "going": going,
+        "field_n": n,
+        "multipliers": mult,
+        "base": base.copy(),
+        "final": out.copy()
+    }
+    return out, meta
 
 # -------- Core builder --------
 def build_metrics_and_shape(df_in: pd.DataFrame,
