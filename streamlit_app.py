@@ -570,13 +570,13 @@ w["tsSPI"]    = speed_to_index(pd.to_numeric(w["_MID_spd"], errors="coerce"))
 w["Accel"]    = speed_to_index(pd.to_numeric(w["_ACC_spd"], errors="coerce"))
 w["Grind"]    = speed_to_index(pd.to_numeric(w["_GR_spd"],  errors="coerce"))
 
-    # ---------- Corrected Grind (CG) ----------
-    ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
-    GR_field  = pd.to_numeric(w["_GR_spd"],  errors="coerce").mean(skipna=True)
-    FSR = float(GR_field / ACC_field) if (ACC_field and ACC_field > 0 and math.isfinite(ACC_field) and math.isfinite(GR_field)) else np.nan
-    if not math.isfinite(FSR):
-        FSR = 1.0
-    CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index points
+# ---------- Corrected Grind (CG) ----------
+ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
+GR_field  = pd.to_numeric(w["_GR_spd"],  errors="coerce").mean(skipna=True)
+FSR = float(GR_field / ACC_field) if (ACC_field and ACC_field > 0 and math.isfinite(ACC_field) and math.isfinite(GR_field)) else np.nan
+if not math.isfinite(FSR):
+FSR = 1.0
+CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index points
 
     def delta_g_row(r):
         mid = float(r.get("_MID_spd", np.nan))
