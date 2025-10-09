@@ -678,24 +678,22 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     sci         = 1.0
     fra_applied = 0
 
-    if use_race_shape:
-        # EARLY/LATE windows
-        if step == 100:
-            early_markers = [int(D - 100), int(D - 200)]
-        else:
-            # One earliest panel for 200m data (based on actual first span)
-            if markers:
-                first_span = float(max(1.0, D - int(markers[0])))
-                take = int(D - min(first_span, 200.0))
-                early_markers = [take]
-            else:
-                early_markers = [int(D - 200)]
-        early_cols = [f"{m}_Time" for m in early_markers if f"{m}_Time" in w.columns]
+        if use_race_shape:
+        # ----- EARLY (always the adaptive F-window you computed above) -----
+        # You already built w["_F_spd"] using the adaptive logic (F150/F160/F250/F100/F200).
+        w["_EARLY_spd"] = pd.to_numeric(w["_F_spd"], errors="coerce")
 
+        # ----- LATE (unchanged) -----
         if step == 100:
             late_cols = [c for c in [f"{m}_Time" for m in [500, 400, 300, 200]] if c in w.columns]
         else:
             late_cols = [c for c in [f"{m}_Time" for m in [600, 400]] if c in w.columns]
+
+        w["_LATE_spd"] = w.apply(lambda r: stage_speed(r, late_cols, float(step)) if late_cols else np.nan, axis=1)
+
+        # Map to indices
+        w["EARLY_idx"] = speed_to_index(pd.to_numeric(w["_EARLY_spd"], errors="coerce"))
+        w["LATE_idx"]  = speed_to_index(pd.to_numeric(w["_LATE_spd"],  errors="coerce"))
 
         w["_EARLY_spd"] = w.apply(lambda r: stage_speed(r, early_cols, float(step)) if early_cols else np.nan, axis=1)
         w["_LATE_spd"]  = w.apply(lambda r: stage_speed(r, late_cols,  float(step)) if late_cols  else np.nan, axis=1)
