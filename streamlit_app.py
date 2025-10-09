@@ -358,6 +358,14 @@ def apply_weight_to_times(df: pd.DataFrame, *, distance_m: float, baseline_kg: f
     out["_WeightΔ_kg"] = kg_delta
     return out
 
+# --- make sure sidebar widgets are visible globally (Streamlit scopes them locally sometimes) ---
+if "WEIGHT_BASELINE" not in globals() and "WEIGHT_BASELINE" in locals():
+    WEIGHT_BASELINE = locals()["WEIGHT_BASELINE"]
+if "WEIGHT_SENS_PER_KG" not in globals() and "WEIGHT_SENS_PER_KG" in locals():
+    WEIGHT_SENS_PER_KG = locals()["WEIGHT_SENS_PER_KG"]
+if "USE_WEIGHT" not in globals() and "USE_WEIGHT" in locals():
+    USE_WEIGHT = locals()["USE_WEIGHT"]
+
 # ---- Apply weight & proceed to metrics (Batch 2 will consume `work_w`) ----
 BASE_WEIGHT = 60.0
 ui_delta = weight_delta if 'weight_delta' in globals() else 0.0
