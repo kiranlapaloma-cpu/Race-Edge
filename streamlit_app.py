@@ -908,6 +908,65 @@ if pi_meta:
     if moved:
         st.caption(f"Going: {g} — PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
         
+# ======================= Ahead of Handicap (Single-Race, Field-Aware) =======================
+st.markdown("## Ahead of Handicap — Single Race Field Context")
+
+AH = metrics.copy()
+# Safety: ensure required columns exist
+for c in ["PI_RS","PI","Accel",GR_COL,"Finish_Pos","Horse"]:
+    if c not in AH.columns:
+        AH[c] = np.nan
+AH["PI_RS"] = pd.to_numeric(AH["PI_RS"], errors="coerce").fillna(pd.to_numeric(AH["PI"], errors="coerce"))
+
+# 1) Robust centre and spread (single race only)
+pi_rs = AH["PI_RS"].clip(lower=0.0, upper=10.0)
+med   = float(np.nanmedian(pi_rs))
+sigma = mad_std(pi_rs - med)
+sigma = 0.90 if (not np.isfinite(sigma) or sigma < 0.90) else sigma
+
+# 2) Sample-size shrink for small/odd fields
+N     = int(pi_rs.notna().sum())
+alpha = N / (N + 6.0)  # → ~0.63 at N=10; ~0.4 at N=4
+
+# 3) Field-shape influence (devoid of weight/handicap; uses only this race)
+#    Reward balance late; softly reduce if very skewed (helps dampen fluky “shape gifts”).
+bal          = 100.0 - (pd.to_numeric(AH["Accel"], errors="coerce") - pd.to_numeric(AH[GR_COL], errors="coerce")).abs() / 2.0
+AH["_BAL"]   = bal
+# Map BAL to a small multiplier in [0.92, 1.05]
+AH["_FSI"]   = (0.92 + (AH["_BAL"] - 95.0) / 100.0).clip(0.92, 1.05)
+
+# 4) z’s and final AHS 0–10 scale
+z_raw        = (pi_rs - med) / sigma
+AH["z_clean"]= alpha * z_raw
+AH["z_FA"]   = AH["z_clean"] * AH["_FSI"]
+AH["AHS"]    = (5.0 + 2.2 * AH["z_FA"]).clip(0.0, 10.0).round(2)
+
+# 5) Tiers + Confidence (field size)
+def ah_tier(v):
+    if not np.isfinite(v): return ""
+    if v >= 7.20: return "🏆 Dominant"
+    if v >= 6.20: return "🔥 Clear Ahead"
+    if v >= 5.40: return "🟢 Ahead"
+    if v <= 4.60: return "🔻 Behind"
+    return "⚪ Neutral"
+
+def ah_conf(n):
+    if n >= 12: return "High"
+    if n >= 8:  return "Med"
+    return "Low"
+
+AH["AH_Tier"]       = AH["AHS"].map(ah_tier)
+AH["AH_Confidence"] = ah_conf(N)
+
+# 6) Display table (sorted by AHS then finish)
+ah_cols = ["Horse","Finish_Pos","PI_RS","AHS","AH_Tier","AH_Confidence","z_FA","_FSI"]
+for c in ah_cols:
+    if c not in AH.columns: AH[c] = np.nan
+
+AH_view = AH.sort_values(["AHS","Finish_Pos"], ascending=[False, True])[ah_cols]
+st.dataframe(AH_view, use_container_width=True)
+st.caption("AH = Ahead-of-Handicap (single race). Centre = trimmed median PI_RS; spread = MAD σ; FSI mildly rewards late balance.")
+# ======================= End Ahead of Handicap =======================
 # ======================= End of Batch 2 =======================
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
 from matplotlib.patches import Rectangle
