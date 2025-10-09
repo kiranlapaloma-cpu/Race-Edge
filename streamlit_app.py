@@ -145,9 +145,10 @@ CREATE TABLE IF NOT EXISTS races(
   split_step     INTEGER CHECK(split_step IN (100,200)) NOT NULL,
   fsr            REAL,
   collapse       REAL,
-  shape_tag      TEXT,         -- NEW: SED tag e.g., SLOW_EARLY, EVEN, FAST_EARLY
-  sci            REAL,         -- NEW: Shape Consistency Index (0..1)
-  fra_applied    INTEGER,      -- NEW: flag if False-Run Adjustment was used (0/1)
+  shape_tag      TEXT,
+  sci            REAL,
+  fra_applied    INTEGER,
+  going          TEXT,       -- NEW: Track going used for PI weighting (Firm/Good/Soft/Heavy)
   app_version    TEXT,
   created_ts     TEXT DEFAULT (datetime('now')),
   src_hash       TEXT
