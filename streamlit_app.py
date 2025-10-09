@@ -263,10 +263,7 @@ st.dataframe(work.head(12), use_container_width=True)
 
 # ----------------------- Integrity helpers (odds-aware) -------------------
 def expected_segments_from_df(df: pd.DataFrame) -> list[str]:
-    """
-    Use ONLY the *_Time columns that actually exist in the upload (highest→lowest),
-    and append Finish_Time if present. This avoids phantom warnings like 1150_Time at 1250m.
-    """
+    """Use only *_Time columns that actually exist (highest→lowest) + Finish_Time if present."""
     marks = []
     for c in df.columns:
         if c.endswith("_Time") and c != "Finish_Time":
@@ -279,6 +276,19 @@ def expected_segments_from_df(df: pd.DataFrame) -> list[str]:
     if "Finish_Time" in df.columns:
         cols.append("Finish_Time")
     return cols
+
+def integrity_scan(df: pd.DataFrame, distance_m: float, step: int):
+    """Validate only the real columns; no synthetic ‘missing’ list."""
+    exp_cols = expected_segments_from_df(df)
+    invalid_counts = {}
+    for c in exp_cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        invalid_counts[c] = int(((s <= 0) | s.isna()).sum())
+    msgs = []
+    bads = [f"{k} ({v} rows)" for k, v in invalid_counts.items() if v > 0]
+    if bads:
+        msgs.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
+    return " • ".join(msgs), [], invalid_counts
 
 def integrity_scan(df: pd.DataFrame, distance_m: float, step: int):
     """
