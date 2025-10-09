@@ -673,41 +673,34 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
 
     w["GCI"] = gci_vals
 
-    # ---------- RACE SHAPE MODULE v2.2 (EARLY/LATE/SCI + FRA) ----------
+        # ---------- RACE SHAPE MODULE v2.2 (EARLY/LATE/SCI + FRA) ----------
     shape_tag   = "EVEN"
     sci         = 1.0
     fra_applied = 0
 
-        if use_race_shape:
-        # ----- EARLY (always the adaptive F-window you computed above) -----
-        # You already built w["_F_spd"] using the adaptive logic (F150/F160/F250/F100/F200).
-        w["_EARLY_spd"] = pd.to_numeric(w["_F_spd"], errors="coerce")
+    if use_race_shape:
+        # EARLY = your adaptive F-window speed (_F_spd) → always present when the file has at least the first panel
+        w["_EARLY_spd"] = pd.to_numeric(w.get("_F_spd"), errors="coerce")
 
-        # ----- LATE (unchanged) -----
+        # LATE window unchanged (depends on split step)
         if step == 100:
             late_cols = [c for c in [f"{m}_Time" for m in [500, 400, 300, 200]] if c in w.columns]
         else:
             late_cols = [c for c in [f"{m}_Time" for m in [600, 400]] if c in w.columns]
+        w["_LATE_spd"]  = w.apply(lambda r: stage_speed(r, late_cols, float(step)) if late_cols else np.nan, axis=1)
 
-        w["_LATE_spd"] = w.apply(lambda r: stage_speed(r, late_cols, float(step)) if late_cols else np.nan, axis=1)
-
-        # Map to indices
+        # Map to indices (robust)
         w["EARLY_idx"] = speed_to_index(pd.to_numeric(w["_EARLY_spd"], errors="coerce"))
         w["LATE_idx"]  = speed_to_index(pd.to_numeric(w["_LATE_spd"],  errors="coerce"))
 
-        w["_EARLY_spd"] = w.apply(lambda r: stage_speed(r, early_cols, float(step)) if early_cols else np.nan, axis=1)
-        w["_LATE_spd"]  = w.apply(lambda r: stage_speed(r, late_cols,  float(step)) if late_cols  else np.nan, axis=1)
-
-        w["EARLY_idx"] = speed_to_index(pd.to_numeric(w["_EARLY_spd"], errors="coerce"))
-        w["LATE_idx"]  = speed_to_index(pd.to_numeric(w["_LATE_spd"],  errors="coerce"))
-
+        # Medians and deltas
         E_med = float(pd.to_numeric(w["EARLY_idx"], errors="coerce").median(skipna=True))
         M_med = float(pd.to_numeric(w["tsSPI"],     errors="coerce").median(skipna=True))
         L_med = float((0.6*pd.to_numeric(w["Accel"], errors="coerce") +
                        0.4*pd.to_numeric(w[GR_COL],   errors="coerce")).median(skipna=True))
-
         dE, dM, dL = (E_med - 100.0), (M_med - 100.0), (L_med - 100.0)
 
+        # Adaptive gates (MAD-based), then distance scaling
         def _gate(series, base=2.2):
             z = pd.to_numeric(series, errors="coerce") - 100.0
             s = mad_std(z)
@@ -716,21 +709,23 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
 
         gE = _gate(w["EARLY_idx"])
         gL = _gate(0.6*w["Accel"] + 0.4*w[GR_COL])
-
         if   D <= 1200: scale = 1.00
         elif D <  1800: scale = 1.10
         else:           scale = 1.20
         gE *= scale; gL *= scale
 
+        # SCI components: how many runners improved late vs early (or vice versa)
         delta_EL = (pd.to_numeric(w["LATE_idx"], errors="coerce") -
                     pd.to_numeric(w["EARLY_idx"], errors="coerce"))
         sci_plus  = float((delta_EL >  +1.0).mean()) if delta_EL.notna().any() else np.nan
         sci_minus = float((delta_EL <  -1.0).mean()) if delta_EL.notna().any() else np.nan
 
+        # FSR confirmatory signals
         fsr_val = float(FSR) if np.isfinite(FSR) else np.nan
         confirm_slow = (np.isfinite(fsr_val) and fsr_val >= 1.03)
         confirm_fast = (np.isfinite(fsr_val) and fsr_val <= 0.97)
 
+        # Decisions (conservative)
         slow_early = (dE <= -gE) and (dL >= +gL) and ((dL - dE) >= 3.5) \
                      and (sci_plus >= 0.55 if np.isfinite(sci_plus) else True) \
                      and (99.0 <= M_med <= 101.8)
@@ -750,6 +745,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
             else:
                 shape_tag = "EVEN"
 
+        # SCI value
         if shape_tag == "SLOW_EARLY":
             sci = float(sci_plus if np.isfinite(sci_plus) else 1.0)
         elif shape_tag == "FAST_EARLY":
@@ -757,7 +753,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         else:
             sci = float((delta_EL.abs() <= 1.5).mean()) if delta_EL.notna().any() else 1.0
 
-        # FRA (False-Run Adjustment) — mild, only if SCI is decent
+        # FRA (False-Run Adjustment) — mild, only if SCI decent
         w["PI_RS"]  = w["PI"].astype(float)
         w["GCI_RS"] = w["GCI"].astype(float)
 
@@ -778,10 +774,16 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
             w["PI_RS"]  = (w["PI"]  + f2 * (sturdiness / 4.0)).clip(0.0, 10.0)
             w["GCI_RS"] = (w["GCI"] + f2 * (sturdiness / 3.0)).clip(0.0, 10.0)
             fra_applied = 1
+
     else:
-        # race shape OFF → passthrough
+        # Race shape OFF → passthrough
         w["PI_RS"]  = w["PI"].astype(float)
         w["GCI_RS"] = w["GCI"].astype(float)
+
+    # Stash diagnostics for the header
+    w.attrs["SHAPE_TAG"]   = shape_tag
+    w.attrs["SCI"]         = float(sci)
+    w.attrs["FRA_APPLIED"] = int(fra_applied)
 
     # ---------- Final rounding ----------
     for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
