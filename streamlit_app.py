@@ -931,7 +931,7 @@ try:
         # weight engine (from the sidebar + editor)
         use_weight=USE_WEIGHT,
         baseline_kg=float(WEIGHT_BASELINE),
-        kg_effect_pct=float(0.60),
+        weight_sens_per_kg=float(WEIGHT_SENS_PER_KG),
         weight_sens_per_kg=float(WEIGHT_SENS_PER_KG),
         weights_map=WEIGHTS_MAP,
         debug=DEBUG,
