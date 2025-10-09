@@ -487,6 +487,23 @@ def pi_weights_distance_and_context(distance_m: float,
         base = {k: v / s for k, v in base.items()}
     return base
 
+# ---- safety defaults in case widgets aren't in globals on this rerun
+try:
+    WEIGHT_BASELINE
+except NameError:
+    WEIGHT_BASELINE = 60.0
+
+try:
+    WEIGHT_SENS_PER_KG
+except NameError:
+    WEIGHT_SENS_PER_KG = 0.0011
+
+try:
+    USE_WEIGHT
+except NameError:
+    USE_WEIGHT = False
+
+WEIGHTS_MAP = globals().get("WEIGHTS_MAP", WEIGHTS_MAP if "WEIGHTS_MAP" in globals() else None)
 # -------- Metric builder (handles 100m and 200m) --------
 def build_metrics_and_shape(
     df_in: pd.DataFrame,
