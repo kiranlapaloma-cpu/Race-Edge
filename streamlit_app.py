@@ -949,7 +949,7 @@ try:
     weights_map=WEIGHTS_MAP,
     weight_baseline=float(WEIGHT_BASELINE),
     weight_sens_per_kg=float(WEIGHT_SENS_PER_KG)
-    )
+    
 except Exception as e:
     st.error("Metric computation failed.")
     st.exception(e)
