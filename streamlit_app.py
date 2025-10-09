@@ -922,18 +922,18 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
 # ---- Compute metrics + race shape now ----
 try:
     metrics, seg_markers = build_metrics_and_shape(
-        work,
-        float(race_distance_input),
-        int(split_step),
-        USE_CG,
-        DAMPEN_CG,
-        USE_RACE_SHAPE,
-        DEBUG,
-        # Weight UI wiring (from Batch 1):
-        use_weight=USE_WEIGHT,
-        weights_map=WEIGHTS_MAP,
-        weight_baseline=float(WEIGHT_BASELINE),
-        weight_sens_per_kg=float(WEIGHT_SENS_PER_KG)
+    work,
+    float(race_distance_input),
+    int(split_step),
+    USE_CG,
+    DAMPEN_CG,
+    USE_RACE_SHAPE,
+    DEBUG,
+    # --- new weight controls from Batch 1 ---
+    use_weight=USE_WEIGHT,
+    weights_map=WEIGHTS_MAP,
+    weight_baseline=float(WEIGHT_BASELINE),
+    weight_sens_per_kg=float(WEIGHT_SENS_PER_KG)
     )
 except Exception as e:
     st.error("Metric computation failed.")
