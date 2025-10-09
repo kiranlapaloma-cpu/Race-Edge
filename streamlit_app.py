@@ -291,7 +291,6 @@ if split_step == 200:
 
 # -------------------------------------------------------------------------
 # Hand-off: Batch 2 will compute metrics and the Race Shape module (SED/FRA/SCI)
-# Hand-off: Batch 2 will compute metrics and the Race Shape module (SED/FRA/SCI)
 # ======================= Batch 2 — Metrics Engine + Race Shape (SED/SCI/FRA) =======================
 # (Drop-in replacement with Adaptive F-windows + Finish-Pos inference)
 
@@ -388,18 +387,18 @@ def pi_weights_distance_and_context(distance_m: float,
         ts = max(0.0, 1.0 - F200 - ACC - grind)
         base = {"F200_idx":F200, "tsSPI":ts, "Accel":ACC, "Grind":grind}
 
-    # Context tweak based on within-race bias (Accel vs Grind medians)
+    # Context tweak (Accel vs Grind bias)
     acc_med = float(acc_median) if acc_median is not None else None
     grd_med = float(grd_median) if grd_median is not None else None
     if acc_med is not None and grd_med is not None and math.isfinite(acc_med) and math.isfinite(grd_med):
         bias = acc_med - grd_med
-        scale = math.tanh(abs(bias) / 6.0)          # sensitivity curve
+        scale = math.tanh(abs(bias) / 6.0)
         max_shift = 0.02 * scale
         F200 = base["F200_idx"]; ts = base["tsSPI"]; ACC = base["Accel"]; GR = base["Grind"]
-        if bias > 0:           # acceleration rewarded → rebalance a touch toward Grind
+        if bias > 0:
             delta = min(max_shift, ACC - 0.26)
             ACC -= delta; GR += delta
-        elif bias < 0:         # grinding rewarded → swing a hair back to Accel
+        elif bias < 0:
             delta = min(max_shift, GR - 0.18)
             GR  -= delta; ACC += delta
         GR = min(GR, 0.40)
@@ -411,7 +410,41 @@ def pi_weights_distance_and_context(distance_m: float,
         base = {k: v / s for k, v in base.items()}
     return base
 
-# -------- Metric builder (handles 100m and 200m) --------
+# -------- Robust mapping: speeds → indices --------
+def _shrink_center(idx_series):
+    x = pd.to_numeric(idx_series, errors="coerce").dropna().values
+    N_eff = len(x)
+    if N_eff == 0:
+        return 100.0, 0
+    med_race = float(np.median(x))
+    alpha = N_eff / (N_eff + 6.0)
+    return alpha * med_race + (1 - alpha) * 100.0, N_eff
+
+def _dispersion_equalizer(delta_series, N_eff, N_ref=10, beta=0.20, cap=1.20):
+    gamma = 1.0 + beta * max(0, N_ref - N_eff) / N_ref
+    return delta_series * min(gamma, cap)
+
+def _variance_floor(idx_series, floor=1.5, cap=1.25):
+    deltas = idx_series - 100.0
+    sigma = mad_std(deltas)
+    if not np.isfinite(sigma) or sigma <= 0:
+        return idx_series
+    if sigma < floor:
+        factor = min(cap, floor / sigma)
+        return 100.0 + deltas * factor
+    return idx_series
+
+def speed_to_index(spd_series):
+    spd_series = pd.to_numeric(spd_series, errors="coerce")
+    med = spd_series.median(skipna=True)
+    idx_raw = 100.0 * (spd_series / med)
+    center, n_eff = _shrink_center(idx_raw)
+    idx = 100.0 * (spd_series / (center / 100.0 * med))
+    idx = 100.0 + _dispersion_equalizer(idx - 100.0, n_eff)
+    idx = _variance_floor(idx)
+    return idx
+
+# -------- Metric builder (handles 100m and 200m with adaptive F-windows) --------
 def build_metrics_and_shape(df_in: pd.DataFrame,
                             D_actual_m: float,
                             step: int,
@@ -424,7 +457,6 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     # ---------- Finish_Pos inference (if missing or mostly empty) ----------
     finish_inferred = 0
     if "Finish_Pos" not in w.columns or (pd.to_numeric(w["Finish_Pos"], errors="coerce").isna().mean() > 0.70):
-        # Try to infer by RaceTime_s later; for now keep a placeholder
         w["Finish_Pos"] = np.nan
         finish_inferred = 1
     else:
@@ -447,9 +479,8 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     else:
         w["RaceTime_s"] = as_num(w.get("Race Time", np.nan))
 
-    # If we decided to infer Finish_Pos, do it now (after RaceTime_s exists)
+    # Infer Finish_Pos now (after RaceTime_s exists)
     if finish_inferred == 1:
-        # Prefer ascending RaceTime_s; fallback to row order; stable tie-break on Horse
         tmp = w.reset_index(drop=False).rename(columns={"index":"_row"})
         tmp["_rt"] = pd.to_numeric(tmp["RaceTime_s"], errors="coerce")
         tmp["_horse"] = tmp.get("Horse", "").astype(str)
@@ -458,148 +489,109 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         w = tmp.sort_values("_row").drop(columns=["_row","_rt","_horse"]).reset_index(drop=True)
 
     # ---------- Build stage composite speeds (ADAPTIVE WINDOWS) ----------
-D = float(D_actual_m)
-markers = collect_markers(w)               # e.g. [1200, 1100, ..., 100] for a 1250 race
-step = int(step)                           # 100 or 200
+    D = float(D_actual_m)
+    markers = collect_markers(w)          # e.g. [1200, 1100, ..., 100]
+    step = int(step)                      # 100 or 200
 
-def _adaptive_f_window_cols(D, step, markers):
-    """
-    Returns (f_cols, f_dist) according to our rules:
-      100 m splits:
-         - normal: F200 = [D-100, D-200] (2 splits, 200 m)
-         - if D ends with 50: F150 = [D-50, D-150]  (2 splits, 150 m total)
-      200 m splits:
-         - if first split covers 160 m (e.g., 1160): F160 = [first marker] (160 m)
-         - if first split covers 250 m (e.g., 1450/1750/2450): F250 = [first marker] (250 m)
-         - if first split covers 100 m (e.g., 1300/1500/1700 not cleanly on 200): F100 = [first marker] (100 m)
-         - normal even 200 m race: F200 = [D-200] (one 200 m split)
-    """
-    if not markers:
-        return [], 0.0
-
-    m1 = int(markers[0])
-    first_span = D - m1                         # how long the VERY FIRST split is
-    cols = []
-
-    if step == 100:
-        if int(D) % 100 == 50:
-            # F150: need two columns — D-50 and D-150 — if present
-            wanted = [int(D - 50), int(D - 150)]
-            cols = [f"{m}_Time" for m in wanted if f"{m}_Time" in w.columns]
-            dist = 50.0 + 100.0 if len(cols) == 2 else 100.0 * len(cols)
-        else:
-            # Normal F200 = [D-100, D-200]
-            wanted = [int(D - 100), int(D - 200)]
-            cols = [f"{m}_Time" for m in wanted if f"{m}_Time" in w.columns]
-            dist = 100.0 * len(cols)
+    def _adaptive_f_window_cols(D, step, markers):
+        """
+        Returns (f_cols, f_dist) according to our rules.
+        """
+        if not markers:
+            return [], 0.0
+        m1 = int(markers[0])
+        first_span = float(max(1.0, D - m1))  # distance from D to first marker
+        if step == 100:
+            if int(D) % 100 == 50:
+                wanted = [int(D - 50), int(D - 150)]
+                cols = [f"{m}_Time" for m in wanted if f"{m}_Time" in w.columns]
+                dist = 150.0 if len(cols) == 2 else 100.0 * len(cols)
+                return cols, dist
+            else:
+                wanted = [int(D - 100), int(D - 200)]
+                cols = [f"{m}_Time" for m in wanted if f"{m}_Time" in w.columns]
+                return cols, 100.0 * len(cols)
+        # step == 200
+        cols = [f"{m1}_Time"] if f"{m1}_Time" in w.columns else []
+        if first_span <= 120:    dist = 100.0
+        elif first_span <= 180:  dist = 160.0
+        elif first_span <= 220:  dist = 200.0
+        else:                    dist = 250.0
         return cols, float(dist)
 
-    # step == 200
-    # Use the first split’s actual length to name the window (F160/F250/F100/F200)
-    cols = [f"{m1}_Time"] if f"{m1}_Time" in w.columns else []
-    if first_span <= 120:    dist = 100.0
-    elif first_span <= 180:  dist = 160.0
-    elif first_span <= 220:  dist = 200.0
-    else:                    dist = 250.0
-    return cols, float(dist)
+    def _adaptive_tssp_start(D, step):
+        if step == 100:
+            return int(D - 150) if (int(D) % 100 == 50) else int(D - 300)
+        if not markers:
+            return int(D - 400)
+        m1 = int(markers[0]); first_span = float(max(1.0, D - m1))
+        if first_span <= 120:    return int(D - 100)
+        if first_span <= 180:    return int(D - 150)
+        if first_span <= 220:    return int(D - 400)
+        return int(D - 250)
 
-def _adaptive_tssp_start(D, step):
-    """
-    tsSPI start:
-      100 m splits: normal D-300, but if D ends in 50 → D-150
-      200 m splits:
-        - if first span ≈160 → D-150
-        - if first span ≈250 → D-250
-        - if first span ≈100 → D-100
-        - else (even 200)    → D-400
-    """
+    # ---- F-window (early)
+    f_cols, f_dist = _adaptive_f_window_cols(D, step, markers)
+    w["_F_spd"] = w.apply(
+        lambda r: (f_dist / sum_times(r, f_cols)) if (f_cols and pd.notna(sum_times(r, f_cols)) and sum_times(r, f_cols) > 0)
+        else np.nan, axis=1
+    )
+
+    # ---- tsSPI (mid)
+    tssp_start = _adaptive_tssp_start(D, step)
+    tssp_cols = [c for c in make_range_cols(D, tssp_start, 600, step) if c in w.columns]
+    w["_MID_spd"] = w.apply(lambda r: stage_speed(r, tssp_cols, float(step)), axis=1)
+
+    # ---- Accel (600→200)
     if step == 100:
-        return int(D - 150) if (int(D) % 100 == 50) else int(D - 300)
-
-    # step == 200
-    if not markers:
-        return int(D - 400)
-    m1 = int(markers[0]); first_span = D - m1
-    if first_span <= 120:    return int(D - 100)
-    if first_span <= 180:    return int(D - 150)
-    if first_span <= 220:    return int(D - 400)
-    return int(D - 250)
-
-def _stage_speed_colwise(row, cols, meters_per_split):
-    if not cols: return np.nan
-    tsum = sum_times(row, cols)
-    if pd.isna(tsum) or tsum <= 0: return np.nan
-    # distance = sum of actual split lengths represented by the columns
-    # for 100 m splits each col = 100; for 200 m splits each col = the first split length or 200
-    if step == 100:
-        dist = 100.0 * len(cols)
-        # special case: 100m + F150 when only one of the two columns is present (rare)
-        if len(cols) == 2 and int(D) % 100 == 50 and (f"{int(D-50)}_Time" in cols and f"{int(D-150)}_Time" in cols):
-            dist = 150.0
+        accel_cols = [c for c in [f"{m}_Time" for m in [500, 400, 300, 200]] if c in w.columns]
     else:
-        # 200 m case — for tsSPI we just use step for mid windows (still robust),
-        # for early (F-window) we’ll feed an explicit distance separately
-        dist = float(step) * len(cols)
-    return dist / tsum
+        accel_cols = [c for c in [f"{m}_Time" for m in [600, 400]] if c in w.columns]
+    w["_ACC_spd"] = w.apply(lambda r: stage_speed(r, accel_cols, float(step)), axis=1)
 
-# ---- F-window (early) ----
-f_cols, f_dist = _adaptive_f_window_cols(D, step, markers)
-w["_F_spd"] = w.apply(
-    lambda r: (f_dist / sum_times(r, f_cols)) if (f_cols and pd.notna(sum_times(r, f_cols)) and sum_times(r, f_cols) > 0)
-    else np.nan, axis=1
-)
+    # ---- Grind (finish)
+    w["_GR_spd"] = w.apply(lambda r: grind_speed(r, step), axis=1)
 
-# ---- tsSPI (mid) ----
-tssp_start = _adaptive_tssp_start(D, step)
-tssp_cols = [c for c in make_range_cols(D, tssp_start, 600, step) if c in w.columns]
-w["_MID_spd"] = w.apply(lambda r: stage_speed(r, tssp_cols, float(step)), axis=1)
+    # ---- Map speeds → indices
+    w["F200_idx"] = speed_to_index(pd.to_numeric(w["_F_spd"],   errors="coerce"))
+    w["tsSPI"]    = speed_to_index(pd.to_numeric(w["_MID_spd"], errors="coerce"))
+    w["Accel"]    = speed_to_index(pd.to_numeric(w["_ACC_spd"], errors="coerce"))
+    w["Grind"]    = speed_to_index(pd.to_numeric(w["_GR_spd"],  errors="coerce"))
 
-# ---- Accel (600→200) stays the same windows as before ----
-if step == 100:
-    accel_cols = [c for c in [f"{m}_Time" for m in [500,400,300,200]] if c in w.columns]
-else:
-    accel_cols = [c for c in [f"{m}_Time" for m in [600,400]] if c in w.columns]
-w["_ACC_spd"] = w.apply(lambda r: stage_speed(r, accel_cols, float(step)), axis=1)
+    # ---------- Corrected Grind (CG) ----------
+    ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
+    GR_field  = pd.to_numeric(w["_GR_spd"],  errors="coerce").mean(skipna=True)
+    FSR = float(GR_field / ACC_field) if (ACC_field and ACC_field > 0 and math.isfinite(ACC_field) and math.isfinite(GR_field)) else np.nan
+    if not math.isfinite(FSR):
+        FSR = 1.0
+    CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index points
 
-# ---- Grind (finish) — unchanged ----
-w["_GR_spd"] = w.apply(lambda r: grind_speed(r, step), axis=1)
-
-# ---- Map speeds → indices (use existing mapper) ----
-w["F200_idx"] = speed_to_index(pd.to_numeric(w["_F_spd"],  errors="coerce"))
-w["tsSPI"]    = speed_to_index(pd.to_numeric(w["_MID_spd"], errors="coerce"))
-w["Accel"]    = speed_to_index(pd.to_numeric(w["_ACC_spd"], errors="coerce"))
-w["Grind"]    = speed_to_index(pd.to_numeric(w["_GR_spd"],  errors="coerce"))
-
-# ---------- Corrected Grind (CG) ----------
-ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
-GR_field  = pd.to_numeric(w["_GR_spd"],  errors="coerce").mean(skipna=True)
-FSR = float(GR_field / ACC_field) if (ACC_field and ACC_field > 0 and math.isfinite(ACC_field) and math.isfinite(GR_field)) else np.nan
-if not math.isfinite(FSR):
-FSR = 1.0
-CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index points
-
-    def delta_g_row(r):
+    def _delta_g_row(r):
         mid = float(r.get("_MID_spd", np.nan))
         grd = float(r.get("_GR_spd",  np.nan))
         if not (math.isfinite(mid) and math.isfinite(grd) and mid > 0):
             return np.nan
         return 100.0 * (grd / mid)
-    w["DeltaG"] = w.apply(delta_g_row, axis=1)
 
-    def finisher_factor_row(dg):
+    w["DeltaG"] = w.apply(_delta_g_row, axis=1)
+
+    def _finisher_factor_row(dg):
         if not math.isfinite(dg): return 0.0
         return float(clamp((dg - 98.0) / 4.0, 0.0, 1.0))
-    w["FinisherFactor"] = w["DeltaG"].map(finisher_factor_row)
+
+    w["FinisherFactor"] = w["DeltaG"].map(_finisher_factor_row)
     w["GrindAdjPts"] = (CollapseSeverity * (1.0 - w["FinisherFactor"])).round(2)
 
     # Subtract adj (cap fades for big late fades)
     w["Grind_CG"] = (w["Grind"] - w["GrindAdjPts"]).clip(lower=90.0, upper=110.0)
-    def fade_cap(g, dg):
+
+    def _fade_cap(g, dg):
         if not math.isfinite(g) or not math.isfinite(dg): return g
         if dg < 97.0 and g > 100.0:
             return 100.0 + 0.5 * (g - 100.0)
         return g
-    w["Grind_CG"] = [fade_cap(g, dg) for g, dg in zip(w["Grind_CG"], w["DeltaG"])]
+
+    w["Grind_CG"] = [_fade_cap(g, dg) for g, dg in zip(w["Grind_CG"], w["DeltaG"])]
 
     # ---------- PI v3.2 (pre Race Shape) ----------
     acc_med = w["Accel"].median(skipna=True)
@@ -616,7 +608,7 @@ CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index poi
 
     GR_COL = "Grind_CG" if use_cg else "Grind"
 
-    def pi_pts_row(row):
+    def _pi_pts_row(row):
         parts, weights = [], []
         for k, wgt in PI_W.items():
             v = row.get(GR_COL) if k == "Grind" else row.get(k, np.nan)
@@ -626,7 +618,7 @@ CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index poi
         if not weights: return np.nan
         return sum(parts) / sum(weights)
 
-    w["PI_pts"] = w.apply(pi_pts_row, axis=1)
+    w["PI_pts"] = w.apply(_pi_pts_row, axis=1)
     pts = pd.to_numeric(w["PI_pts"], errors="coerce")
     med = float(np.nanmedian(pts)) if np.isfinite(np.nanmedian(pts)) else 0.0
     centered = pts - med
@@ -652,7 +644,7 @@ CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index poi
         except Exception:
             winner_time = None
 
-    def map_pct(x, lo=98.0, hi=104.0):
+    def _map_pct(x, lo=98.0, hi=104.0):
         if pd.isna(x): return 0.0
         return clamp((float(x) - lo) / (hi - lo), 0.0, 1.0)
 
@@ -666,8 +658,8 @@ CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index poi
             elif d <= 1.00: T = 0.4
             else:           T = 0.2
 
-        LQ = 0.6 * map_pct(r.get("Accel")) + 0.4 * map_pct(r.get(GR_COL))
-        SS = map_pct(r.get("tsSPI"))
+        LQ = 0.6 * _map_pct(r.get("Accel")) + 0.4 * _map_pct(r.get(GR_COL))
+        SS = _map_pct(r.get("tsSPI"))
 
         acc, grd_eff = r.get("Accel"), r.get(GR_COL)
         if pd.isna(acc) or pd.isna(grd_eff):
@@ -687,14 +679,17 @@ CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index poi
     fra_applied = 0
 
     if use_race_shape:
-        # Ensure EARLY/LATE indices ALWAYS exist for the table
+        # EARLY/LATE windows
         if step == 100:
             early_markers = [int(D - 100), int(D - 200)]
         else:
-            # first segment length for 200m data drives the earliest window we can measure, but
-            # we still compute EARLY as the mean of the first "panel" only to avoid gaps
-            L0 = int(first_segment_length_200(D))
-            early_markers = [int(D - min(L0, 200))]
+            # One earliest panel for 200m data (based on actual first span)
+            if markers:
+                first_span = float(max(1.0, D - int(markers[0])))
+                take = int(D - min(first_span, 200.0))
+                early_markers = [take]
+            else:
+                early_markers = [int(D - 200)]
         early_cols = [f"{m}_Time" for m in early_markers if f"{m}_Time" in w.columns]
 
         if step == 100:
@@ -785,7 +780,6 @@ CollapseSeverity = float(min(10.0, max(0.0, (0.95 - FSR) * 100.0)))  # index poi
             w["PI_RS"]  = (w["PI"]  + f2 * (sturdiness / 4.0)).clip(0.0, 10.0)
             w["GCI_RS"] = (w["GCI"] + f2 * (sturdiness / 3.0)).clip(0.0, 10.0)
             fra_applied = 1
-
     else:
         # race shape OFF → passthrough
         w["PI_RS"]  = w["PI"].astype(float)
@@ -880,7 +874,6 @@ st.caption(
     f"CG={'ON' if USE_CG else 'OFF'} (FSR={metrics.attrs.get('FSR',1.0):.3f}; Collapse={metrics.attrs.get('CollapseSeverity',0.0):.1f}).  "
     f"Race Shape={metrics.attrs.get('SHAPE_TAG','EVEN')} (SCI={metrics.attrs.get('SCI',1.0):.2f}; FRA={'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'})."
 )
-
 # ======================= End of Batch 2 =======================
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
 from matplotlib.patches import Rectangle
