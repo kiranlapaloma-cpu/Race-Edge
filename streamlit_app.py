@@ -915,6 +915,11 @@ def build_metrics_and_shape(
     return w, seg_markers
 
 # ---- Compute metrics + race shape now (KEYWORD-ONLY call) ----
+# --- Safety: ensure baseline + sensitivity from sidebar exist in global scope ---
+if "WEIGHT_BASELINE" not in globals() and "WEIGHT_BASELINE" in locals():
+    WEIGHT_BASELINE = locals()["WEIGHT_BASELINE"]
+if "WEIGHT_SENS_PER_KG" not in globals() and "WEIGHT_SENS_PER_KG" in locals():
+    WEIGHT_SENS_PER_KG = locals()["WEIGHT_SENS_PER_KG"]
 try:
     metrics, seg_markers = build_metrics_and_shape(
         df_in=work,
