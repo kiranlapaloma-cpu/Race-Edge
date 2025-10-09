@@ -500,18 +500,7 @@ def pi_weights_distance_and_context(distance_m: float,
     return base
 
 # -------- Metric builder (handles 100m and 200m) --------
-def build_metrics_and_shape(df_in: pd.DataFrame,
-                            D_actual_m: float,
-                            step: int,
-                            use_cg: bool,
-                            dampen_cg: bool,
-                            use_race_shape: bool,
-                            use_weight: bool = False,
-                            baseline_kg: float = 60.0,
-                            kg_effect_pct: float = 0.60,
-                            debug: bool = False):
-                            # NEW (Batch 1 weight UI provides these):
-                            def build_metrics_and_shape(
+def build_metrics_and_shape(
     df_in: pd.DataFrame,
     D_actual_m: float,
     step: int,
@@ -524,14 +513,23 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     weight_sens_per_kg: float = 0.0011,
     debug: bool = False
 ):
-                
-        w = df_in.copy()
+    w = df_in.copy()
 
-        # Finish_Pos as numeric if present
-        if "Finish_Pos" in w.columns:
-            w["Finish_Pos"] = as_num(w["Finish_Pos"])
+    # Finish_Pos as numeric if present
+    if "Finish_Pos" in w.columns:
+        w["Finish_Pos"] = as_num(w["Finish_Pos"])
 
-        seg_markers = collect_markers(w)
+    seg_markers = collect_markers(w)
+
+    # Per-segment speeds
+    for m in seg_markers:
+        w[f"spd_{m}"] = (step * 1.0) / as_num(w.get(f"{m}_Time"))
+    w["spd_Finish"] = (
+        (100.0 if step == 100 else 200.0)
+        / as_num(w.get("Finish_Time"))
+        if "Finish_Time" in w.columns
+        else np.nan
+    )
 
     # Per-segment speeds
     for m in seg_markers:
