@@ -696,232 +696,97 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
 
     w["GCI"] = gci_vals
 
-        # ---------- RACE SHAPE MODULE v2.3 (Blended EARLY/LATE + SCI + FRA) ----------
-# Expects variables already defined in Batch 2:
-#   w (DataFrame with F200_idx, tsSPI, Accel, Grind/Grind_CG, PI, GCI, etc.)
-#   D (race distance, float), step (100 or 200), FSR (float), GR_COL ("Grind_CG" or "Grind")
-#   use_race_shape (bool), debug (bool), mad_std(), collect_markers()
+        # ====== RACE SHAPE v2.3 (drop-in for v3.1 app) ======
+# Paste this block immediately AFTER the try/except that builds `metrics`.
 
-def _norm_pair(a, b, lo=0.20, hi=0.80):
-    """Clamp to [lo,hi], then renormalize to sum to 1.00. NaNs → 0.5/0.5."""
-    try:
-        a = float(a)
-    except Exception:
-        a = 0.5
-    try:
-        b = float(b)
-    except Exception:
-        b = 0.5
-    a = float(np.clip(a, lo, hi))
-    b = float(np.clip(b, lo, hi))
-    s = a + b
-    if s <= 0:
-        return 0.5, 0.5
-    return a / s, b / s
+def _mad_std_series(series):
+    s = pd.to_numeric(series, errors="coerce") - 100.0
+    x = s.to_numpy(dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return np.nan
+    med = np.median(x)
+    return 1.4826 * np.median(np.abs(x - med))
 
-shape_tag   = "EVEN"
-sci         = 1.0
-fra_applied = 0
+def _gate(series, base=2.2):
+    s = _mad_std_series(series)
+    if not np.isfinite(s) or s <= 0:
+        s = 2.0
+    return max(base, 0.6 * s)
 
-if use_race_shape:
-    # ---- 1) Blended EARLY/LATE weights ----
-    dm = float(D)
+def _distance_gate_scale(D):
+    D = float(D or 1200)
+    if D <= 1200: return 1.00
+    if D <  1800: return 1.10
+    return 1.20
 
-    # Baseline by distance
-    if dm <= 1100:
-        wF, wM = 0.70, 0.30      # EARLY: F-window (F200_idx*), tsSPI
-        wA, wG = 0.55, 0.45      # LATE:  Accel, Grind/CG
-    elif dm <= 1400:
-        wF, wM = 0.60, 0.40
-        wA, wG = 0.60, 0.40
-    elif dm < 1800:
-        wF, wM = 0.50, 0.50
-        wA, wG = 0.55, 0.45
+def attach_race_shape_v23(df: pd.DataFrame, *, distance_m: float) -> pd.DataFrame:
+    w = df.copy()
+
+    # --- Blended indices (your new definition)
+    if "F200_idx" in w.columns and "tsSPI" in w.columns:
+        w["EARLY_idx"] = 0.60 * pd.to_numeric(w["F200_idx"], errors="coerce") \
+                       + 0.40 * pd.to_numeric(w["tsSPI"],    errors="coerce")
     else:
-        wF, wM = 0.40, 0.60
-        wA, wG = 0.50, 0.50
+        w["EARLY_idx"] = np.nan
 
-    # Odd first panel → nudge F weight
-    markers_here = collect_markers(w)
-    if len(markers_here) > 0:
-        m1 = int(markers_here[0])
-        first_panel_len = max(1.0, dm - m1)  # meters from D to first split marker
+    gr_col = "Grind"  # v3.1 app has no CG column; we’ll use Grind directly
+    if "Accel" in w.columns and gr_col in w.columns:
+        w["LATE_idx"]  = 0.60 * pd.to_numeric(w["Accel"], errors="coerce") \
+                       + 0.40 * pd.to_numeric(w[gr_col],   errors="coerce")
     else:
-        first_panel_len = 200.0 if step == 200 else (50.0 if (int(dm) % 100 == 50) else 100.0)
+        w["LATE_idx"] = np.nan
 
-    eff_len_factor = float(np.clip(first_panel_len / 200.0, 0.80, 1.10))
-    wF *= eff_len_factor
-    wF, wM = _norm_pair(wF, wM)
+    # --- Robust, distance-aware gates
+    gE = _gate(w["EARLY_idx"])
+    gL = _gate(w["LATE_idx"])
+    sc = _distance_gate_scale(distance_m)
+    gE *= sc; gL *= sc
 
-    # Field-size shrink → toward 50/50 (reduces variance in small fields)
-    n_field = int(len(w))
-    alpha = n_field / (n_field + 8.0)
-    wF = 0.50 + alpha * (wF - 0.50); wM = 1.0 - wF
-    wA = 0.50 + alpha * (wA - 0.50); wG = 1.0 - wA
-    wF, wM = _norm_pair(wF, wM)
-    wA, wG = _norm_pair(wA, wG)
-
-    # FSR context nudge for late mix (field collapse vs slow-early)
-    if np.isfinite(FSR):
-        if FSR <= 0.97:     # collapse → slightly favor Accel
-            wA += 0.03; wG -= 0.03
-        elif FSR >= 1.03:   # slow-early → slightly favor Grind
-            wG += 0.03; wA -= 0.03
-        wA, wG = _norm_pair(wA, wG)
-
-    # Data-quality nudges (valid fraction + MAD tightness)
-    def _mad_on(series):
-        z = pd.to_numeric(series, errors="coerce") - 100.0
-        return mad_std(z)
-
-    vF = float(pd.to_numeric(w["F200_idx"], errors="coerce").notna().mean())
-    vM = float(pd.to_numeric(w["tsSPI"],    errors="coerce").notna().mean())
-    vA = float(pd.to_numeric(w["Accel"],    errors="coerce").notna().mean())
-    vG = float(pd.to_numeric(w[GR_COL],     errors="coerce").notna().mean())
-
-    madF = _mad_on(w["F200_idx"])
-    madM = _mad_on(w["tsSPI"])
-    madA = _mad_on(w["Accel"])
-    madG = _mad_on(w[GR_COL])
-
-    # If F very tight → lean a touch to tsSPI
-    if np.isfinite(madF) and madF < 1.2:
-        wM += 0.03; wF -= 0.03
-    # If Grind tight & Accel erratic → lean a touch to Grind
-    if (np.isfinite(madG) and madG < 1.2) and (np.isfinite(madA) and madA >= 1.6):
-        wG += 0.03; wA -= 0.03
-
-    # If a component looks weak (low valid fraction or ultra-tight), reduce it
-    if (vF < 0.60) or (np.isfinite(madF) and madF < 0.30):
-        wF = max(0.20, wF - 0.10); wM = 1.0 - wF
-    if (vM < 0.60) or (np.isfinite(madM) and madM < 0.30):
-        wM = max(0.20, wM - 0.10); wF = 1.0 - wM
-    if (vA < 0.60) or (np.isfinite(madA) and madA < 0.30):
-        wA = max(0.20, wA - 0.10); wG = 1.0 - wA
-    if (vG < 0.60) or (np.isfinite(madG) and madG < 0.30):
-        wG = max(0.20, wG - 0.10); wA = 1.0 - wG
-
-    # Final renorm safety
-    wF, wM = _norm_pair(wF, wM)
-    wA, wG = _norm_pair(wA, wG)
-
-    # ---- 2) Build blended indices ----
-    F_idx = pd.to_numeric(w["F200_idx"], errors="coerce")
-    M_idx = pd.to_numeric(w["tsSPI"],    errors="coerce")
-    A_idx = pd.to_numeric(w["Accel"],    errors="coerce")
-    G_idx = pd.to_numeric(w[GR_COL],     errors="coerce")
-
-    w["EARLY_idx"] = (wF * F_idx + wM * M_idx).astype(float)
-    w["LATE_idx"]  = (wA * A_idx + wG * G_idx).astype(float)
-
-    if debug:
-        st.write({
-            "EARLY_weights": {"F": round(wF,3), "tsSPI": round(wM,3), "first_panel_m": round(first_panel_len,1)},
-            "LATE_weights":  {"Accel": round(wA,3), "Grind": round(wG,3)},
-            "valid_frac":    {"F": round(vF,2), "M": round(vM,2), "A": round(vA,2), "G": round(vG,2)},
-            "MAD":           {"F": round(madF if np.isfinite(madF) else np.nan,2),
-                              "M": round(madM if np.isfinite(madM) else np.nan,2),
-                              "A": round(madA if np.isfinite(madA) else np.nan,2),
-                              "G": round(madG if np.isfinite(madG) else np.nan,2)}
-        })
-
-    # ---- 3) Race-shape decision (conservative) ----
+    # --- Medians vs 100
     E_med = float(pd.to_numeric(w["EARLY_idx"], errors="coerce").median(skipna=True))
     M_med = float(pd.to_numeric(w["tsSPI"],     errors="coerce").median(skipna=True))
     L_med = float(pd.to_numeric(w["LATE_idx"],  errors="coerce").median(skipna=True))
-
     dE, dM, dL = (E_med - 100.0), (M_med - 100.0), (L_med - 100.0)
 
-    def _gate(series, base=2.2):
-        z = pd.to_numeric(series, errors="coerce") - 100.0
-        s = mad_std(z)
-        s = 2.0 if (not np.isfinite(s) or s <= 0) else s
-        return max(base, 0.6 * s)
-
-    gE = _gate(w["EARLY_idx"])
-    gL = _gate(w["LATE_idx"])
-
-    # Distance scale (wider gates as trip lengthens)
-    if   dm <= 1200: scale = 1.00
-    elif dm <  1800: scale = 1.10
-    else:            scale = 1.20
-    gE *= scale; gL *= scale
-
-    # SCI — how consistently the field came from behind or from the front
-    delta_EL = (pd.to_numeric(w["LATE_idx"], errors="coerce") -
-                pd.to_numeric(w["EARLY_idx"], errors="coerce"))
+    # --- SCI (consistency of early→late shift across field)
+    delta_EL = (pd.to_numeric(w["LATE_idx"], errors="coerce")
+              - pd.to_numeric(w["EARLY_idx"], errors="coerce"))
     sci_plus  = float((delta_EL >  +1.0).mean()) if delta_EL.notna().any() else np.nan
     sci_minus = float((delta_EL <  -1.0).mean()) if delta_EL.notna().any() else np.nan
 
-    # FSR confirmations
-    fsr_val = float(FSR) if np.isfinite(FSR) else np.nan
-    confirm_slow = (np.isfinite(fsr_val) and fsr_val >= 1.03)
-    confirm_fast = (np.isfinite(fsr_val) and fsr_val <= 0.97)
-
+    # --- Shape decision (conservative, mid pace around par)
     slow_early = (dE <= -gE) and (dL >= +gL) and ((dL - dE) >= 3.5) \
-                 and (sci_plus >= 0.55 if np.isfinite(sci_plus) else True) \
+                 and (sci_plus  >= 0.55 if np.isfinite(sci_plus)  else True) \
                  and (99.0 <= M_med <= 101.8)
     fast_early = (dE >= +gE) and (dL <= -gL) and ((dE - dL) >= 3.5) \
                  and (sci_minus >= 0.55 if np.isfinite(sci_minus) else True) \
                  and (98.2 <= M_med <= 101.8)
 
-    if slow_early and confirm_slow:
-        shape_tag = "SLOW_EARLY"
-    elif fast_early and confirm_fast:
-        shape_tag = "FAST_EARLY"
+    if slow_early:
+        shape_tag = "SLOW_EARLY"; sci = sci_plus if np.isfinite(sci_plus) else 1.0
+    elif fast_early:
+        shape_tag = "FAST_EARLY"; sci = sci_minus if np.isfinite(sci_minus) else 1.0
     else:
-        if slow_early and (np.isfinite(sci_plus) and sci_plus >= 0.65):
-            shape_tag = "SLOW_EARLY"
-        elif fast_early and (np.isfinite(sci_minus) and sci_minus >= 0.65):
-            shape_tag = "FAST_EARLY"
-        else:
-            shape_tag = "EVEN"
-
-    # Final SCI (0..1)
-    if shape_tag == "SLOW_EARLY":
-        sci = float(sci_plus if np.isfinite(sci_plus) else 1.0)
-    elif shape_tag == "FAST_EARLY":
-        sci = float(sci_minus if np.isfinite(sci_minus) else 1.0)
-    else:
+        shape_tag = "EVEN"
         sci = float((delta_EL.abs() <= 1.5).mean()) if delta_EL.notna().any() else 1.0
 
-    # ---- 4) FRA — False-Run Adjustment (mild, only with decent SCI) ----
-    w["PI_RS"]  = w["PI"].astype(float)
-    w["GCI_RS"] = w["GCI"].astype(float)
+    # --- RS-adjusted PI/GCI (no FRA yet — just passthrough to keep drop-in minimal)
+    w["PI_RS"]  = pd.to_numeric(w.get("PI"),  errors="coerce")
+    w["GCI_RS"] = pd.to_numeric(w.get("GCI"), errors="coerce")
 
-    if (shape_tag == "SLOW_EARLY") and (sci >= 0.60):
-        # Penalize late-only inflation when the race crawled early
-        f = 0.12 + 0.08 * (sci - 0.60) / 0.40
-        late_excess = ((pd.to_numeric(w["Accel"], errors="coerce") +
-                        pd.to_numeric(w[GR_COL],   errors="coerce"))/2.0 - 100.0
-                      ).clip(lower=0.0, upper=8.0).fillna(0.0)
-        w["PI_RS"]  = (w["PI"]  - f * (late_excess / 4.0)).clip(0.0, 10.0)
-        w["GCI_RS"] = (w["GCI"] - f * (late_excess / 3.0)).clip(0.0, 10.0)
-        fra_applied = 1
+    # --- Attach race-level attrs for your header/captions
+    w.attrs["SHAPE_TAG"] = shape_tag
+    w.attrs["SCI"]       = float(sci)
 
-    elif (shape_tag == "FAST_EARLY") and (sci >= 0.60):
-        # Reward sturdiness when the shape was brutal up front
-        f2 = 0.10 + 0.05 * (sci - 0.60) / 0.40
-        sturdiness = ((pd.to_numeric(w[GR_COL], errors="coerce") - 100.0)
-                      - (100.0 - pd.to_numeric(w["Accel"], errors="coerce")).clip(lower=0.0)
-                     ).clip(lower=0.0, upper=6.0).fillna(0.0)
-        w["PI_RS"]  = (w["PI"]  + f2 * (sturdiness / 4.0)).clip(0.0, 10.0)
-        w["GCI_RS"] = (w["GCI"] + f2 * (sturdiness / 3.0)).clip(0.0, 10.0)
-        fra_applied = 1
+    return w
 
-else:
-    # Race-shape OFF → passthrough
-    w["PI_RS"]  = w["PI"].astype(float)
-    w["GCI_RS"] = w["GCI"].astype(float)
+# Apply Race Shape now
+metrics = attach_race_shape_v23(metrics, distance_m=float(race_distance_input))
 
-# ---------- Attach race-level diagnostics ----------
-w.attrs["FSR"] = float(FSR if np.isfinite(FSR) else 1.0)
-w.attrs["CollapseSeverity"] = float(min(10.0, max(0.0, (0.95 - w.attrs["FSR"]) * 100.0)))
-w.attrs["GR_COL"] = GR_COL
-w.attrs["STEP"] = step
-w.attrs["SHAPE_TAG"] = shape_tag
-w.attrs["SCI"] = float(sci)
-w.attrs["FRA_APPLIED"] = int(fra_applied)
+# (Optional) if your header shows shape/SCI, you can read:
+#   metrics.attrs["SHAPE_TAG"], metrics.attrs["SCI"]
+# ====== END RACE SHAPE v2.3 ======
 
     # ---------- Final rounding ----------
     for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
