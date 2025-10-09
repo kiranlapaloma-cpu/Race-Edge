@@ -726,76 +726,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         w["PI_RS"]  = w["PI"].astype(float)
         w["GCI_RS"] = w["GCI"].astype(float)
 
-
-    # ---- Infer Finish_Pos if missing or partially missing ----
-def _infer_finish_positions(df: pd.DataFrame, *, time_col: str = "RaceTime_s",
-                            pos_col: str = "Finish_Pos", eps: float = 0.01) -> pd.Series:
-    """
-    Returns a Series of inferred finish positions (1 = winner).
-    Keeps existing positions, fills only NaNs.
-    Uses competition ranking with dead-heats within eps seconds.
-    """
-    out = pd.to_numeric(df.get(pos_col), errors="coerce")
-
-    # If everything is present, just return as-is
-    if out.notna().all():
-        return out
-
-    # Base order: by RaceTime_s (ascending), then stable by original row index
-    times = pd.to_numeric(df.get(time_col), errors="coerce")
-    idx = np.arange(len(df), dtype=int)
-
-    # Build a sortable frame
-    tmp = pd.DataFrame({
-        "_i": idx,
-        "_t": times
-    })
-
-    # Split into timed and untimed
-    timed    = tmp[tmp["_t"].notna()].copy().sort_values(["_t","_i"], ascending=[True, True])
-    untimed  = tmp[tmp["_t"].isna()].copy().sort_values(["_i"], ascending=True)
-
-    # Assign competition ranks with dead-heats (eps)
-    ranks = np.full(len(df), np.nan, dtype=float)
-    if len(timed):
-        tvals = timed["_t"].to_numpy()
-        # Group by eps (dead-heat bins)
-        grp = np.zeros(len(timed), dtype=int)
-        g = 0
-        for k in range(1, len(timed)):
-            if abs(tvals[k] - tvals[k-1]) > eps:
-                g += 1
-            grp[k] = g
-        # position = 1 + #items in earlier groups
-        # competition style: all in a group get same position
-        pos_map = {}
-        for g_id in np.unique(grp):
-            mask = (grp == g_id)
-            # count of items in previous groups
-            pos = 1 + int(np.sum(grp < g_id))
-            pos_map[g_id] = float(pos)
-            ranks[timed.index[mask]] = float(pos_map[g_id])
-
-    # Untimed go after all timed, in row order
-    if len(untimed):
-        start_pos = int(np.nanmax(ranks)) + 1 if np.isfinite(np.nanmax(ranks)) else 1
-        for j, ridx in enumerate(untimed.index.to_list()):
-            ranks[ridx] = float(start_pos + j)
-
-    inferred = pd.Series(ranks, index=df.index)
-
-    # Keep existing positions, fill only NaNs
-    need = out.isna()
-    out.loc[need] = inferred.loc[need]
-    return out
-
-# Attach inferred Finish_Pos back onto w
-if "Finish_Pos" not in w.columns:
-    w["Finish_Pos"] = np.nan
-w["Finish_Pos"] = _infer_finish_positions(w, time_col="RaceTime_s", pos_col="Finish_Pos", eps=0.01)
-
                                 
-
     # ---------- Final rounding ----------
     for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
               "PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
