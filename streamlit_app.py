@@ -697,7 +697,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         except Exception: winner_time = None
 
     wT = 0.25
-        Wg = pi_weights_distance_and_context(
+    Wg = pi_weights_distance_and_context(
     D,
     pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True),
     pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True)
