@@ -921,7 +921,6 @@ if "WEIGHT_BASELINE" not in globals() and "WEIGHT_BASELINE" in locals():
 if "WEIGHT_SENS_PER_KG" not in globals() and "WEIGHT_SENS_PER_KG" in locals():
     WEIGHT_SENS_PER_KG = locals()["WEIGHT_SENS_PER_KG"]
 try:
-    try:
     metrics, seg_markers = build_metrics_and_shape(
         df_in=work,
         D_actual_m=float(race_distance_input),
