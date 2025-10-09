@@ -716,8 +716,10 @@ def _gate(series, base=2.2):
 
 def _distance_gate_scale(D):
     D = float(D or 1200)
-    if D <= 1200: return 1.00
-    if D <  1800: return 1.10
+    if D <= 1200:
+        return 1.00
+    if D < 1800:
+        return 1.10
     return 1.20
 
 def attach_race_shape_v23(df: pd.DataFrame, *, distance_m: float) -> pd.DataFrame:
@@ -725,15 +727,19 @@ def attach_race_shape_v23(df: pd.DataFrame, *, distance_m: float) -> pd.DataFram
 
     # --- Blended indices (your new definition)
     if "F200_idx" in w.columns and "tsSPI" in w.columns:
-        w["EARLY_idx"] = 0.60 * pd.to_numeric(w["F200_idx"], errors="coerce") \
-                       + 0.40 * pd.to_numeric(w["tsSPI"],    errors="coerce")
+        w["EARLY_idx"] = (
+            0.60 * pd.to_numeric(w["F200_idx"], errors="coerce")
+            + 0.40 * pd.to_numeric(w["tsSPI"], errors="coerce")
+        )
     else:
         w["EARLY_idx"] = np.nan
 
     gr_col = "Grind"  # v3.1 app has no CG column; we’ll use Grind directly
     if "Accel" in w.columns and gr_col in w.columns:
-        w["LATE_idx"]  = 0.60 * pd.to_numeric(w["Accel"], errors="coerce") \
-                       + 0.40 * pd.to_numeric(w[gr_col],   errors="coerce")
+        w["LATE_idx"] = (
+            0.60 * pd.to_numeric(w["Accel"], errors="coerce")
+            + 0.40 * pd.to_numeric(w[gr_col], errors="coerce")
+        )
     else:
         w["LATE_idx"] = np.nan
 
@@ -741,51 +747,65 @@ def attach_race_shape_v23(df: pd.DataFrame, *, distance_m: float) -> pd.DataFram
     gE = _gate(w["EARLY_idx"])
     gL = _gate(w["LATE_idx"])
     sc = _distance_gate_scale(distance_m)
-    gE *= sc; gL *= sc
+    gE *= sc
+    gL *= sc
 
     # --- Medians vs 100
     E_med = float(pd.to_numeric(w["EARLY_idx"], errors="coerce").median(skipna=True))
-    M_med = float(pd.to_numeric(w["tsSPI"],     errors="coerce").median(skipna=True))
-    L_med = float(pd.to_numeric(w["LATE_idx"],  errors="coerce").median(skipna=True))
+    M_med = float(pd.to_numeric(w["tsSPI"], errors="coerce").median(skipna=True))
+    L_med = float(pd.to_numeric(w["LATE_idx"], errors="coerce").median(skipna=True))
     dE, dM, dL = (E_med - 100.0), (M_med - 100.0), (L_med - 100.0)
 
     # --- SCI (consistency of early→late shift across field)
-    delta_EL = (pd.to_numeric(w["LATE_idx"], errors="coerce")
-              - pd.to_numeric(w["EARLY_idx"], errors="coerce"))
-    sci_plus  = float((delta_EL >  +1.0).mean()) if delta_EL.notna().any() else np.nan
-    sci_minus = float((delta_EL <  -1.0).mean()) if delta_EL.notna().any() else np.nan
+    delta_EL = (
+        pd.to_numeric(w["LATE_idx"], errors="coerce")
+        - pd.to_numeric(w["EARLY_idx"], errors="coerce")
+    )
+    sci_plus = float((delta_EL > +1.0).mean()) if delta_EL.notna().any() else np.nan
+    sci_minus = float((delta_EL < -1.0).mean()) if delta_EL.notna().any() else np.nan
 
     # --- Shape decision (conservative, mid pace around par)
-    slow_early = (dE <= -gE) and (dL >= +gL) and ((dL - dE) >= 3.5) \
-                 and (sci_plus  >= 0.55 if np.isfinite(sci_plus)  else True) \
-                 and (99.0 <= M_med <= 101.8)
-    fast_early = (dE >= +gE) and (dL <= -gL) and ((dE - dL) >= 3.5) \
-                 and (sci_minus >= 0.55 if np.isfinite(sci_minus) else True) \
-                 and (98.2 <= M_med <= 101.8)
+    slow_early = (
+        (dE <= -gE)
+        and (dL >= +gL)
+        and ((dL - dE) >= 3.5)
+        and (sci_plus >= 0.55 if np.isfinite(sci_plus) else True)
+        and (99.0 <= M_med <= 101.8)
+    )
+    fast_early = (
+        (dE >= +gE)
+        and (dL <= -gL)
+        and ((dE - dL) >= 3.5)
+        and (sci_minus >= 0.55 if np.isfinite(sci_minus) else True)
+        and (98.2 <= M_med <= 101.8)
+    )
 
     if slow_early:
-        shape_tag = "SLOW_EARLY"; sci = sci_plus if np.isfinite(sci_plus) else 1.0
+        shape_tag = "SLOW_EARLY"
+        sci = sci_plus if np.isfinite(sci_plus) else 1.0
     elif fast_early:
-        shape_tag = "FAST_EARLY"; sci = sci_minus if np.isfinite(sci_minus) else 1.0
+        shape_tag = "FAST_EARLY"
+        sci = sci_minus if np.isfinite(sci_minus) else 1.0
     else:
         shape_tag = "EVEN"
-        sci = float((delta_EL.abs() <= 1.5).mean()) if delta_EL.notna().any() else 1.0
+        sci = (
+            float((delta_EL.abs() <= 1.5).mean())
+            if delta_EL.notna().any()
+            else 1.0
+        )
 
-    # --- RS-adjusted PI/GCI (no FRA yet — just passthrough to keep drop-in minimal)
-    w["PI_RS"]  = pd.to_numeric(w.get("PI"),  errors="coerce")
+    # --- RS-adjusted PI/GCI (no FRA yet — passthrough)
+    w["PI_RS"] = pd.to_numeric(w.get("PI"), errors="coerce")
     w["GCI_RS"] = pd.to_numeric(w.get("GCI"), errors="coerce")
 
     # --- Attach race-level attrs for your header/captions
     w.attrs["SHAPE_TAG"] = shape_tag
-    w.attrs["SCI"]       = float(sci)
-
+    w.attrs["SCI"] = float(sci)
     return w
+
 
 # Apply Race Shape now
 metrics = attach_race_shape_v23(metrics, distance_m=float(race_distance_input))
-
-# (Optional) if your header shows shape/SCI, you can read:
-#   metrics.attrs["SHAPE_TAG"], metrics.attrs["SCI"]
 # ====== END RACE SHAPE v2.3 ======
 
     # ---------- Final rounding ----------
