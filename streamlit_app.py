@@ -580,6 +580,43 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     # Grind (unchanged)
     w["_GR_spd"] = w.apply(lambda r: grind_speed(r, step), axis=1)
 
+        # -------- Robust total race time (sum of all segment times) --------
+    # Works whether the file uses Finish_Time, Finish_Split or Finish (headers are
+    # usually normalized earlier, but we guard again here).
+    # We also accept any "<meters>_Time" or "<meters>_Split" columns.
+    if ("RaceTime_s" not in w.columns) or (pd.to_numeric(w["RaceTime_s"], errors="coerce").isna().all()):
+        # Collect candidate time columns safely
+        time_cols = []
+        for c in w.columns:
+            lc = str(c).strip()
+            if lc.lower() in ("finish_time", "finish_split", "finish"):
+                time_cols.append(c)
+            elif lc.endswith("_Time") or lc.endswith("_time") or lc.endswith("_Split") or lc.endswith("_split"):
+                # only accept if it looks like a distance prefix, e.g. "1200_Time"
+                parts = lc.split("_", 1)
+                if parts and parts[0].isdigit():
+                    time_cols.append(c)
+
+        # If we somehow missed a Finish* column but have one in the frame, add it
+        for cand in ("Finish_Time", "Finish_Split", "Finish"):
+            if cand in w.columns and cand not in time_cols:
+                time_cols.append(cand)
+
+        # Sum all valid, positive times
+        def _sum_race_time(row):
+            vals = []
+            for c in time_cols:
+                v = pd.to_numeric(row.get(c), errors="coerce")
+                if pd.notna(v) and float(v) > 0.0:
+                    vals.append(float(v))
+            return np.sum(vals) if vals else np.nan
+
+        w["RaceTime_s"] = w.apply(_sum_race_time, axis=1)
+    else:
+        # Ensure numeric and clean non-positive entries
+        w["RaceTime_s"] = pd.to_numeric(w["RaceTime_s"], errors="coerce")
+        w.loc[(w["RaceTime_s"] <= 0) | (~np.isfinite(w["RaceTime_s"])) , "RaceTime_s"] = np.nan                            
+
     # -------- Speed→index conversion --------
     def speed_to_index(spd):
         med=spd.median(skipna=True)
