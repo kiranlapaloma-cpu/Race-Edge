@@ -261,24 +261,38 @@ if alias_notes and SHOW_WARNINGS:
 st.markdown("### Raw Table")
 st.dataframe(work.head(12), use_container_width=True)
 
-# ----------------------- Integrity helpers (used later) -------------------
-def expected_segments(distance_m: float, step:int) -> list[str]:
-    want = [f"{m}_Time" for m in range(int(distance_m) - step, step-1, -step)]
-    want.append("Finish_Time")  # For 200m, this is the 200→0 split
-    return want
+# ----------------------- Integrity helpers (odds-aware) -------------------
+def expected_segments_from_df(df: pd.DataFrame) -> list[str]:
+    """
+    Use ONLY the *_Time columns that actually exist in the upload (highest→lowest),
+    and append Finish_Time if present. This avoids phantom warnings like 1150_Time at 1250m.
+    """
+    marks = []
+    for c in df.columns:
+        if c.endswith("_Time") and c != "Finish_Time":
+            try:
+                marks.append(int(c.split("_")[0]))
+            except Exception:
+                pass
+    marks = sorted(set(marks), reverse=True)
+    cols = [f"{m}_Time" for m in marks if f"{m}_Time" in df.columns]
+    if "Finish_Time" in df.columns:
+        cols.append("Finish_Time")
+    return cols
 
 def integrity_scan(df: pd.DataFrame, distance_m: float, step: int):
-    exp_cols = expected_segments(distance_m, step)
-    missing = [c for c in exp_cols if c not in df.columns]
+    """
+    Validate only the columns that truly exist in the file.
+    Reports rows where times are <=0 or NaN (treated as missing).
+    """
+    exp_cols = expected_segments_from_df(df)
+    missing = []  # by construction we only check columns that exist
     invalid_counts = {}
     for c in exp_cols:
-        if c in df.columns:
-            s = pd.to_numeric(df[c], errors="coerce")
-            invalid_counts[c] = int(((s <= 0) | s.isna()).sum())
+        s = pd.to_numeric(df[c], errors="coerce")
+        invalid_counts[c] = int(((s <= 0) | s.isna()).sum())
     msgs = []
-    if missing:
-        msgs.append("Missing: " + ", ".join(missing))
-    bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
+    bads = [f"{k} ({v} rows)" for k, v in invalid_counts.items() if v > 0]
     if bads:
         msgs.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
     return " • ".join(msgs), missing, invalid_counts
