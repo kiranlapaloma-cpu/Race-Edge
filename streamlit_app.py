@@ -457,123 +457,118 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         tmp["Finish_Pos"] = np.arange(1, len(tmp)+1)
         w = tmp.sort_values("_row").drop(columns=["_row","_rt","_horse"]).reset_index(drop=True)
 
-    # ---------- Build stage composite speeds ----------
-    D = float(D_actual_m)
+    # ---------- Build stage composite speeds (ADAPTIVE WINDOWS) ----------
+D = float(D_actual_m)
+markers = collect_markers(w)               # e.g. [1200, 1100, ..., 100] for a 1250 race
+step = int(step)                           # 100 or 200
 
-    # ===== Adaptive F-window (FIRST 200 rules you specified) =====
-    # We compute an "F-window speed" as distance_over_time of the *first* portion of the race.
-    # step==100: F200 or F150 (…50 distances) using weighted time
-    # step==200: F{L0} where L0 is the first segment length (200 / 160 / 100 / 250 / remainder)
-    def fwindow_speed_100(row, Dm):
-        # Always use two 100m splits (D-100 and D-200) if available
-        t1 = as_num(row.get(f"{int(Dm-100)}_Time"))
-        t2 = as_num(row.get(f"{int(Dm-200)}_Time"))
-        if pd.isna(t1) or t1 <= 0 or pd.isna(t2) or t2 <= 0:
-            return np.nan
-        if int(Dm) % 100 == 50:
-            # F150: 50m of t1 + 100m of t2
-            eff_time = 0.5*float(t1) + 1.0*float(t2)
-            eff_dist = 150.0
+def _adaptive_f_window_cols(D, step, markers):
+    """
+    Returns (f_cols, f_dist) according to our rules:
+      100 m splits:
+         - normal: F200 = [D-100, D-200] (2 splits, 200 m)
+         - if D ends with 50: F150 = [D-50, D-150]  (2 splits, 150 m total)
+      200 m splits:
+         - if first split covers 160 m (e.g., 1160): F160 = [first marker] (160 m)
+         - if first split covers 250 m (e.g., 1450/1750/2450): F250 = [first marker] (250 m)
+         - if first split covers 100 m (e.g., 1300/1500/1700 not cleanly on 200): F100 = [first marker] (100 m)
+         - normal even 200 m race: F200 = [D-200] (one 200 m split)
+    """
+    if not markers:
+        return [], 0.0
+
+    m1 = int(markers[0])
+    first_span = D - m1                         # how long the VERY FIRST split is
+    cols = []
+
+    if step == 100:
+        if int(D) % 100 == 50:
+            # F150: need two columns — D-50 and D-150 — if present
+            wanted = [int(D - 50), int(D - 150)]
+            cols = [f"{m}_Time" for m in wanted if f"{m}_Time" in w.columns]
+            dist = 50.0 + 100.0 if len(cols) == 2 else 100.0 * len(cols)
         else:
-            # F200 standard
-            eff_time = float(t1) + float(t2)
-            eff_dist = 200.0
-        return eff_dist / eff_time if eff_time > 0 else np.nan
+            # Normal F200 = [D-100, D-200]
+            wanted = [int(D - 100), int(D - 200)]
+            cols = [f"{m}_Time" for m in wanted if f"{m}_Time" in w.columns]
+            dist = 100.0 * len(cols)
+        return cols, float(dist)
 
-    def first_segment_length_200(Dm):
-        r = int(Dm) % 200
-        if r == 0:
-            return 200
-        if r == 160:
-            return 160
-        if r == 100:
-            return 100
-        if r == 50:
-            # operator quirk: first panel often covers 250m
-            return 250
-        return r if r > 0 else 200
+    # step == 200
+    # Use the first split’s actual length to name the window (F160/F250/F100/F200)
+    cols = [f"{m1}_Time"] if f"{m1}_Time" in w.columns else []
+    if first_span <= 120:    dist = 100.0
+    elif first_span <= 180:  dist = 160.0
+    elif first_span <= 220:  dist = 200.0
+    else:                    dist = 250.0
+    return cols, float(dist)
 
-    def fwindow_speed_200(row, Dm):
-        L0 = first_segment_length_200(Dm)
-        # Column label equals the segment *end* marker: D-L0
-        col = f"{int(Dm - L0)}_Time"
-        t = as_num(row.get(col))
-        if pd.isna(t) or t <= 0:
-            return np.nan
-        return float(L0) / float(t)
-
-    # Compute F-window speed and map to F200_idx-like index
+def _adaptive_tssp_start(D, step):
+    """
+    tsSPI start:
+      100 m splits: normal D-300, but if D ends in 50 → D-150
+      200 m splits:
+        - if first span ≈160 → D-150
+        - if first span ≈250 → D-250
+        - if first span ≈100 → D-100
+        - else (even 200)    → D-400
+    """
     if step == 100:
-        w["_FW_spd"] = w.apply(lambda r: fwindow_speed_100(r, D), axis=1)
-    else:
-        w["_FW_spd"] = w.apply(lambda r: fwindow_speed_200(r, D), axis=1)
+        return int(D - 150) if (int(D) % 100 == 50) else int(D - 300)
 
-    # tsSPI window (also adaptive start in stubs)
+    # step == 200
+    if not markers:
+        return int(D - 400)
+    m1 = int(markers[0]); first_span = D - m1
+    if first_span <= 120:    return int(D - 100)
+    if first_span <= 180:    return int(D - 150)
+    if first_span <= 220:    return int(D - 400)
+    return int(D - 250)
+
+def _stage_speed_colwise(row, cols, meters_per_split):
+    if not cols: return np.nan
+    tsum = sum_times(row, cols)
+    if pd.isna(tsum) or tsum <= 0: return np.nan
+    # distance = sum of actual split lengths represented by the columns
+    # for 100 m splits each col = 100; for 200 m splits each col = the first split length or 200
     if step == 100:
-        # If distance ends with …50 → start at D-150; else D-300
-        tssp_start = int(D - (150 if (int(D) % 100 == 50) else 300))
+        dist = 100.0 * len(cols)
+        # special case: 100m + F150 when only one of the two columns is present (rare)
+        if len(cols) == 2 and int(D) % 100 == 50 and (f"{int(D-50)}_Time" in cols and f"{int(D-150)}_Time" in cols):
+            dist = 150.0
     else:
-        # 200m splits:
-        r = int(D) % 200
-        if r == 160:
-            tssp_start = int(D - 150)
-        elif r == 50:
-            tssp_start = int(D - 250)
-        elif r == 100:
-            tssp_start = int(D - 100)
-        else:
-            tssp_start = int(D - 400)
-    tssp_cols = [c for c in make_range_cols(D, tssp_start, 600, step) if c in w.columns]
-    w["_MID_spd"] = w.apply(lambda r: stage_speed(r, tssp_cols, float(step)), axis=1)
+        # 200 m case — for tsSPI we just use step for mid windows (still robust),
+        # for early (F-window) we’ll feed an explicit distance separately
+        dist = float(step) * len(cols)
+    return dist / tsum
 
-    # Accel: 600→200
-    if step == 100:
-        accel_cols = [c for c in [f"{m}_Time" for m in [500,400,300,200]] if c in w.columns]
-    else:
-        accel_cols = [c for c in [f"{m}_Time" for m in [600,400]] if c in w.columns]
-    w["_ACC_spd"] = w.apply(lambda r: stage_speed(r, accel_cols, float(step)), axis=1)
+# ---- F-window (early) ----
+f_cols, f_dist = _adaptive_f_window_cols(D, step, markers)
+w["_F_spd"] = w.apply(
+    lambda r: (f_dist / sum_times(r, f_cols)) if (f_cols and pd.notna(sum_times(r, f_cols)) and sum_times(r, f_cols) > 0)
+    else np.nan, axis=1
+)
 
-    # Grind (finish)
-    w["_GR_spd"] = w.apply(lambda r: grind_speed(r, step), axis=1)
+# ---- tsSPI (mid) ----
+tssp_start = _adaptive_tssp_start(D, step)
+tssp_cols = [c for c in make_range_cols(D, tssp_start, 600, step) if c in w.columns]
+w["_MID_spd"] = w.apply(lambda r: stage_speed(r, tssp_cols, float(step)), axis=1)
 
-    # ---------- Map speeds → indices (robust, small-field stabilizers) ----------
-    def shrink_center(idx_series):
-        x = idx_series.dropna().values
-        N_eff = len(x)
-        if N_eff == 0:
-            return 100.0, 0
-        med_race = float(np.median(x))
-        alpha = N_eff / (N_eff + 6.0)
-        return alpha * med_race + (1 - alpha) * 100.0, N_eff
+# ---- Accel (600→200) stays the same windows as before ----
+if step == 100:
+    accel_cols = [c for c in [f"{m}_Time" for m in [500,400,300,200]] if c in w.columns]
+else:
+    accel_cols = [c for c in [f"{m}_Time" for m in [600,400]] if c in w.columns]
+w["_ACC_spd"] = w.apply(lambda r: stage_speed(r, accel_cols, float(step)), axis=1)
 
-    def dispersion_equalizer(delta_series, N_eff, N_ref=10, beta=0.20, cap=1.20):
-        gamma = 1.0 + beta * max(0, N_ref - N_eff) / N_ref
-        return delta_series * min(gamma, cap)
+# ---- Grind (finish) — unchanged ----
+w["_GR_spd"] = w.apply(lambda r: grind_speed(r, step), axis=1)
 
-    def variance_floor(idx_series, floor=1.5, cap=1.25):
-        deltas = idx_series - 100.0
-        sigma = mad_std(deltas)
-        if not np.isfinite(sigma) or sigma <= 0:
-            return idx_series
-        if sigma < floor:
-            factor = min(cap, floor / sigma)
-            return 100.0 + deltas * factor
-        return idx_series
-
-    def speed_to_index(spd_series):
-        med = spd_series.median(skipna=True)
-        idx_raw = 100.0 * (spd_series / med)
-        center, n_eff = shrink_center(idx_raw)
-        idx = 100.0 * (spd_series / (center / 100.0 * med))
-        idx = 100.0 + dispersion_equalizer(idx - 100.0, n_eff)
-        idx = variance_floor(idx)
-        return idx
-
-    # Map: FW → F200_idx slot (name kept for UI continuity)
-    w["F200_idx"] = speed_to_index(pd.to_numeric(w["_FW_spd"], errors="coerce"))
-    w["tsSPI"]    = speed_to_index(pd.to_numeric(w["_MID_spd"],  errors="coerce"))
-    w["Accel"]    = speed_to_index(pd.to_numeric(w["_ACC_spd"],  errors="coerce"))
-    w["Grind"]    = speed_to_index(pd.to_numeric(w["_GR_spd"],   errors="coerce"))
+# ---- Map speeds → indices (use existing mapper) ----
+w["F200_idx"] = speed_to_index(pd.to_numeric(w["_F_spd"],  errors="coerce"))
+w["tsSPI"]    = speed_to_index(pd.to_numeric(w["_MID_spd"], errors="coerce"))
+w["Accel"]    = speed_to_index(pd.to_numeric(w["_ACC_spd"], errors="coerce"))
+w["Grind"]    = speed_to_index(pd.to_numeric(w["_GR_spd"],  errors="coerce"))
 
     # ---------- Corrected Grind (CG) ----------
     ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
