@@ -807,12 +807,11 @@ def attach_race_shape_v23(df: pd.DataFrame, *, distance_m: float) -> pd.DataFram
 # Apply Race Shape now
 metrics = attach_race_shape_v23(metrics, distance_m=float(race_distance_input))
 # ====== END RACE SHAPE v2.3 ======
+for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG", ...]:
+    if c in metrics.columns:
+        metrics[c] = pd.to_numeric(metrics[c], errors="coerce").round(3)
 
-    # ---------- Final rounding ----------
-    for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
-              "PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
-        if c in w.columns:
-            w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
+    
 
     # ---------- Attach race-level diagnostics ----------
     w.attrs["FSR"] = float(FSR)
