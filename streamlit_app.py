@@ -108,6 +108,18 @@ with st.sidebar:
     DAMPEN_CG = st.toggle("Dampen Grind weight if collapsed", value=True, help="Shift a little weight Grind→Accel/tsSPI on collapse races.")
     USE_RACE_SHAPE = st.toggle("Use Race Shape module (SED/FRA/SCI)", value=True,
                                help="Detect slow-early/sprint-home and apply False-Run Adjustment and consistency guardrails.")
+        # --- Going (affects PI weighting only) ---
+    USE_GOING_ADJUST = st.toggle(
+        "Use Going Adjustment",
+        value=True,
+        help="Adjust PI weighting based on track going (Firm/Good/Soft/Heavy)"
+    )
+    GOING_TYPE = st.selectbox(
+        "Track Going",
+        options=["Good", "Firm", "Soft", "Heavy"],
+        index=0,
+        help="Only affects PI weights; GCI stays independent"
+    ) if USE_GOING_ADJUST else "Good"
     SHOW_WARNINGS = st.toggle("Show data warnings", value=True)
     DEBUG = st.toggle("Debug info", value=False)
 
