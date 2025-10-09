@@ -514,7 +514,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
                             use_weight: bool = False,
                             weights_map: dict | None = None,
                             weight_baseline: float = 60.0,
-                            weight_sens_per_kg: float = 0.0011):
+                            weight_sens_per_kg: float = 0.0011)
     w = df_in.copy()
 
     # Finish_Pos as numeric if present
