@@ -647,7 +647,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["Grind_CG"] = [ _fade_cap(g, dg) for g, dg in zip(w["Grind_CG"], w["DeltaG"]) ]
 
     # ----- PI v3.2 -----
-        GR_COL = "Grind_CG" if use_cg else "Grind"
+    GR_COL = "Grind_CG" if use_cg else "Grind"
     acc_med = pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True)
     grd_med = pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True)
 
