@@ -1595,6 +1595,10 @@ def _ensure_schema(conn: sqlite3.Connection):
         confidence     TEXT,
         pi             REAL,
         gci            REAL,
+        -- AH module additions
+        ahs            REAL,
+        ah_tier        TEXT,
+        ah_confidence  TEXT,
         inserted_ts    TEXT DEFAULT (datetime('now'))
     );
     """)
@@ -1624,6 +1628,7 @@ def _export_pdf_report(*,
                        ability_png:bytes|None,
                        ability_table_df:pd.DataFrame,
                        hidden_table_df:pd.DataFrame,
+                       ah_table_df:pd.DataFrame,         # <— NEW
                        race_title:str):
     try:
         from reportlab.lib import colors
@@ -1707,6 +1712,26 @@ def _export_pdf_report(*,
     else:
         story.append(Paragraph("No horses flagged in this race.", styles["Normal"]))
 
+    # Ahead of Handicap (flagged only)
+    story.append(Paragraph("Ahead of Handicap (flagged)", styles["Heading3"]))
+    if ah_table_df is not None and not ah_table_df.empty:
+        flagged_ah = ah_table_df[ah_table_df.get("AH_Tier","").isin(["🏆 Dominant","🔥 Clear Ahead","🟢 Ahead"])].copy()
+        if not flagged_ah.empty:
+            data_ah = [list(flagged_ah.columns)] + flagged_ah.fillna("").astype(str).values.tolist()
+            t3 = Table(data_ah, repeatRows=1)
+            t3.setStyle(TableStyle([
+                ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
+                ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+                ('GRID',(0,0),(-1,-1),0.25,colors.whitesmoke),
+                ('FONTSIZE',(0,0),(-1,-1),8),
+                ('ALIGN',(2,1),(-1,-1),'RIGHT')
+            ]))
+            story.append(t3)
+        else:
+            story.append(Paragraph("No runners flagged Ahead-of-Handicap in this race.", styles["Normal"]))
+    else:
+        story.append(Paragraph("No runners flagged Ahead-of-Handicap in this race.", styles["Normal"]))
+
     doc.build(story)
     buf.seek(0)
     return buf
@@ -1743,7 +1768,13 @@ def _save_current_race_to_db(db_path: str,
     # Make sure we can save PI/GCI/IAI/etc.
     _m = metrics.loc[:, ["Horse","RaceTime_s"]].copy() if "RaceTime_s" in metrics.columns else pd.DataFrame(columns=["Horse","RaceTime_s"])
     _am = AM_view.copy() if 'AM_view' in globals() else pd.DataFrame()
+    _ah = AH_view.copy() if 'AH_view' in globals() else pd.DataFrame()
     to_save = _am.merge(_m, on="Horse", how="left") if not _am.empty else pd.DataFrame()
+    if not _ah.empty:
+        # bring in AHS, AH_Tier, AH_Confidence
+        to_save = (to_save if not to_save.empty else _m.copy()).merge(
+            _ah[["Horse","AHS","AH_Tier","AH_Confidence"]], on="Horse", how="left"
+        )
 
     conn = _open_db(db_path)
     _ensure_schema(conn)
@@ -1794,6 +1825,9 @@ def _save_current_race_to_db(db_path: str,
                 "confidence":  str(r.get("Confidence")) if pd.notna(r.get("Confidence")) else None,
                 "pi":          float(r.get("PI")) if pd.notna(r.get("PI")) else None,
                 "gci":         float(r.get("GCI")) if pd.notna(r.get("GCI")) else None,
+                "ahs":         float(r.get("AHS")) if pd.notna(r.get("AHS")) else None,
+                "ah_tier":     str(r.get("AH_Tier")) if pd.notna(r.get("AH_Tier")) else None,
+                "ah_confidence": str(r.get("AH_Confidence")) if pd.notna(r.get("AH_Confidence")) else None,
             }
             _insert_or_replace(conn, "performances", perf_row)
             n_saved += 1
@@ -1859,15 +1893,16 @@ st.markdown("### 📥 Export Complete Race Report (PDF)")
 pdf_btn = st.button("Generate PDF Report")
 if pdf_btn:
     pdf_buf = _export_pdf_report(
-        distance_m=int(race_distance_input),
-        metrics_table_df=display_df if 'display_df' in globals() else pd.DataFrame(),
-        shape_png=shape_map_png if 'shape_map_png' in globals() else None,
-        pace_png=pace_png if 'pace_png' in globals() else None,
-        ability_png=ability_png if 'ability_png' in globals() else None,
-        ability_table_df=AM_view if 'AM_view' in globals() else pd.DataFrame(),
-        hidden_table_df=hh_view if 'hh_view' in globals() else pd.DataFrame(),
-        race_title=f"{ui_track or 'Race'} · {ui_race_date or ''}"
-    )
+    distance_m=int(race_distance_input),
+    metrics_table_df=display_df if 'display_df' in globals() else pd.DataFrame(),
+    shape_png=shape_map_png if 'shape_map_png' in globals() else None,
+    pace_png=pace_png if 'pace_png' in globals() else None,
+    ability_png=ability_png if 'ability_png' in globals() else None,
+    ability_table_df=AM_view if 'AM_view' in globals() else pd.DataFrame(),
+    hidden_table_df=hh_view if 'hh_view' in globals() else pd.DataFrame(),
+    ah_table_df=AH_view if 'AH_view' in globals() else pd.DataFrame(),   # <— NEW
+    race_title=f"{ui_track or 'Race'} · {ui_race_date or ''}"
+)
     if pdf_buf is not None:
         st.download_button(
             "📥 Download PDF",
