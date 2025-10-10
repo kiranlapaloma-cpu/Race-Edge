@@ -776,111 +776,99 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     dLM = acc - mid   # +ve = late stronger than mid  → SLOW_EARLY candidate
     dLG = grd - acc   # +ve = grind tougher than late → Attritional finish
 
-        # ----- Race Shape (ordering-first; Accel = 600→200; Grind = 200→0) -----
-    GR_COL = "Grind_CG" if use_cg else "Grind"
-
+        # ================= Race Shape v3 — more sensitive, geometry-aware =================
     acc = pd.to_numeric(w["Accel"], errors="coerce")
     mid = pd.to_numeric(w["tsSPI"], errors="coerce")
-    grd = pd.to_numeric(w[GR_COL], errors="coerce")
+    grd = pd.to_numeric(w[GR_COL],  errors="coerce")
 
-    # 0) Robust dispersion → dynamic gates
+    dLM = acc - mid           # +ve = late kick / slow early
+    dLG = grd - acc           # +ve = attritional finish; -ve = sprinty
+
+    # Robust spread (MAD) with a soft floor so tiny spreads don’t neuter sensitivity
     def _madv(s):
         v = mad_std(pd.to_numeric(s, errors="coerce"))
         return 0.0 if (not np.isfinite(v)) else float(v)
 
-    # Early–Late contrast and Late–Finish flavour
-    dEA = acc - mid     # +ve → late quicker than setup (slow-early)
-    dGF = grd - acc     # +ve → attritional; -ve → sprint-home
+    mad_LM = max(0.8, _madv(dLM))   # was ~1.4–1.8; pull down hard for sensitivity
+    mad_LG = max(0.8, _madv(dLG))
 
-    # Distance-aware gate (smaller at 7–8f, a touch larger at extremes)
-    D = float(D_actual_m)
-    if   D <= 1100: base_gate = 1.50
-    elif D <= 1400: base_gate = 1.35
-    elif D <= 1700: base_gate = 1.20   # the mile “sweet” easing
-    elif D <= 2000: base_gate = 1.35
-    else:           base_gate = 1.50
+    # z-like medians (how many "MADs" the field skew is)
+    zLM = float(pd.to_numeric(dLM, errors="coerce").median(skipna=True)) / (mad_LM + 1e-9)
+    zLG = float(pd.to_numeric(dLG, errors="coerce").median(skipna=True)) / (mad_LG + 1e-9)
 
-    gate_EA = max(base_gate, 0.45 * _madv(dEA) + 1.00)  # robust, never tiny
-    gate_GF = max(1.30,     0.45 * _madv(dGF) + 0.90)
+    # Distance sensitivity – make the mile & sprints easiest to tilt
+    if   D <= 1200: sens = 1.05
+    elif D <= 1600: sens = 1.15     # mile: most sensitive
+    elif D <= 2000: sens = 1.00
+    else:           sens = 0.95
 
-    # 1) Ordering with tolerance epsilon (treat near-ties as equal)
-    eps = 0.40   # ~<0.4 index points = “≈ equal”
-    def _cmp(a, b):
-        if not (np.isfinite(a) and np.isfinite(b)): return 0
-        if a > b + eps:  return +1
-        if a < b - eps:  return -1
-        return 0
+    # Field-size booster (small fields need a little push)
+    N = len(w)
+    sens *= (1.10 if N < 9 else 1.00)
 
-    # 2) Horse-level label: -1 FAST_EARLY, 0 EVEN-ish, +1 SLOW_EARLY
-    def _horse_tag_row(r):
-        t, a, g = r.get("tsSPI"), r.get("Accel"), r.get(GR_COL)
-        cTA = _cmp(a, t)   # Accel vs tsSPI
-        cAG = _cmp(g, a)   # Grind vs Accel (flavour)
-        # Primary decision on Accel vs tsSPI
-        if cTA <= -1:   # tsSPI > Accel → early was hotter
-            return -1
-        if cTA >= +1:   # Accel > tsSPI → early was softer
-            return +1
-        return 0
+    # Primary gates (smaller than before)
+    GATE_SLOW = 0.70 / sens      # needs zLM ≥ +gate  → SLOW_EARLY
+    GATE_FAST = 0.70 / sens      # needs zLM ≤ −gate  → FAST_EARLY
 
-    w["_RS_horse"] = w.apply(_horse_tag_row, axis=1)
-
-    # 3) Field consensus (SCI) on the primary axis (Accel vs tsSPI)
-    signs = np.sign(pd.to_numeric(dEA, errors="coerce"))
-    signs = signs[~np.isnan(signs)]
+    # Consensus (SCI): % of runners whose sign matches the median sign of dLM
+    signs = np.sign(pd.to_numeric(dLM, errors="coerce").dropna().to_numpy())
     if signs.size == 0:
         sci = 0.0
     else:
-        maj = np.sign(np.nanmedian(signs)) or 0.0
-        sci = float((signs == maj).mean())
+        sgn_med = np.sign(np.median(signs))
+        sci = float((signs == sgn_med).mean()) if sgn_med != 0 else 0.0
 
-    # 4) Field medians and margins for “how much”
-    med_mid = float(np.nanmedian(mid))
-    med_acc = float(np.nanmedian(acc))
-    med_grd = float(np.nanmedian(grd))
-    delta_med_EA = med_acc - med_mid            # +ve = slow-early, -ve = fast-early
-    delta_med_GF = med_grd - med_acc
+    # Flexible SCI gates (lowered a bit)
+    if   D <= 1200: sci_gate_slow = 0.52; sci_gate_fast = 0.52
+    elif D <= 1600: sci_gate_slow = 0.50; sci_gate_fast = 0.50
+    else:           sci_gate_slow = 0.48; sci_gate_fast = 0.48
 
-    # 5) Primary tag by ordering + margin gates
-    if   (delta_med_EA <= -gate_EA and sci >= 0.53):
-        shape_tag = "FAST_EARLY"
-    elif (delta_med_EA >= +gate_EA and sci >= 0.53):
+    # ---------- Curve-geometry cues (force away from EVEN when obvious) ----------
+    # Medians across the field for the three key panels
+    F_med   = float(pd.to_numeric(w["F200_idx"], errors="coerce").median(skipna=True))
+    MID_med = float(mid.median(skipna=True))
+    ACC_med = float(acc.median(skipna=True))
+
+    # "Valley then late surge" (slow-early / sprint-home look)
+    mid_valley  = (MID_med <= min(F_med, ACC_med) - 0.6)   # dip ≥0.6pt
+    late_surge  = (ACC_med - MID_med) >= 0.8               # lift ≥0.8pt
+    CUE_SLOW    = mid_valley and late_surge
+
+    # "Early heat then fade" (fast-early look): early+mid outpace late
+    early_hot   = (max(F_med, MID_med) - ACC_med) >= 0.8
+    mid_not_soft= (MID_med >= F_med - 0.4)                 # avoid slow-beginning traps
+    CUE_FAST    = early_hot and mid_not_soft
+
+    # ---------- Primary tag ----------
+    shape_tag = "EVEN"
+    if (zLM >= GATE_SLOW and sci >= sci_gate_slow) or CUE_SLOW:
         shape_tag = "SLOW_EARLY"
-    else:
-        # Near-gate nudges if lots of horses agree (SCI) even when just shy
-        near = 0.75 * gate_EA
-        if   (delta_med_EA <= -near and sci >= 0.58):
-            shape_tag = "FAST_EARLY"
-        elif (delta_med_EA >= +near and sci >= 0.58):
-            shape_tag = "SLOW_EARLY"
-        else:
-            shape_tag = "EVEN"
+    elif (zLM <= -GATE_FAST and sci >= sci_gate_fast) or CUE_FAST:
+        shape_tag = "FAST_EARLY"
 
-    # 6) Finish flavour (informational)
-    if   delta_med_GF >= +gate_GF: fin_flav = "Attritional Finish"
-    elif delta_med_GF <= -gate_GF: fin_flav = "Sprint Finish"
-    else:                          fin_flav = "Balanced Finish"
+    # ---------- Finish flavour (informational) ----------
+    fin_flav = "Balanced Finish"
+    if   zLG >= 0.60: fin_flav = "Attritional Finish"
+    elif zLG <= -0.60: fin_flav = "Sprint Finish"
 
-    # 7) Strength: RSI from |median gap| × SCI (mapped 0..10)
-    shape_mag = abs(delta_med_EA) * sci
-    if   shape_mag < 2.5: rsi = 2.5 + shape_mag
-    elif shape_mag < 4.5: rsi = 5.0 + 1.7*(shape_mag-2.5)
-    elif shape_mag < 5.5: rsi = 8.4 + 1.2*(shape_mag-4.5)
-    else:                 rsi = 10.0
+    # ---------- Strength (RSI) ----------
+    # Combine |zLM| with SCI and add a tiny bonus if a curve cue fired.
+    shape_strength = abs(zLM) * (0.90 + 0.10 * (CUE_SLOW or CUE_FAST))
+    # Map to 0..10 (slightly steeper than before)
+    if   shape_strength < 0.6: rsi = 2.5 + 3.0*shape_strength
+    elif shape_strength < 1.2: rsi = 4.3 + 4.0*(shape_strength-0.6)
+    elif shape_strength < 2.0: rsi = 6.7 + 2.8*(shape_strength-1.2)
+    else:                      rsi = 9.0 + 1.0*min(1.0, shape_strength-2.0)
     rsi = float(clamp(rsi, 0.0, 10.0))
-    if shape_tag == "EVEN": rsi = 0.0
 
-    # 8) FRA strength (applied downstream in your PI/GCI RS steps if needed)
-    fra_strength = float(clamp(0.06 + 0.020 * rsi, 0.06, 0.18))
-    fra_applied  = 1 if shape_tag != "EVEN" else 0
+    # FRA strength tied a bit more to RSI (still capped)
+    fra_strength = float(clamp(0.07 + 0.022 * rsi, 0.07, 0.20))
 
-    # Save attributes for downstream use / UI
+    # Save attrs
     w.attrs["SCI"]         = float(sci)
-    w.attrs["RSI"]         = float(rsi)
+    w.attrs["RSI"]         = 0.0 if shape_tag == "EVEN" else float(rsi)
     w.attrs["SHAPE_TAG"]   = shape_tag
     w.attrs["FINISH_FLAV"] = fin_flav
-    w.attrs["FRA_APPLIED"] = int(fra_applied)
-    w.attrs["GR_COL"]      = GR_COL
     return w, seg_markers
 
 
