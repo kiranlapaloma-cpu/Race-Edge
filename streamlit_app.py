@@ -821,8 +821,8 @@ w.attrs["RSI"] = float(RSI)
 w.attrs["FINISH_FLAVOUR"] = finish_flavour
 w.attrs["FRA_APPLIED"] = int(fra_applied)
     # Always provide PI_RS/GCI_RS (copy) so downstream code stays happy
-    w["PI_RS"]  = w["PI"].astype(float)
-    w["GCI_RS"] = w["GCI"].astype(float)
+w["PI_RS"]  = w["PI"].astype(float)
+w["GCI_RS"] = w["GCI"].astype(float)
 
     if use_race_shape:
         acc  = pd.to_numeric(w["Accel"],    errors="coerce")
