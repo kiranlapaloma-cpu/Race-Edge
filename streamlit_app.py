@@ -776,99 +776,113 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     dLM = acc - mid   # +ve = late stronger than mid  → SLOW_EARLY candidate
     dLG = grd - acc   # +ve = grind tougher than late → Attritional finish
 
-        # ================= Race Shape v3 — more sensitive, geometry-aware =================
-    acc = pd.to_numeric(w["Accel"], errors="coerce")
-    mid = pd.to_numeric(w["tsSPI"], errors="coerce")
-    grd = pd.to_numeric(w[GR_COL],  errors="coerce")
+        # ========================= Race Shape (Eureka RSI) =========================
+# Uses the SAME primitives you already calculated: tsSPI, Accel, Grind[_CG]
+# Sign convention:
+#   RSI > 0  → Slow-Early / Sprint-home bias (late favoured)
+#   RSI < 0  → Fast-Early / Attritional bias (early favoured)
+# Scale: approximately -10..+10 for human sense-making.
 
-    dLM = acc - mid           # +ve = late kick / slow early
-    dLG = grd - acc           # +ve = attritional finish; -ve = sprinty
+acc = pd.to_numeric(w["Accel"], errors="coerce")
+mid = pd.to_numeric(w["tsSPI"], errors="coerce")
+grd = pd.to_numeric(w[GR_COL], errors="coerce")
 
-    # Robust spread (MAD) with a soft floor so tiny spreads don’t neuter sensitivity
-    def _madv(s):
-        v = mad_std(pd.to_numeric(s, errors="coerce"))
-        return 0.0 if (not np.isfinite(v)) else float(v)
+# Core axis (late minus mid): positive = slow-early; negative = fast-early
+dLM = (acc - mid)
 
-    mad_LM = max(0.8, _madv(dLM))   # was ~1.4–1.8; pull down hard for sensitivity
-    mad_LG = max(0.8, _madv(dLG))
+# Finish flavour axis (grind minus accel): positive = attritional finish; negative = sprint finish
+dLG = (grd - acc)
 
-    # z-like medians (how many "MADs" the field skew is)
-    zLM = float(pd.to_numeric(dLM, errors="coerce").median(skipna=True)) / (mad_LM + 1e-9)
-    zLG = float(pd.to_numeric(dLG, errors="coerce").median(skipna=True)) / (mad_LG + 1e-9)
+def _madv(s):
+    v = mad_std(pd.to_numeric(s, errors="coerce"))
+    return 0.0 if (not np.isfinite(v)) else float(v)
 
-    # Distance sensitivity – make the mile & sprints easiest to tilt
-    if   D <= 1200: sens = 1.05
-    elif D <= 1600: sens = 1.15     # mile: most sensitive
-    elif D <= 2000: sens = 1.00
-    else:           sens = 0.95
+# 1) Consensus (SCI) on the shape direction using dLM signs
+sgn = np.sign(dLM.dropna().to_numpy())
+if sgn.size:
+    sgn_med = int(np.sign(np.median(dLM.dropna())))
+    sci = float((sgn == sgn_med).mean()) if sgn_med != 0 else 0.0
+else:
+    sgn_med = 0
+    sci = 0.0
 
-    # Field-size booster (small fields need a little push)
-    N = len(w)
-    sens *= (1.10 if N < 9 else 1.00)
+# 2) Directional centre and robust scale
+med_dLM = float(np.nanmedian(dLM))
+mad_dLM = _madv(dLM)
+if not np.isfinite(mad_dLM) or mad_dLM <= 0:
+    mad_dLM = 1.0  # safety
 
-    # Primary gates (smaller than before)
-    GATE_SLOW = 0.70 / sens      # needs zLM ≥ +gate  → SLOW_EARLY
-    GATE_FAST = 0.70 / sens      # needs zLM ≤ −gate  → FAST_EARLY
+# 3) Distance sensitivity (mile & 7f get a touch more lift)
+D = float(D_actual_m)
+if   D <= 1100: dist_gain = 0.95
+elif D <= 1400: dist_gain = 1.05
+elif D <= 1800: dist_gain = 1.12
+elif D <= 2000: dist_gain = 1.05
+else:           dist_gain = 0.98
 
-    # Consensus (SCI): % of runners whose sign matches the median sign of dLM
-    signs = np.sign(pd.to_numeric(dLM, errors="coerce").dropna().to_numpy())
-    if signs.size == 0:
-        sci = 0.0
-    else:
-        sgn_med = np.sign(np.median(signs))
-        sci = float((signs == sgn_med).mean()) if sgn_med != 0 else 0.0
+# 4) Finish flavour adds gentle seasoning to magnitude only
+mad_dLG = _madv(dLG)
+fin_strength = 0.0 if mad_dLG == 0 else clamp(abs(np.nanmedian(dLG)) / max(mad_dLG, 1e-6), 0.0, 2.0)
+# mapped ~0..+0.6
+fin_bonus = 0.30 * fin_strength
 
-    # Flexible SCI gates (lowered a bit)
-    if   D <= 1200: sci_gate_slow = 0.52; sci_gate_fast = 0.52
-    elif D <= 1600: sci_gate_slow = 0.50; sci_gate_fast = 0.50
-    else:           sci_gate_slow = 0.48; sci_gate_fast = 0.48
+# 5) RSI raw → scaled to ≈ [-10, +10], with SCI gating
+# Base scale ~3.2 chosen to make |RSI|~6–8 for notably biased races.
+base_scale = 3.2
+rsi_signed = (med_dLM / mad_dLM) * base_scale
+rsi_signed *= (0.60 + 0.40 * sci)   # respect consensus
+rsi_signed *= dist_gain
+# flavour magnifies magnitude only
+rsi = np.sign(rsi_signed) * min(10.0, abs(rsi_signed) * (1.0 + fin_bonus))
+rsi = float(np.round(rsi, 2))
 
-    # ---------- Curve-geometry cues (force away from EVEN when obvious) ----------
-    # Medians across the field for the three key panels
-    F_med   = float(pd.to_numeric(w["F200_idx"], errors="coerce").median(skipna=True))
-    MID_med = float(mid.median(skipna=True))
-    ACC_med = float(acc.median(skipna=True))
-
-    # "Valley then late surge" (slow-early / sprint-home look)
-    mid_valley  = (MID_med <= min(F_med, ACC_med) - 0.6)   # dip ≥0.6pt
-    late_surge  = (ACC_med - MID_med) >= 0.8               # lift ≥0.8pt
-    CUE_SLOW    = mid_valley and late_surge
-
-    # "Early heat then fade" (fast-early look): early+mid outpace late
-    early_hot   = (max(F_med, MID_med) - ACC_med) >= 0.8
-    mid_not_soft= (MID_med >= F_med - 0.4)                 # avoid slow-beginning traps
-    CUE_FAST    = early_hot and mid_not_soft
-
-    # ---------- Primary tag ----------
+# 6) Tag (human label) from RSI only
+if abs(rsi) < 1.2:
     shape_tag = "EVEN"
-    if (zLM >= GATE_SLOW and sci >= sci_gate_slow) or CUE_SLOW:
-        shape_tag = "SLOW_EARLY"
-    elif (zLM <= -GATE_FAST and sci >= sci_gate_fast) or CUE_FAST:
-        shape_tag = "FAST_EARLY"
+elif rsi > 0:
+    shape_tag = "SLOW_EARLY"
+else:
+    shape_tag = "FAST_EARLY"
 
-    # ---------- Finish flavour (informational) ----------
-    fin_flav = "Balanced Finish"
-    if   zLG >= 0.60: fin_flav = "Attritional Finish"
-    elif zLG <= -0.60: fin_flav = "Sprint Finish"
+# 7) RSI strength index (0..10) = |RSI|, capped
+rsi_strength = float(min(10.0, abs(rsi)))
 
-    # ---------- Strength (RSI) ----------
-    # Combine |zLM| with SCI and add a tiny bonus if a curve cue fired.
-    shape_strength = abs(zLM) * (0.90 + 0.10 * (CUE_SLOW or CUE_FAST))
-    # Map to 0..10 (slightly steeper than before)
-    if   shape_strength < 0.6: rsi = 2.5 + 3.0*shape_strength
-    elif shape_strength < 1.2: rsi = 4.3 + 4.0*(shape_strength-0.6)
-    elif shape_strength < 2.0: rsi = 6.7 + 2.8*(shape_strength-1.2)
-    else:                      rsi = 9.0 + 1.0*min(1.0, shape_strength-2.0)
-    rsi = float(clamp(rsi, 0.0, 10.0))
+# 8) Per-horse exposure along the same axis (late-minus-mid)
+# Positive RS_Component = ran like late-favoured type; negative = early-favoured type
+w["RS_Component"] = (acc - mid).round(3)
 
-    # FRA strength tied a bit more to RSI (still capped)
-    fra_strength = float(clamp(0.07 + 0.022 * rsi, 0.07, 0.20))
+# Alignment cue: +1 with shape, -1 against shape, 0 neutral
+def _align_row(val, rsi_val, eps=0.25):
+    if not (np.isfinite(val) and np.isfinite(rsi_val)) or abs(rsi_val) < 1.2:
+        return 0
+    if val > +eps and rsi_val > 0: return +1
+    if val < -eps and rsi_val < 0: return +1
+    if val > +eps and rsi_val < 0: return -1
+    if val < -eps and rsi_val > 0: return -1
+    return 0
 
-    # Save attrs
-    w.attrs["SCI"]         = float(sci)
-    w.attrs["RSI"]         = 0.0 if shape_tag == "EVEN" else float(rsi)
-    w.attrs["SHAPE_TAG"]   = shape_tag
-    w.attrs["FINISH_FLAV"] = fin_flav
+w["RSI_Align"] = [ _align_row(v, rsi) for v in w["RS_Component"] ]
+
+# Pretty cue for tables
+def _align_icon(a):
+    if a > 0:  return "🔵 ➜ with shape"
+    if a < 0:  return "🔴 ⇦ against shape"
+    return "⚪ neutral"
+
+w["RSI_Cue"] = [ _align_icon(a) for a in w["RSI_Align"] ]
+
+# Save attrs you already expose / use elsewhere
+w.attrs["RSI"]         = float(rsi)
+w.attrs["RSI_STRENGTH"]= float(rsi_strength)
+w.attrs["SCI"]         = float(sci)
+w.attrs["SHAPE_TAG"]   = shape_tag
+# Informational finish flavour (kept from your previous UX)
+fin_flav = "Balanced Finish"
+med_dLG = float(np.nanmedian(dLG))
+gLG_gate = max(1.40, 0.50 * _madv(dLG))  # keep your eased threshold
+if   med_dLG >= +gLG_gate: fin_flav = "Attritional Finish"
+elif med_dLG <= -gLG_gate: fin_flav = "Sprint Finish"
+w.attrs["FINISH_FLAV"] = fin_flav
     return w, seg_markers
 
 
@@ -1094,7 +1108,9 @@ _hdr = (
     f"## Race Distance: **{int(race_distance_input)}m**  |  "
     f"Split step: **{split_step}m**  |  "
     f"Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  |  "
-    f"SCI: **{metrics.attrs.get('SCI',1.0):.2f}**  |  "
+    f"RSI: **{metrics.attrs.get('RSI',0.0):+.2f} / 10**  |  "
+    f"Finish: **{metrics.attrs.get('FINISH_FLAV','Balanced Finish')}**  |  "
+    f"SCI: **{metrics.attrs.get('SCI',0.0):.2f}**  |  "
     f"FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
 )
 rqs_v = metrics.attrs.get("RQS", None)
@@ -1146,7 +1162,9 @@ show_cols = [
     "F200_idx","tsSPI","Accel", "Grind", "Grind_CG",
     "EARLY_idx","LATE_idx",
     "GrindAdjPts","DeltaG",
-    "PI","PI_RS","GCI","GCI_RS"
+    "PI","PI_RS","GCI","GCI_RS",
+    # NEW:
+    "RSI","RS_Component","RSI_Cue"
 ]
 for c in show_cols:
     if c not in metrics.columns:
@@ -1163,6 +1181,10 @@ st.caption(
     f"CG={'ON' if USE_CG else 'OFF'} (FSR={metrics.attrs.get('FSR',1.0):.3f}; Collapse={metrics.attrs.get('CollapseSeverity',0.0):.1f}).  "
     f"Race Shape={metrics.attrs.get('SHAPE_TAG','EVEN')} (SCI={metrics.attrs.get('SCI',1.0):.2f}; FRA={'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'})."
 )
+# ----- Add RSI & exposure columns to the Sectional Metrics view -----
+display_df["RSI"]          = metrics.attrs.get("RSI", np.nan)
+display_df["RS_Component"] = metrics.get("RS_Component", np.nan)
+display_df["RSI_Cue"]      = metrics.get("RSI_Cue", "")
 # Going note (PI only)
 pi_meta = metrics.attrs.get("PI_GOING_META", {})
 if pi_meta:
@@ -1173,6 +1195,7 @@ if pi_meta:
     moved = [f"{k}×{mult[k]:.3f}" for k in ["Accel","F200_idx","tsSPI","Grind"] if abs(mult.get(k,1.0)-1.0) >= 0.005]
     if moved:
         st.caption(f"Going: {g} — PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
+        st.caption("RSI: + = slow-early (late favoured), − = fast-early (early favoured).  RS_Component per horse uses the same axis.  🔵 with shape · 🔴 against shape.")
         
 # ======================= Ahead of Handicap (Single-Race, Field-Aware) =======================
 st.markdown("## Ahead of Handicap — Single Race Field Context")
