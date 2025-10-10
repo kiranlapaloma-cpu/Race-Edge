@@ -881,7 +881,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w.attrs["FINISH_FLAV"] = fin_flav
     w.attrs["FRA_APPLIED"] = int(fra_applied)
     w.attrs["GR_COL"]      = GR_COL
-        return w, seg_markers
+    return w, seg_markers
 
 
 # ---- Compute metrics + race shape now ----
