@@ -777,112 +777,112 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     dLG = grd - acc   # +ve = grind tougher than late → Attritional finish
 
         # ========================= Race Shape (Eureka RSI) =========================
-# Uses the SAME primitives you already calculated: tsSPI, Accel, Grind[_CG]
-# Sign convention:
-#   RSI > 0  → Slow-Early / Sprint-home bias (late favoured)
-#   RSI < 0  → Fast-Early / Attritional bias (early favoured)
-# Scale: approximately -10..+10 for human sense-making.
+    # Uses the SAME primitives you already calculated: tsSPI, Accel, Grind[_CG]
+    # Sign convention:
+    #   RSI > 0  → Slow-Early / Sprint-home bias (late favoured)
+    #   RSI < 0  → Fast-Early / Attritional bias (early favoured)
+    # Scale: approximately -10..+10 for human sense-making.
 
-acc = pd.to_numeric(w["Accel"], errors="coerce")
-mid = pd.to_numeric(w["tsSPI"], errors="coerce")
-grd = pd.to_numeric(w[GR_COL], errors="coerce")
+    acc = pd.to_numeric(w["Accel"], errors="coerce")
+    mid = pd.to_numeric(w["tsSPI"], errors="coerce")
+    grd = pd.to_numeric(w[GR_COL], errors="coerce")
 
-# Core axis (late minus mid): positive = slow-early; negative = fast-early
-dLM = (acc - mid)
+    # Core axis (late minus mid): positive = slow-early; negative = fast-early
+    dLM = (acc - mid)
 
-# Finish flavour axis (grind minus accel): positive = attritional finish; negative = sprint finish
-dLG = (grd - acc)
+    # Finish flavour axis (grind minus accel): positive = attritional finish; negative = sprint finish
+    dLG = (grd - acc)
 
-def _madv(s):
-    v = mad_std(pd.to_numeric(s, errors="coerce"))
-    return 0.0 if (not np.isfinite(v)) else float(v)
+    def _madv(s):
+        v = mad_std(pd.to_numeric(s, errors="coerce"))
+        return 0.0 if (not np.isfinite(v)) else float(v)
 
-# 1) Consensus (SCI) on the shape direction using dLM signs
-sgn = np.sign(dLM.dropna().to_numpy())
-if sgn.size:
-    sgn_med = int(np.sign(np.median(dLM.dropna())))
-    sci = float((sgn == sgn_med).mean()) if sgn_med != 0 else 0.0
-else:
-    sgn_med = 0
-    sci = 0.0
+    # 1) Consensus (SCI) on the shape direction using dLM signs
+    sgn = np.sign(dLM.dropna().to_numpy())
+    if sgn.size:
+        sgn_med = int(np.sign(np.median(dLM.dropna())))
+        sci = float((sgn == sgn_med).mean()) if sgn_med != 0 else 0.0
+    else:
+        sgn_med = 0
+        sci = 0.0
 
-# 2) Directional centre and robust scale
-med_dLM = float(np.nanmedian(dLM))
-mad_dLM = _madv(dLM)
-if not np.isfinite(mad_dLM) or mad_dLM <= 0:
-    mad_dLM = 1.0  # safety
+    # 2) Directional centre and robust scale
+    med_dLM = float(np.nanmedian(dLM))
+    mad_dLM = _madv(dLM)
+    if not np.isfinite(mad_dLM) or mad_dLM <= 0:
+        mad_dLM = 1.0  # safety
 
-# 3) Distance sensitivity (mile & 7f get a touch more lift)
-D = float(D_actual_m)
-if   D <= 1100: dist_gain = 0.95
-elif D <= 1400: dist_gain = 1.05
-elif D <= 1800: dist_gain = 1.12
-elif D <= 2000: dist_gain = 1.05
-else:           dist_gain = 0.98
+    # 3) Distance sensitivity (mile & 7f get a touch more lift)
+    D = float(D_actual_m)
+    if   D <= 1100: dist_gain = 0.95
+    elif D <= 1400: dist_gain = 1.05
+    elif D <= 1800: dist_gain = 1.12
+    elif D <= 2000: dist_gain = 1.05
+    else:           dist_gain = 0.98
 
-# 4) Finish flavour adds gentle seasoning to magnitude only
-mad_dLG = _madv(dLG)
-fin_strength = 0.0 if mad_dLG == 0 else clamp(abs(np.nanmedian(dLG)) / max(mad_dLG, 1e-6), 0.0, 2.0)
-# mapped ~0..+0.6
-fin_bonus = 0.30 * fin_strength
+    # 4) Finish flavour adds gentle seasoning to magnitude only
+    mad_dLG = _madv(dLG)
+    fin_strength = 0.0 if mad_dLG == 0 else clamp(abs(np.nanmedian(dLG)) / max(mad_dLG, 1e-6), 0.0, 2.0)
+    # mapped ~0..+0.6
+    fin_bonus = 0.30 * fin_strength
 
-# 5) RSI raw → scaled to ≈ [-10, +10], with SCI gating
-# Base scale ~3.2 chosen to make |RSI|~6–8 for notably biased races.
-base_scale = 3.2
-rsi_signed = (med_dLM / mad_dLM) * base_scale
-rsi_signed *= (0.60 + 0.40 * sci)   # respect consensus
-rsi_signed *= dist_gain
-# flavour magnifies magnitude only
-rsi = np.sign(rsi_signed) * min(10.0, abs(rsi_signed) * (1.0 + fin_bonus))
-rsi = float(np.round(rsi, 2))
+    # 5) RSI raw → scaled to ≈ [-10, +10], with SCI gating
+    # Base scale ~3.2 chosen to make |RSI|~6–8 for notably biased races.
+    base_scale = 3.2
+    rsi_signed = (med_dLM / mad_dLM) * base_scale
+    rsi_signed *= (0.60 + 0.40 * sci)   # respect consensus
+    rsi_signed *= dist_gain
+    # flavour magnifies magnitude only
+    rsi = np.sign(rsi_signed) * min(10.0, abs(rsi_signed) * (1.0 + fin_bonus))
+    rsi = float(np.round(rsi, 2))
 
-# 6) Tag (human label) from RSI only
-if abs(rsi) < 1.2:
-    shape_tag = "EVEN"
-elif rsi > 0:
-    shape_tag = "SLOW_EARLY"
-else:
-    shape_tag = "FAST_EARLY"
+    # 6) Tag (human label) from RSI only
+    if abs(rsi) < 1.2:
+        shape_tag = "EVEN"
+    elif rsi > 0:
+        shape_tag = "SLOW_EARLY"
+    else:
+        shape_tag = "FAST_EARLY"
 
-# 7) RSI strength index (0..10) = |RSI|, capped
-rsi_strength = float(min(10.0, abs(rsi)))
+    # 7) RSI strength index (0..10) = |RSI|, capped
+    rsi_strength = float(min(10.0, abs(rsi)))
 
-# 8) Per-horse exposure along the same axis (late-minus-mid)
-# Positive RS_Component = ran like late-favoured type; negative = early-favoured type
-w["RS_Component"] = (acc - mid).round(3)
+    # 8) Per-horse exposure along the same axis (late-minus-mid)
+    # Positive RS_Component = ran like late-favoured type; negative = early-favoured type
+    w["RS_Component"] = (acc - mid).round(3)
 
-# Alignment cue: +1 with shape, -1 against shape, 0 neutral
-def _align_row(val, rsi_val, eps=0.25):
-    if not (np.isfinite(val) and np.isfinite(rsi_val)) or abs(rsi_val) < 1.2:
+    # Alignment cue: +1 with shape, -1 against shape, 0 neutral
+    def _align_row(val, rsi_val, eps=0.25):
+        if not (np.isfinite(val) and np.isfinite(rsi_val)) or abs(rsi_val) < 1.2:
+            return 0
+        if val > +eps and rsi_val > 0: return +1
+        if val < -eps and rsi_val < 0: return +1
+        if val > +eps and rsi_val < 0: return -1
+        if val < -eps and rsi_val > 0: return -1
         return 0
-    if val > +eps and rsi_val > 0: return +1
-    if val < -eps and rsi_val < 0: return +1
-    if val > +eps and rsi_val < 0: return -1
-    if val < -eps and rsi_val > 0: return -1
-    return 0
 
-w["RSI_Align"] = [ _align_row(v, rsi) for v in w["RS_Component"] ]
+    w["RSI_Align"] = [ _align_row(v, rsi) for v in w["RS_Component"] ]
 
-# Pretty cue for tables
-def _align_icon(a):
-    if a > 0:  return "🔵 ➜ with shape"
-    if a < 0:  return "🔴 ⇦ against shape"
-    return "⚪ neutral"
+    # Pretty cue for tables
+    def _align_icon(a):
+        if a > 0:  return "🔵 ➜ with shape"
+        if a < 0:  return "🔴 ⇦ against shape"
+        return "⚪ neutral"
 
-w["RSI_Cue"] = [ _align_icon(a) for a in w["RSI_Align"] ]
+    w["RSI_Cue"] = [ _align_icon(a) for a in w["RSI_Align"] ]
 
-# Save attrs you already expose / use elsewhere
-w.attrs["RSI"]         = float(rsi)
-w.attrs["RSI_STRENGTH"]= float(rsi_strength)
-w.attrs["SCI"]         = float(sci)
-w.attrs["SHAPE_TAG"]   = shape_tag
-# Informational finish flavour (kept from your previous UX)
-fin_flav = "Balanced Finish"
-med_dLG = float(np.nanmedian(dLG))
-gLG_gate = max(1.40, 0.50 * _madv(dLG))  # keep your eased threshold
-if   med_dLG >= +gLG_gate: fin_flav = "Attritional Finish"
-elif med_dLG <= -gLG_gate: fin_flav = "Sprint Finish"
-w.attrs["FINISH_FLAV"] = fin_flav
+    # Save attrs you already expose / use elsewhere
+    w.attrs["RSI"]         = float(rsi)
+    w.attrs["RSI_STRENGTH"]= float(rsi_strength)
+    w.attrs["SCI"]         = float(sci)
+    w.attrs["SHAPE_TAG"]   = shape_tag
+    # Informational finish flavour (kept from your previous UX)
+    fin_flav = "Balanced Finish"
+    med_dLG = float(np.nanmedian(dLG))
+    gLG_gate = max(1.40, 0.50 * _madv(dLG))  # keep your eased threshold
+    if   med_dLG >= +gLG_gate: fin_flav = "Attritional Finish"
+    elif med_dLG <= -gLG_gate: fin_flav = "Sprint Finish"
+    w.attrs["FINISH_FLAV"] = fin_flav
     return w, seg_markers
 
 
