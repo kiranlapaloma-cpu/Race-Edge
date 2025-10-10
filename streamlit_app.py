@@ -934,6 +934,23 @@ st.markdown(
     f"|  FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**  "
     f"|  RQS: **{metrics.attrs.get('RQS', 0.0):.1f}/100**"
 )
+# ----------------------- RQS Badge -----------------------
+rqs_val = float(metrics.attrs.get("RQS", 0.0))
+if rqs_val >= 80:
+    badge_color, badge_label = "#27AE60", "Elite Class"
+elif rqs_val >= 65:
+    badge_color, badge_label = "#F39C12", "Competitive Field"
+elif rqs_val >= 45:
+    badge_color, badge_label = "#E67E22", "Moderate Class"
+else:
+    badge_color, badge_label = "#C0392B", "Weak Field"
+
+st.markdown(
+    f"<div style='display:inline-block;padding:4px 10px;border-radius:6px;"
+    f"background-color:{badge_color};color:white;font-weight:bold;'>"
+    f"RQS {rqs_val:.1f} / 100 — {badge_label}</div>",
+    unsafe_allow_html=True
+)
 if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
     bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
     warn = []
