@@ -686,19 +686,6 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         field_n=len(w),
         return_meta=True
     )
-    # ------------------- Compute RQS / RPS & store -------------------
-metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
-metrics.attrs["RPS"] = compute_rps(metrics)
-
-_profile_label, _profile_color = classify_race_profile(
-    float(metrics.attrs.get("RQS", np.nan)),
-    float(metrics.attrs.get("RPS", np.nan))
-)
-
-metrics.attrs["RACE_PROFILE"] = _profile_label
-metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
-
-
 
     # Store for captions/DB/PDF
     w.attrs["GOING"] = going_for_pi
@@ -770,73 +757,140 @@ metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
     w["LATE_idx"]  = (0.60*pd.to_numeric(w["Accel"],    errors="coerce") +
                       0.40*pd.to_numeric(w[GR_COL],      errors="coerce"))
 
-    # ----- Race Shape + FRA (ΔLA = Accel − tsSPI core version) -----
-    shape_tag = "EVEN"
-    fra_applied = 0
-    sci = 1.0
+    # ----- Race Shape + FRA (tsSPI vs Accel/Grind) -----
+    # Definitions:
+    # ΔLM = ((Accel + GR)/2) - tsSPI    → +ve = built late (slow early / sprint home)
+    # ΔLG = GR - Accel                  → +ve = attritional finish; -ve = sprint finish
+    shape_tag = "EVEN"; finish_flavour = "Balanced Finish"; fra_applied = 0
+    sci2 = 1.0; rsi = 0.0
 
-    # ΔLA and ΔLG per horse
-    w["ΔLA"] = pd.to_numeric(w["Accel"], errors="coerce") - pd.to_numeric(w["tsSPI"], errors="coerce")
-    w["ΔLG"] = pd.to_numeric(w[GR_COL], errors="coerce") - pd.to_numeric(w["Accel"], errors="coerce")
-
-    # Medians across field
-    med_dla = float(pd.to_numeric(w["ΔLA"], errors="coerce").median(skipna=True))
-    mad_dla = mad_std(w["ΔLA"])
-    sci = float((abs(w["ΔLA"] - med_dla) <= 1.5).mean()) if w["ΔLA"].notna().any() else 1.0
-
-    # Determine race-shape tag
-    if med_dla >= +1.5:
-        shape_tag = "SLOW_EARLY"
-    elif med_dla <= -1.5:
-        shape_tag = "FAST_EARLY"
-    else:
-        shape_tag = "EVEN"
-
-    # Compute RSI = |ΔLA| × SCI × 10 (scaled for readability 0–10)
-    RSI = float(min(10.0, abs(med_dla) * sci))
-
-    # Finish flavour tag (ΔLG)
-    if np.isfinite(med_dla):
-        med_dlg = float(pd.to_numeric(w["ΔLG"], errors="coerce").median(skipna=True))
-        if med_dlg >= +2.0:
-            finish_flavour = "Attritional Finish"
-        elif med_dlg <= -2.0:
-            finish_flavour = "Sprint Finish"
-        else:
-            finish_flavour = "Balanced Finish"
-    else:
-        finish_flavour = "Balanced Finish"
-
-    # FRA adjustment based on ΔLA polarity
+    # Always provide PI_RS/GCI_RS (copy) so downstream code stays happy
     w["PI_RS"]  = w["PI"].astype(float)
     w["GCI_RS"] = w["GCI"].astype(float)
 
-    if shape_tag == "SLOW_EARLY" and sci >= 0.60:
-        f = 0.10 + 0.05 * (sci - 0.60) / 0.40
-        late_excess = ((w["Accel"] - w["tsSPI"]).clip(lower=0.0, upper=8.0)).fillna(0.0)
-        w["PI_RS"]  = (w["PI"]  - f * (late_excess / 4.0)).clip(0.0, 10.0)
-        w["GCI_RS"] = (w["GCI"] - f * (late_excess / 3.0)).clip(0.0, 10.0)
-        fra_applied = 1
+    if use_race_shape:
+        acc  = pd.to_numeric(w["Accel"],    errors="coerce")
+        mid  = pd.to_numeric(w["tsSPI"],    errors="coerce")
+        grd  = pd.to_numeric(w[GR_COL],     errors="coerce")
 
-    elif shape_tag == "FAST_EARLY" and sci >= 0.60:
-        f = 0.08 + 0.04 * (sci - 0.60) / 0.40
-        sturdiness = ((w["tsSPI"] - w["Accel"]).clip(lower=0.0, upper=8.0)).fillna(0.0)
-        w["PI_RS"]  = (w["PI"]  + f * (sturdiness / 4.0)).clip(0.0, 10.0)
-        w["GCI_RS"] = (w["GCI"] + f * (sturdiness / 3.0)).clip(0.0, 10.0)
-        fra_applied = 1
+        dLM  = ((acc + grd)/2.0) - mid
+        dLG  = grd - acc
 
-    # Round key fields
-    for c in ["ΔLA", "ΔLG"]:
-        w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
+        # Robust gates from dispersion; scale with trip length a touch
+        def _mad(s):
+            v = mad_std(pd.to_numeric(s, errors="coerce"))
+            return 0.0 if (not np.isfinite(v)) else float(v)
 
-    # Store to attrs
+        gLM = max(2.0, 0.6 * _mad(dLM))
+        gLG = max(1.6, 0.6 * _mad(dLG))
+        if   D <= 1200: scale = 1.00
+        elif D <  1800: scale = 1.08
+        else:           scale = 1.15
+        gLM *= scale; gLG *= scale
+
+        # Field medians
+        med_dLM = float(pd.to_numeric(dLM, errors="coerce").median(skipna=True))
+        med_dLG = float(pd.to_numeric(dLG, errors="coerce").median(skipna=True))
+
+        # Agreement (% runners with the same sign as med_dLM)
+        sgn_med = 0 if med_dLM == 0 else (1 if med_dLM > 0 else -1)
+        if sgn_med == 0:
+            sci2 = 0.0
+        else:
+            same = np.sign(pd.to_numeric(dLM, errors="coerce").dropna().to_numpy())
+            sci2 = float((same == sgn_med).mean()) if same.size else 0.0
+
+        # Base tag (built late vs spent early)
+        if med_dLM >= +gLM and sci2 >= 0.55:
+            shape_tag = "SLOW_EARLY"
+        elif med_dLM <= -gLM and sci2 >= 0.55:
+            shape_tag = "FAST_EARLY"
+        else:
+            shape_tag = "EVEN"
+
+        # Finish flavour
+        if   med_dLG >= +gLG: finish_flavour = "Attritional Finish"
+        elif med_dLG <= -gLG: finish_flavour = "Sprint Finish"
+        else:                 finish_flavour = "Balanced Finish"
+
+        # RSI: how “shaped” the race was (0..10)
+        # Build a simple piecewise map s.t. |med_dLM|*SCI drives it:
+        shape_mag = abs(med_dLM) * sci2
+        if shape_mag <= 3.0:
+            rsi = 2.0 * shape_mag                    # 0..6
+        elif shape_mag <= 5.0:
+            rsi = 6.0 + 1.5 * (shape_mag - 3.0)      # 6..9
+        elif shape_mag <= 6.0:
+            rsi = 9.0 + (shape_mag - 5.0)            # 9..10
+        else:
+            rsi = 10.0
+        rsi = float(clamp(rsi, 0.0, 10.0))
+
+        # FRA (mild, transparent), scaled by RSI (stronger shape ⇒ stronger adjustment)
+        strength = 0.05 + 0.015 * rsi   # 0.05..0.20 roughly
+        strength = float(clamp(strength, 0.05, 0.20))
+
+        if shape_tag == "SLOW_EARLY":
+            # Kicker-flattered get a tiny trim; steady/attritional protected
+            kicker_excess = (acc - mid).clip(lower=0.0).fillna(0.0)          # how much turn-of-foot > cruise
+            adj_pi  = (strength * (kicker_excess / 6.0)).clip(upper=0.60)    # cap per-horse effect
+            adj_gci = 0.80 * adj_pi
+
+            w["PI_RS"]  = (w["PI"]  - adj_pi).clip(0.0, 10.0)
+            w["GCI_RS"] = (w["GCI"] - adj_gci).clip(0.0, 10.0)
+            fra_applied = 1
+
+        elif shape_tag == "FAST_EARLY":
+            # Sturdiness rewarded (Grind over Accel), with some mid support
+            sturdiness = ((grd - acc) + (grd - mid)/2.0).clip(lower=0.0).fillna(0.0)
+            bonus_pi  = (strength * (sturdiness / 6.0)).clip(upper=0.60)
+            bonus_gci = 0.80 * bonus_pi
+
+            w["PI_RS"]  = (w["PI"]  + bonus_pi).clip(0.0, 10.0)
+            w["GCI_RS"] = (w["GCI"] + bonus_gci).clip(0.0, 10.0)
+            fra_applied = 1
+
+    # Save attrs
+    w.attrs["SHAPE_TAG"]   = shape_tag
+    w.attrs["FINISH_FLAV"] = finish_flavour
+    w.attrs["SCI"]         = float(clamp(sci2, 0.0, 1.0))
+    w.attrs["RSI"]         = float(rsi)
+    w.attrs["FRA_APPLIED"] = int(fra_applied)
+
+    # ----- Final rounding & attrs -----
+    for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
+              "PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
+        if c in w.columns:
+            w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
+
+    w.attrs["FSR"] = float(FSR)
+    w.attrs["CollapseSeverity"] = float(CollapseSeverity)
+    w.attrs["GR_COL"] = GR_COL
+    w.attrs["STEP"] = step
     w.attrs["SHAPE_TAG"] = shape_tag
     w.attrs["SCI"] = float(sci)
-    w.attrs["RSI"] = float(RSI)
-    w.attrs["FINISH_FLAVOUR"] = finish_flavour
     w.attrs["FRA_APPLIED"] = int(fra_applied)
-    # Compute and attach RQS to metrics attributes
-    w.attrs["RQS"] = compute_rqs(w, w.attrs)
+
+    if debug:
+        st.write({"FSR":FSR, "CollapseSeverity":CollapseSeverity, "PI_W":PI_W,
+                  "SHAPE_TAG":shape_tag, "SCI":sci, "FRA_APPLIED":fra_applied})
+    return w, seg_markers
+
+# ---- Compute metrics + race shape now ----
+try:
+    metrics, seg_markers = build_metrics_and_shape(
+        work,
+        float(race_distance_input),
+        int(split_step),
+        USE_CG,
+        DAMPEN_CG,
+        USE_RACE_SHAPE,
+        DEBUG
+    )
+except Exception as e:
+    st.error("Metric computation failed.")
+    st.exception(e)
+    st.stop()
 
 # ----------------------- Race Quality Score (RQS v2) -----------------------
 def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
@@ -899,6 +953,7 @@ def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
     return float(np.clip(round(rqs, 1), 0.0, 100.0))
 
 # Compute once and store into attrs (used by header / PDF / DB)
+metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
 
 def compute_rps(df: pd.DataFrame) -> float:
     """
@@ -991,23 +1046,12 @@ def compute_rps(df: pd.DataFrame) -> float:
     rps_pi = (1.0 - w_star) * p95 + w_star * pmax
     return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
 
-# ---------------------- Race Quality Score (RQS v2) ----------------------
-def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
-    ...
-    return float(np.clip(round(rqs, 1), 0.0, 100.0))
-
-# ---------------------- Race Peak Strength (RPS) -------------------------
-def compute_rps(df: pd.DataFrame) -> float:
-    ...
-    return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
-
-# ---------------------- Race Profile badge -------------------------------
 def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
     """
-    Returns (label, color_hex):
-      🔴 Top-Heavy if RPS − RQS ≥ 18
-      🟢 Deep Field if RQS ≥ RPS − 10
-      ⚪ Average otherwise
+    Return (label, color_hex) for the badge.
+    - 🔴 Top-Heavy  when RPS - RQS ≥ 18
+    - 🟢 Deep Field when RQS ≥ RPS - 10
+    - ⚪ Average Profile otherwise
     """
     if not (math.isfinite(rqs) and math.isfinite(rps)):
         return ("Unknown", "#7f8c8d")
@@ -1019,91 +1063,13 @@ def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
     else:
         return ("⚪ Average Profile", "#95a5a6")
 
-# ---- compute & stash (TOP-LEVEL — no indentation) -----------------------
-metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
 metrics.attrs["RPS"] = compute_rps(metrics)
-
 _profile_label, _profile_color = classify_race_profile(
     float(metrics.attrs.get("RQS", np.nan)),
-    float(metrics.attrs.get("RPS", np.nan)),
+    float(metrics.attrs.get("RPS", np.nan))
 )
 metrics.attrs["RACE_PROFILE"] = _profile_label
 metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
-
-# ===============================================================
-# Race Quality & Peak Strength (RQS + RPS + Race Profile)
-# ===============================================================
-
-import math
-import numpy as np
-import pandas as pd
-
-def _safe_med(s):
-    s = pd.to_numeric(s, errors="coerce")
-    return float(np.nanmedian(s)) if s.notna().any() else np.nan
-
-def _prop_ge(s, thr):
-    s = pd.to_numeric(s, errors="coerce")
-    if not s.notna().any():
-        return 0.0
-    return float((s >= thr).mean())
-
-# ----------------- Race Quality Score (RQS v2) -----------------
-def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
-    if df is None or len(df) == 0:
-        return 0.0
-    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
-    gci = pd.to_numeric(df.get("GCI_RS", df.get("GCI")), errors="coerce")
-
-    p90 = np.nanpercentile(pi.dropna(), 90) if pi.notna().any() else np.nan
-    S1 = 10.0 * p90 if np.isfinite(p90) else 0.0
-    med_gci = _safe_med(gci)
-    S2 = 10.0 * med_gci if np.isfinite(med_gci) else 0.0
-    depth = _prop_ge(pi, 6.5)
-    S3 = 100.0 * depth
-
-    z = pi - 5.0
-    mad = np.nanmedian(np.abs(z - np.nanmedian(z))) if np.isfinite(z).any() else 1.2
-    S4 = 100.0 * max(0.0, 1.0 - abs(mad - 1.2) / 1.2)
-
-    n = len(df.index)
-    trust = max(0.85, min(1.15, 0.85 + 0.30 * max(0.0, min(1.0, (n - 6) / 8.0))))
-    fra = int(attrs.get("FRA_APPLIED", 0))
-    sci = float(attrs.get("SCI", 1.0))
-    penalty = 0.0
-    if fra and sci >= 0.6:
-        penalty = min(10.0, max(0.0, 10.0 * (sci - 0.6) / 0.4))
-
-    w1, w2, w3 = 0.55, 0.25, 0.20
-    base = w1 * S1 + w2 * S2 + w3 * S3
-    rqs = base * trust - penalty
-    return float(np.clip(round(rqs, 1), 0.0, 100.0))
-
-# ----------------- Race Peak Strength (RPS) --------------------
-def compute_rps(df: pd.DataFrame) -> float:
-    if df is None or len(df) == 0:
-        return 0.0
-    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce").dropna()
-    if len(pi) == 0:
-        return 0.0
-    n = len(pi)
-    p95 = np.nanpercentile(pi, 95)
-    pmax = np.nanmax(pi)
-    w_star = max(0.1, min(0.4, (12.0 / (n + 2.0))))
-    rps_pi = (1.0 - w_star) * p95 + w_star * pmax
-    return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
-
-# ----------------- Race Profile Badge --------------------------
-def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
-    if not (math.isfinite(rqs) and math.isfinite(rps)):
-        return ("Unknown", "#7f8c8d")
-    delta = rps - rqs
-    if delta >= 18.0:
-        return ("🔴 Top-Heavy", "#e74c3c")
-    elif rqs >= (rps - 10.0):
-        return ("🟢 Deep Field", "#2ecc71")
-    else:
-        return ("⚪ Average Profile", "#95a5a6")
 
 # ======================= Data Integrity & Header (post compute) ==========================
 def _expected_segments(distance_m: float, step:int) -> list[str]:
