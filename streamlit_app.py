@@ -90,6 +90,23 @@ def _safe_bal_norm(series, center=100.0, pad=0.5):
 
     return TwoSlopeNorm(vcenter=center, vmin=vmin, vmax=vmax)
 
+def render_profile_badge(label: str, color_hex: str):
+    st.markdown(
+        f"""
+        <div style="
+            display:inline-block;
+            background:{color_hex};
+            color:white;
+            padding:4px 10px;
+            border-radius:8px;
+            font-weight:600;
+            font-size:0.9rem;">
+            {label}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 # ----------------------- Sidebar ---------------------------
 with st.sidebar:
     st.markdown(f"### Race Edge v{APP_VERSION}")
@@ -903,6 +920,46 @@ def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
 # Compute once and store into attrs (used by header / PDF / DB)
 metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
 
+# ----------------------- Race Peak Strength (RPS) + Race Profile -----------------------
+def compute_rps(df: pd.DataFrame) -> float:
+    """
+    RPS (0..100): peak performance in this race.
+    By default uses p95(PI_RS) to avoid single outliers.
+    Falls back to max(PI_RS) when the field is tiny (<5 valid).
+    """
+    if df is None or len(df) == 0:
+        return 0.0
+    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce").dropna()
+    if pi.size == 0:
+        return 0.0
+    peak = float(np.nanmax(pi)) if pi.size < 5 else float(np.nanpercentile(pi, 95))
+    return float(np.clip(round(10.0 * peak, 1), 0.0, 100.0))
+
+def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
+    """
+    Return (label, color_hex) for the badge.
+    - 🔴 Top-Heavy  when RPS - RQS ≥ 18
+    - 🟢 Deep Field when RQS ≥ RPS - 10
+    - ⚪ Average Profile otherwise
+    """
+    if not (math.isfinite(rqs) and math.isfinite(rps)):
+        return ("Unknown", "#7f8c8d")
+    delta = rps - rqs
+    if delta >= 18.0:
+        return ("🔴 Top-Heavy", "#e74c3c")
+    elif rqs >= (rps - 10.0):
+        return ("🟢 Deep Field", "#2ecc71")
+    else:
+        return ("⚪ Average Profile", "#95a5a6")
+
+metrics.attrs["RPS"] = compute_rps(metrics)
+_profile_label, _profile_color = classify_race_profile(
+    float(metrics.attrs.get("RQS", np.nan)),
+    float(metrics.attrs.get("RPS", np.nan))
+)
+metrics.attrs["RACE_PROFILE"] = _profile_label
+metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
+
 # ======================= Data Integrity & Header (post compute) ==========================
 def _expected_segments(distance_m: float, step:int) -> list[str]:
     cols = [f"{m}_Time" for m in range(int(distance_m)-step, step-1, -step)]
@@ -925,13 +982,29 @@ def _integrity_scan(df: pd.DataFrame, distance_m: float, step: int):
 
 integrity_text, missing_cols, invalid_counts = _integrity_scan(work, race_distance_input, split_step)
 
-st.markdown(
-    f"## Race Distance: **{int(race_distance_input)}m**  |  Split step: **{split_step}m**  "
-    f"|  Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  "
-    f"|  SCI: **{metrics.attrs.get('SCI',1.0):.2f}**  "
-    f"|  FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**  "
-    f"|  RQS: **{metrics.attrs.get('RQS', 0.0):.1f}/100**"
+# ======================= Header with RQS + RPS + Badge =======================
+_hdr = (
+    f"## Race Distance: **{int(race_distance_input)}m**  |  "
+    f"Split step: **{split_step}m**  |  "
+    f"Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  |  "
+    f"SCI: **{metrics.attrs.get('SCI',1.0):.2f}**  |  "
+    f"FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
 )
+rqs_v = metrics.attrs.get("RQS", None)
+rps_v = metrics.attrs.get("RPS", None)
+if rqs_v is not None:
+    _hdr += f"  |  **RQS:** {float(rqs_v):.1f}/100"
+if rps_v is not None:
+    _hdr += f"  |  **RPS:** {float(rps_v):.1f}/100"
+
+st.markdown(_hdr)
+
+# Badge + short legend line
+render_profile_badge(
+    metrics.attrs.get("RACE_PROFILE","Unknown"),
+    metrics.attrs.get("RACE_PROFILE_COLOR","#7f8c8d")
+)
+st.caption("RQS = field depth/consistency • RPS = peak performance • Badge = depth vs dominance")
 # ----------------------- RQS Badge -----------------------
 rqs_val = float(metrics.attrs.get("RQS", 0.0))
 if rqs_val >= 80:
