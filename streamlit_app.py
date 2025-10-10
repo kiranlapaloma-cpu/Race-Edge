@@ -1107,6 +1107,61 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
 if split_step == 200:
     st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
 
+# ======================= Top 5 Standout Performers (RPS detail) =======================
+def _pi_series(df):
+    s = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
+    return s
+
+def _trust_from_field(n):
+    # 0 at n<=6 → 1 at n>=12
+    return float(max(0.0, min(1.0, (n - 6) / 6.0)))
+
+def _badge_for(pi_rs, ds):
+    pi = float(pi_rs) if pd.notna(pi_rs) else -1e9
+    ds = float(ds) if pd.notna(ds) else -1e9
+    if (pi >= 8.6) and (ds >= 1.2): return "⭐ Elite Performer"
+    if (pi >= 7.6) and (ds >= 0.8): return "🔶 Standout Performer"
+    if (pi >= 6.8) and (ds >= 0.5): return "🔹 Notable Performer"
+    return ""
+
+_pi = _pi_series(metrics)
+p90 = float(np.nanpercentile(_pi.dropna(), 90)) if _pi.notna().any() else np.nan
+trust = _trust_from_field(len(metrics))
+
+# Rank by PI_RS (fallback PI) and compute ΔNext/ΔPack/DS for top 5 only
+ranked = metrics.assign(_PI=_pi).sort_values("_PI", ascending=False).reset_index(drop=True)
+k = min(5, len(ranked))
+delta_next = []
+for i in range(k):
+    cur = ranked.loc[i, "_PI"]
+    nxt = ranked.loc[i+1, "_PI"] if (i+1) < len(ranked) else np.nan
+    dn = float(cur - nxt) if (pd.notna(cur) and pd.notna(nxt)) else 0.0
+    delta_next.append(dn)
+
+top5 = ranked.head(k).copy()
+top5["DeltaNext"] = delta_next
+top5["DeltaPack"] = (top5["_PI"] - p90) if np.isfinite(p90) else np.nan
+# Dominance Score: (0.6·ΔPack/1.5 + 0.4·ΔNext/1.0) × trust
+top5["DS"] = (0.6 * (top5["DeltaPack"] / 1.5).clip(lower=0.0) +
+              0.4 * (top5["DeltaNext"] / 1.0).clip(lower=0.0)) * trust
+top5["PerfBadge"] = [_badge_for(pi, ds) for pi, ds in zip(top5["_PI"], top5["DS"])]
+
+# Push summary columns back into `metrics` (others become NaN for non-top5)
+for col in ["DeltaNext","DeltaPack","DS","PerfBadge"]:
+    metrics[col] = np.nan
+    metrics.loc[metrics["Horse"].isin(top5["Horse"]), col] = top5.set_index("Horse")[col]
+metrics["Top5Flag"] = metrics["PerfBadge"].notna() & (metrics["PerfBadge"].astype(str) != "")
+
+# ---------- UI: table ----------
+st.markdown("## Top 5 Standout Performers — dominance within this race")
+if top5.empty or top5["_PI"].isna().all():
+    st.info("Insufficient PI data to identify standout performers.")
+else:
+    top5_view = (top5[["Horse","_PI","DeltaNext","DeltaPack","DS","PerfBadge"]]
+                 .rename(columns={"_PI":"PI_RS"})
+                 .round({"PI_RS":2,"DeltaNext":2,"DeltaPack":2,"DS":2}))
+    st.dataframe(top5_view, use_container_width=True)
+
 # ======================= Sectional Metrics table =====================
 st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
 GR_COL = metrics.attrs.get("GR_COL","Grind")
