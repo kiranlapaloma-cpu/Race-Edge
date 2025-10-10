@@ -931,7 +931,8 @@ st.markdown(
     f"## Race Distance: **{int(race_distance_input)}m**  |  Split step: **{split_step}m**  "
     f"|  Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  "
     f"|  SCI: **{metrics.attrs.get('SCI',1.0):.2f}**  "
-    f"|  FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
+    f"|  FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**  "
+    f"|  RQS: **{metrics.attrs.get('RQS', 0.0):.1f}/100**"
 )
 if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
     bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
