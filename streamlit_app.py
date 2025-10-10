@@ -824,25 +824,25 @@ w.attrs["FRA_APPLIED"] = int(fra_applied)
 w["PI_RS"]  = w["PI"].astype(float)
 w["GCI_RS"] = w["GCI"].astype(float)
 
-    if use_race_shape:
-        acc  = pd.to_numeric(w["Accel"],    errors="coerce")
-        mid  = pd.to_numeric(w["tsSPI"],    errors="coerce")
-        grd  = pd.to_numeric(w[GR_COL],     errors="coerce")
+if use_race_shape:
+    acc  = pd.to_numeric(w["Accel"],    errors="coerce")
+    mid  = pd.to_numeric(w["tsSPI"],    errors="coerce")
+    grd  = pd.to_numeric(w[GR_COL],     errors="coerce")
 
-        dLM  = ((acc + grd)/2.0) - mid
-        dLG  = grd - acc
+    dLM  = ((acc + grd)/2.0) - mid
+    dLG  = grd - acc
 
-        # Robust gates from dispersion; scale with trip length a touch
-        def _mad(s):
-            v = mad_std(pd.to_numeric(s, errors="coerce"))
-            return 0.0 if (not np.isfinite(v)) else float(v)
+# Robust gates from dispersion; scale with trip length a touch
+def _mad(s):
+    v = mad_std(pd.to_numeric(s, errors="coerce"))
+    return 0.0 if (not np.isfinite(v)) else float(v)
 
-        gLM = max(2.0, 0.6 * _mad(dLM))
-        gLG = max(1.6, 0.6 * _mad(dLG))
-        if   D <= 1200: scale = 1.00
-        elif D <  1800: scale = 1.08
-        else:           scale = 1.15
-        gLM *= scale; gLG *= scale
+    gLM = max(2.0, 0.6 * _mad(dLM))
+    gLG = max(1.6, 0.6 * _mad(dLG))
+    if   D <= 1200: scale = 1.00
+    elif D <  1800: scale = 1.08
+    else:           scale = 1.15
+    gLM *= scale; gLG *= scale
 
         # Field medians
         med_dLM = float(pd.to_numeric(dLM, errors="coerce").median(skipna=True))
