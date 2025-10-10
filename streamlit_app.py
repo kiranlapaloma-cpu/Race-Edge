@@ -870,12 +870,12 @@ def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
     depth_prop = _pct_at_or_above(pi, 6.8)
     S2 = 100.0 * depth_prop             # 0..100
 
-    # ---------- S3: Dispersion “health” ----------
-    # We want not-too-blanket, not-chaos. Target MAD ≈ 1.0 (of PI), taper to 0 at 0 or 2.0
-    deltas = (pi - float(np.nanmedian(pi)))
-    mad = mad_std(deltas)               # robust MAD→σ
-    if not np.isfinite(mad): mad = 1.0
-    S3 = 100.0 * max(0.0, 1.0 - abs(mad - 1.0) / 1.0)   # peak at 1.0; 0 at 0 or 2.0
+    # --- S3: Dispersion “health” (use RAW MAD, not mad_std) ---
+    center = float(np.nanmedian(pi))
+    mad_raw = float(np.nanmedian(np.abs(pi - center)))  # <-- raw MAD (no 1.4826)
+    if not np.isfinite(mad_raw): mad_raw = 1.2
+    # peak at 1.2; falls linearly to 0 at 0 or 2.4
+    S3 = 100.0 * max(0.0, 1.0 - abs(mad_raw - 1.2) / 1.2)
 
     # ---------- field-size trust (multiplier 0.85..1.15) ----------
     n = int(len(df.index))
