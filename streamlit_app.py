@@ -753,149 +753,118 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         gci_vals.append(round(10.0 * (wT*T + wPACE*LQ + wSS*SS + wEFF*EFF), 3))
     w["GCI"] = gci_vals
 
-    # ----- EARLY/LATE (blended) -----
-    w["EARLY_idx"] = (0.65*pd.to_numeric(w["F200_idx"], errors="coerce") +
-                      0.35*pd.to_numeric(w["tsSPI"],    errors="coerce"))
-    w["LATE_idx"]  = (0.60*pd.to_numeric(w["Accel"],    errors="coerce") +
-                      0.40*pd.to_numeric(w[GR_COL],      errors="coerce"))
+    # ----- EARLY/LATE (blended, for display only) -----
+w["EARLY_idx"] = (0.65*pd.to_numeric(w["F200_idx"], errors="coerce") +
+                  0.35*pd.to_numeric(w["tsSPI"],    errors="coerce"))
+w["LATE_idx"]  = (0.60*pd.to_numeric(w["Accel"],    errors="coerce") +
+                  0.40*pd.to_numeric(w[GR_COL],      errors="coerce"))
 
-    # ----- Race Shape (ΔLM core) + FRA -----
-    w["PI_RS"]  = pd.to_numeric(w["PI"],  errors="coerce").astype(float)
-    w["GCI_RS"] = pd.to_numeric(w["GCI"], errors="coerce").astype(float)
+# ----- Race Shape (tsSPI vs Accel everywhere) + FRA ------------------------
+# Always start with RS copies so downstream code is safe
+w["PI_RS"]  = pd.to_numeric(w["PI"],  errors="coerce").astype(float)
+w["GCI_RS"] = pd.to_numeric(w["GCI"], errors="coerce").astype(float)
 
-    shape_tag   = "EVEN"
-    finish_flav = "Balanced Finish"
-    fra_applied = 0
-    sci         = 0.0
-    rsi         = 0.0
+shape_tag   = "EVEN"
+finish_flav = "Balanced Finish"
+fra_applied = 0
+sci         = 0.0
+rsi         = 0.0
 
-    if use_race_shape:
-        acc = pd.to_numeric(w["Accel"],  errors="coerce")
-        mid = pd.to_numeric(w["tsSPI"],  errors="coerce")
-        grd = pd.to_numeric(w[GR_COL],   errors="coerce")
+if use_race_shape:
+    acc = pd.to_numeric(w["Accel"],  errors="coerce")
+    mid = pd.to_numeric(w["tsSPI"],  errors="coerce")
+    grd = pd.to_numeric(w[GR_COL],   errors="coerce")
 
-        dLM = ((acc + grd)/2.0) - mid
-        dLG = grd - acc
+    # --- Core driver: Accel vs tsSPI (all trips)
+    dLM = acc - mid                       # +ve = slow early (soft mid, big late kick)
+    dLG = grd - acc                       # finish flavour only
 
-        def _mad(s):
-            v = mad_std(pd.to_numeric(s, errors="coerce"))
-            return 0.0 if (not np.isfinite(v)) else float(v)
+    # --- Robust gates from dispersion; scale slightly with trip length
+    def _mad(s):
+        v = mad_std(pd.to_numeric(s, errors="coerce"))
+        return 0.0 if (not np.isfinite(v)) else float(v)
 
-        gLM = max(2.0, 0.6 * _mad(dLM))
-        gLG = max(1.6, 0.6 * _mad(dLG))
-        if   D <= 1200: scale = 1.00
-        elif D <  1800: scale = 1.08
-        else:           scale = 1.15
-        gLM *= scale; gLG *= scale
+    gLM = max(1.8, 0.60 * _mad(dLM))      # base gate for early/late call
+    if   D <= 1200: scale = 1.00
+    elif D <  1600: scale = 1.05
+    elif D <  2000: scale = 1.10
+    else:           scale = 1.12
+    gLM *= scale
 
-        med_dLM = float(pd.to_numeric(dLM, errors="coerce").median(skipna=True))
-        med_dLG = float(pd.to_numeric(dLG, errors="coerce").median(skipna=True))
+    gLG = max(1.6, 0.60 * _mad(dLG))      # gate for finish flavour only
 
-        sgn_med = 0 if med_dLM == 0 else (1 if med_dLM > 0 else -1)
-        if sgn_med == 0:
-            sci2 = 0.0
-        else:
-            same = np.sign(pd.to_numeric(dLM, errors="coerce").dropna().to_numpy())
-            sci2 = float((same == sgn_med).mean()) if same.size else 0.0
+    # --- Field medians & SCI (consensus on dLM sign)
+    med_dLM = float(pd.to_numeric(dLM, errors="coerce").median(skipna=True))
+    sgn_med = 0 if med_dLM == 0 else (1 if med_dLM > 0 else -1)
+    if sgn_med == 0:
+        sci2 = 0.0
+    else:
+        same = np.sign(pd.to_numeric(dLM, errors="coerce").dropna().to_numpy())
+        sci2 = float((same == sgn_med).mean()) if same.size else 0.0
 
-        # --- graduated mid-lull helper (1400m+) ---
-        sci_gate_slow = 0.55
-        if D >= 1400:
-            mid_med  = float(pd.to_numeric(mid, errors="coerce").median(skipna=True))
-            late_med = float(((pd.to_numeric(acc, errors="coerce") +
-                               pd.to_numeric(grd, errors="coerce")) / 2.0).median(skipna=True))
-            lull_gap = late_med - mid_med
-            if D >= 2000:      m1, m2, sci_gate_slow = 0.90, 0.85, 0.53
-            elif D >= 1800:    m1, m2, sci_gate_slow = 0.92, 0.88, 0.535
-            elif D >= 1600:    m1, m2, sci_gate_slow = 0.95, 0.92, 0.540
-            else:              m1, m2, sci_gate_slow = 0.97, 0.94, 0.545
-            if np.isfinite(lull_gap):
-                if lull_gap >= 1.2:   gLM *= m2
-                elif lull_gap >= 0.8: gLM *= m1
+    # --- Distance-aware SCI requirement for SLOW_EARLY (slightly easier as trip grows)
+    if   D >= 2000: sci_gate_slow = 0.53
+    elif D >= 1800: sci_gate_slow = 0.535
+    elif D >= 1600: sci_gate_slow = 0.540
+    elif D >= 1400: sci_gate_slow = 0.545
+    else:           sci_gate_slow = 0.55
 
-        # --- Sprint helper (≤1200 m) — emphasise Accel and ease slow gate slightly
-        use_sprint_rule = False
-        if D <= 1200:
-            # Early-vs-mid driver for sprints: weight Accel more than Grind
-            dLM_sprint = (0.75*acc + 0.25*grd) - mid
+    # --- Select tag using ONLY dLM (acc - mid)
+    if med_dLM >= +gLM and sci2 >= sci_gate_slow:
+        shape_tag = "SLOW_EARLY"
+    elif med_dLM <= -gLM and sci2 >= 0.55:
+        shape_tag = "FAST_EARLY"
+    else:
+        shape_tag = "EVEN"
 
-        # Gate derived from dispersion, but a touch easier than the generic gate
-        gLM_sprint = max(1.6, 0.5 * _mad(dLM_sprint))
+    # --- Finish flavour from Grind vs Accel (informational)
+    if   (grd - acc).median(skipna=True) >= +gLG: finish_flav = "Attritional Finish"
+    elif (grd - acc).median(skipna=True) <= -gLG: finish_flav = "Sprint Finish"
+    else:                                        finish_flav = "Balanced Finish"
 
-        # --- micro-boost for pure sprints (1000–1200 m) on clear V-shapes
-        # If the mid is clearly under par AND the late kick is strong, relax the gate a little.
-        gLM_sprint_eff = gLM_sprint * 0.90  # 10% easier than before
+    # --- RSI: “how shaped” 0..10 from |median dLM| × SCI
+    shape_mag = abs(med_dLM) * sci2
+    if   shape_mag < 3.0: rsi = 2.0 + shape_mag            # ~0..6
+    elif shape_mag < 5.0: rsi = 6.0 + 1.5*(shape_mag-3.0)  # 6..9
+    elif shape_mag < 6.0: rsi = 9.0 + (shape_mag-5.0)      # 9..10
+    else:                 rsi = 10.0
+    rsi = float(clamp(rsi, 0.0, 10.0))
+    sci = float(clamp(sci2, 0.0, 1.0))
 
-        # sanity guards to avoid mis-labelling genuine fast runs as slow-early
-        mid_under_med = (pd.to_numeric(mid, errors="coerce")
-                         <= pd.to_numeric(mid, errors="coerce").median(skipna=True) - 0.3)
+    # --- FRA strength: mild, scaled by RSI (stronger shape → stronger adj)
+    strength = float(clamp(0.05 + 0.015 * rsi, 0.05, 0.20))   # ≈ 5%..20%
 
-        # allow a hotter break than before; still require the late kick to dominate
-        f_not_hot = (pd.to_numeric(w["F200_idx"], errors="coerce")
-                     <= pd.to_numeric(acc, errors="coerce") + 0.8)
+    # --- Apply FRA using ONLY acc-mid for SLOW_EARLY; sturdiness for FAST_EARLY
+    if shape_tag == "SLOW_EARLY":
+        # Penalise pure kick that comes from a soft middle
+        kicker_excess = (acc - mid).clip(lower=0.0).fillna(0.0)
+        adj_pi  = (strength * (kicker_excess / 6.0)).clip(upper=0.60)
+        adj_gci = 0.80 * adj_pi
+        w["PI_RS"]  = (w["PI"]  - adj_pi).clip(0.0, 10.0)
+        w["GCI_RS"] = (w["GCI"] - adj_gci).clip(0.0, 10.0)
+        fra_applied = 1
 
-        med_dLM_sprint = float(pd.to_numeric(dLM_sprint, errors="coerce").median(skipna=True))
+    elif shape_tag == "FAST_EARLY":
+        # Reward sturdiness late (uses Grind only for finish toughness bonus)
+        sturdiness = ((grd - acc) + (grd - mid)/2.0).clip(lower=0.0).fillna(0.0)
+        bonus_pi  = (strength * (sturdiness / 6.0)).clip(upper=0.60)
+        bonus_gci = 0.80 * bonus_pi
+        w["PI_RS"]  = (w["PI"]  + bonus_pi).clip(0.0, 10.0)
+        w["GCI_RS"] = (w["GCI"] + bonus_gci).clip(0.0, 10.0)
+        fra_applied = 1
+# -------------------------------------------------------------------------
 
-        use_sprint_rule = (
-            np.isfinite(med_dLM_sprint)
-            and med_dLM_sprint >= gLM_sprint_eff
-            and float(mid_under_med.mean()) >= 0.45   # was 0.50
-            and float(f_not_hot.mean())     >= 0.40   # was 0.50 and +0.4 margin
-        )
+# ----- Final rounding & attrs -----
+for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
+          "PI","PI_RS","GCI","GCI_RS","RaceTime_s"]:
+    if c in w.columns:
+        w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
 
-        if (use_sprint_rule and D <= 1200) or (med_dLM >= +gLM and sci2 >= sci_gate_slow):
-            shape_tag = "SLOW_EARLY"
-        elif med_dLM <= -gLM and sci2 >= 0.55:
-            shape_tag = "FAST_EARLY"
-        else:
-            shape_tag = "EVEN"
-
-        if   med_dLG >= +gLG: finish_flav = "Attritional Finish"
-        elif med_dLG <= -gLG: finish_flav = "Sprint Finish"
-        else:                 finish_flav = "Balanced Finish"
-
-        shape_mag = abs(med_dLM) * sci2
-        if   shape_mag < 3.0: rsi = 2.0 + shape_mag
-        elif shape_mag < 5.0: rsi = 6.0 + 1.5*(shape_mag-3.0)
-        elif shape_mag < 6.0: rsi = 9.0 + (shape_mag-5.0)
-        else:                 rsi = 10.0
-        rsi = float(clamp(rsi, 0.0, 10.0))
-        sci = float(clamp(sci2, 0.0, 1.0))
-
-        strength = float(clamp(0.05 + 0.015 * rsi, 0.05, 0.20))
-
-        if shape_tag == "SLOW_EARLY":
-            kicker_excess = (acc - mid).clip(lower=0.0).fillna(0.0)
-            adj_pi  = (strength * (kicker_excess / 6.0)).clip(upper=0.60)
-            adj_gci = 0.80 * adj_pi
-            w["PI_RS"]  = (w["PI"]  - adj_pi).clip(0.0, 10.0)
-            w["GCI_RS"] = (w["GCI"] - adj_gci).clip(0.0, 10.0)
-            fra_applied = 1
-        elif shape_tag == "FAST_EARLY":
-            sturdiness = ((grd - acc) + (grd - mid)/2.0).clip(lower=0.0).fillna(0.0)
-            bonus_pi  = (strength * (sturdiness / 6.0)).clip(upper=0.60)
-            bonus_gci = 0.80 * bonus_pi
-            w["PI_RS"]  = (w["PI"]  + bonus_pi).clip(0.0, 10.0)
-            w["GCI_RS"] = (w["GCI"] + bonus_gci).clip(0.0, 10.0)
-            fra_applied = 1
-
-    # ----- Final rounding & attrs -----
-    for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
-              "PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
-        if c in w.columns:
-            w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
-
-    w.attrs["SHAPE_TAG"]   = shape_tag
-    w.attrs["FINISH_FLAV"] = finish_flav
-    w.attrs["SCI"]         = float(sci)
-    w.attrs["RSI"]         = float(0.0 if shape_tag=="EVEN" else rsi)
-    w.attrs["FRA_APPLIED"] = int(fra_applied)
-    w.attrs["GR_COL"]      = GR_COL
-    w.attrs["STEP"]        = step
-    w.attrs["FSR"]         = float(FSR)
-    w.attrs["CollapseSeverity"] = float(CollapseSeverity)
-
-    return w, seg_markers
+w.attrs["SHAPE_TAG"]   = shape_tag
+w.attrs["FINISH_FLAV"] = finish_flav
+w.attrs["SCI"]         = float(sci)
+w.attrs["RSI"]         = float(0.0 if shape_tag=="EVEN" else rsi)
+w.attrs["FRA_APPLIED"] = int(fra_applied)
 
 
 # ---- Compute metrics + race shape now ----
