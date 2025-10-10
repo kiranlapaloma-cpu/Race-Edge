@@ -759,7 +759,7 @@ w["EARLY_idx"] = (0.65*pd.to_numeric(w["F200_idx"], errors="coerce") +
 w["LATE_idx"]  = (0.60*pd.to_numeric(w["Accel"],    errors="coerce") +
                   0.40*pd.to_numeric(w[GR_COL],      errors="coerce"))
 
-# ----- Race Shape (tsSPI vs Accel everywhere) + FRA ------------------------
+    # ----- Race Shape (tsSPI vs Accel everywhere) + FRA ------------------------
 # Always start with RS copies so downstream code is safe
 w["PI_RS"]  = pd.to_numeric(w["PI"],  errors="coerce").astype(float)
 w["GCI_RS"] = pd.to_numeric(w["GCI"], errors="coerce").astype(float)
