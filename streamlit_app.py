@@ -898,7 +898,7 @@ w.attrs["SCI"]           = float(sci)
 w.attrs["RSI"]           = float(0.0 if shape_tag=="EVEN" else rsi)
 w.attrs["FRA_APPLIED"]   = int(fra_applied)
 
-    return w, seg_markers
+return w, seg_markers
 
 
 # ---- Compute metrics + race shape now ----
