@@ -757,105 +757,70 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["LATE_idx"]  = (0.60*pd.to_numeric(w["Accel"],    errors="coerce") +
                       0.40*pd.to_numeric(w[GR_COL],      errors="coerce"))
 
-    # ----- Race Shape + FRA (tsSPI vs Accel/Grind) -----
-    # Definitions:
-    # ΔLM = ((Accel + GR)/2) - tsSPI    → +ve = built late (slow early / sprint home)
-    # ΔLG = GR - Accel                  → +ve = attritional finish; -ve = sprint finish
-    shape_tag = "EVEN"; finish_flavour = "Balanced Finish"; fra_applied = 0
-    sci2 = 1.0; rsi = 0.0
-
-    # Always provide PI_RS/GCI_RS (copy) so downstream code stays happy
-    w["PI_RS"]  = w["PI"].astype(float)
-    w["GCI_RS"] = w["GCI"].astype(float)
+    # ----- Race Shape + FRA -----
+    shape_tag = "EVEN"; fra_applied = 0; sci = 1.0
 
     if use_race_shape:
-        acc  = pd.to_numeric(w["Accel"],    errors="coerce")
-        mid  = pd.to_numeric(w["tsSPI"],    errors="coerce")
-        grd  = pd.to_numeric(w[GR_COL],     errors="coerce")
+        E_med = float(pd.to_numeric(w["EARLY_idx"], errors="coerce").median(skipna=True))
+        M_med = float(pd.to_numeric(w["tsSPI"],     errors="coerce").median(skipna=True))
+        L_med = float(pd.to_numeric(w["LATE_idx"],  errors="coerce").median(skipna=True))
+        dE, dM, dL = E_med-100.0, M_med-100.0, L_med-100.0
 
-        dLM  = ((acc + grd)/2.0) - mid
-        dLG  = grd - acc
+        def _gate(series, base=2.2):
+            z = pd.to_numeric(series, errors="coerce") - 100.0
+            s = mad_std(z); s = 2.0 if (not np.isfinite(s) or s <= 0) else s
+            return max(base, 0.6*s)
 
-        # Robust gates from dispersion; scale with trip length a touch
-        def _mad(s):
-            v = mad_std(pd.to_numeric(s, errors="coerce"))
-            return 0.0 if (not np.isfinite(v)) else float(v)
-
-        gLM = max(2.0, 0.6 * _mad(dLM))
-        gLG = max(1.6, 0.6 * _mad(dLG))
+        gE = _gate(w["EARLY_idx"]); gL = _gate(w["LATE_idx"])
         if   D <= 1200: scale = 1.00
-        elif D <  1800: scale = 1.08
-        else:           scale = 1.15
-        gLM *= scale; gLG *= scale
+        elif D <  1800: scale = 1.10
+        else:           scale = 1.20
+        gE *= scale; gL *= scale
 
-        # Field medians
-        med_dLM = float(pd.to_numeric(dLM, errors="coerce").median(skipna=True))
-        med_dLG = float(pd.to_numeric(dLG, errors="coerce").median(skipna=True))
+        delta_EL = pd.to_numeric(w["LATE_idx"], errors="coerce") - pd.to_numeric(w["EARLY_idx"], errors="coerce")
+        sci_plus  = float((delta_EL >  +1.0).mean()) if delta_EL.notna().any() else np.nan
+        sci_minus = float((delta_EL <  -1.0).mean()) if delta_EL.notna().any() else np.nan
 
-        # Agreement (% runners with the same sign as med_dLM)
-        sgn_med = 0 if med_dLM == 0 else (1 if med_dLM > 0 else -1)
-        if sgn_med == 0:
-            sci2 = 0.0
-        else:
-            same = np.sign(pd.to_numeric(dLM, errors="coerce").dropna().to_numpy())
-            sci2 = float((same == sgn_med).mean()) if same.size else 0.0
+        confirm_slow = (FSR >= 1.03)
+        confirm_fast = (FSR <= 0.97)
 
-        # Base tag (built late vs spent early)
-        if med_dLM >= +gLM and sci2 >= 0.55:
+        slow_early = (dE <= -gE) and (dL >= +gL) and ((dL - dE) >= 3.5) \
+                     and (sci_plus  >= 0.55 if np.isfinite(sci_plus)  else True) \
+                     and (99.0 <= M_med <= 101.8)
+        fast_early = (dE >= +gE) and (dL <= -gL) and ((dE - dL) >= 3.5) \
+                     and (sci_minus >= 0.55 if np.isfinite(sci_minus) else True) \
+                     and (98.2 <= M_med <= 101.8)
+
+        if slow_early and (confirm_slow or sci_plus >= 0.65):
             shape_tag = "SLOW_EARLY"
-        elif med_dLM <= -gLM and sci2 >= 0.55:
+            sci = float(sci_plus if np.isfinite(sci_plus) else 1.0)
+        elif fast_early and (confirm_fast or sci_minus >= 0.65):
             shape_tag = "FAST_EARLY"
+            sci = float(sci_minus if np.isfinite(sci_minus) else 1.0)
         else:
             shape_tag = "EVEN"
+            sci = float((delta_EL.abs() <= 1.5).mean()) if delta_EL.notna().any() else 1.0
 
-        # Finish flavour
-        if   med_dLG >= +gLG: finish_flavour = "Attritional Finish"
-        elif med_dLG <= -gLG: finish_flavour = "Sprint Finish"
-        else:                 finish_flavour = "Balanced Finish"
-
-        # RSI: how “shaped” the race was (0..10)
-        # Build a simple piecewise map s.t. |med_dLM|*SCI drives it:
-        shape_mag = abs(med_dLM) * sci2
-        if shape_mag <= 3.0:
-            rsi = 2.0 * shape_mag                    # 0..6
-        elif shape_mag <= 5.0:
-            rsi = 6.0 + 1.5 * (shape_mag - 3.0)      # 6..9
-        elif shape_mag <= 6.0:
-            rsi = 9.0 + (shape_mag - 5.0)            # 9..10
-        else:
-            rsi = 10.0
-        rsi = float(clamp(rsi, 0.0, 10.0))
-
-        # FRA (mild, transparent), scaled by RSI (stronger shape ⇒ stronger adjustment)
-        strength = 0.05 + 0.015 * rsi   # 0.05..0.20 roughly
-        strength = float(clamp(strength, 0.05, 0.20))
-
-        if shape_tag == "SLOW_EARLY":
-            # Kicker-flattered get a tiny trim; steady/attritional protected
-            kicker_excess = (acc - mid).clip(lower=0.0).fillna(0.0)          # how much turn-of-foot > cruise
-            adj_pi  = (strength * (kicker_excess / 6.0)).clip(upper=0.60)    # cap per-horse effect
-            adj_gci = 0.80 * adj_pi
-
-            w["PI_RS"]  = (w["PI"]  - adj_pi).clip(0.0, 10.0)
-            w["GCI_RS"] = (w["GCI"] - adj_gci).clip(0.0, 10.0)
+        # FRA (mild)
+        w["PI_RS"]  = w["PI"].astype(float)
+        w["GCI_RS"] = w["GCI"].astype(float)
+        if (shape_tag == "SLOW_EARLY") and (sci >= 0.60):
+            f = 0.12 + 0.08*(sci-0.60)/0.40
+            late_excess = ((pd.to_numeric(w["LATE_idx"], errors="coerce") - 100.0).clip(lower=0.0, upper=8.0)).fillna(0.0)
+            w["PI_RS"]  = (w["PI"]  - f*(late_excess/4.0)).clip(0.0, 10.0)
+            w["GCI_RS"] = (w["GCI"] - f*(late_excess/3.0)).clip(0.0, 10.0)
             fra_applied = 1
-
-        elif shape_tag == "FAST_EARLY":
-            # Sturdiness rewarded (Grind over Accel), with some mid support
-            sturdiness = ((grd - acc) + (grd - mid)/2.0).clip(lower=0.0).fillna(0.0)
-            bonus_pi  = (strength * (sturdiness / 6.0)).clip(upper=0.60)
-            bonus_gci = 0.80 * bonus_pi
-
-            w["PI_RS"]  = (w["PI"]  + bonus_pi).clip(0.0, 10.0)
-            w["GCI_RS"] = (w["GCI"] + bonus_gci).clip(0.0, 10.0)
+        elif (shape_tag == "FAST_EARLY") and (sci >= 0.60):
+            f2 = 0.10 + 0.05*(sci-0.60)/0.40
+            sturdiness = ((pd.to_numeric(w[GR_COL], errors="coerce") - 100.0) -
+                          (100.0 - pd.to_numeric(w["Accel"], errors="coerce")).clip(lower=0.0)
+                         ).clip(lower=0.0, upper=6.0).fillna(0.0)
+            w["PI_RS"]  = (w["PI"]  + f2*(sturdiness/4.0)).clip(0.0, 10.0)
+            w["GCI_RS"] = (w["GCI"] + f2*(sturdiness/3.0)).clip(0.0, 10.0)
             fra_applied = 1
-
-    # Save attrs
-    w.attrs["SHAPE_TAG"]   = shape_tag
-    w.attrs["FINISH_FLAV"] = finish_flavour
-    w.attrs["SCI"]         = float(clamp(sci2, 0.0, 1.0))
-    w.attrs["RSI"]         = float(rsi)
-    w.attrs["FRA_APPLIED"] = int(fra_applied)
+    else:
+        w["PI_RS"]  = w["PI"].astype(float)
+        w["GCI_RS"] = w["GCI"].astype(float)
 
     # ----- Final rounding & attrs -----
     for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
@@ -1094,14 +1059,13 @@ def _integrity_scan(df: pd.DataFrame, distance_m: float, step: int):
 integrity_text, missing_cols, invalid_counts = _integrity_scan(work, race_distance_input, split_step)
 
 # ======================= Header with RQS + RPS + Badge =======================
-st.markdown(
-    f"## Race Distance: **{int(race_distance_input)}m**  |  Split: **{split_step}m**  "
-    f"|  Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')} • {metrics.attrs.get('FINISH_FLAV','Balanced Finish')}**  "
-    f"|  RSI: **{metrics.attrs.get('RSI',0.0):.1f}**  "
-    f"|  SCI: **{metrics.attrs.get('SCI',1.0):.2f}**  "
-    f"|  FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
+_hdr = (
+    f"## Race Distance: **{int(race_distance_input)}m**  |  "
+    f"Split step: **{split_step}m**  |  "
+    f"Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  |  "
+    f"SCI: **{metrics.attrs.get('SCI',1.0):.2f}**  |  "
+    f"FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
 )
-
 rqs_v = metrics.attrs.get("RQS", None)
 rps_v = metrics.attrs.get("RPS", None)
 if rqs_v is not None:
@@ -1142,61 +1106,6 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
     if warn: st.markdown(f"*(⚠ {' • '.join(warn)})*")
 if split_step == 200:
     st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
-
-# ======================= Top 5 Standout Performers (RPS detail) =======================
-def _pi_series(df):
-    s = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
-    return s
-
-def _trust_from_field(n):
-    # 0 at n<=6 → 1 at n>=12
-    return float(max(0.0, min(1.0, (n - 6) / 6.0)))
-
-def _badge_for(pi_rs, ds):
-    pi = float(pi_rs) if pd.notna(pi_rs) else -1e9
-    ds = float(ds) if pd.notna(ds) else -1e9
-    if (pi >= 8.6) and (ds >= 1.2): return "⭐ Elite Performer"
-    if (pi >= 7.6) and (ds >= 0.8): return "🔶 Standout Performer"
-    if (pi >= 6.8) and (ds >= 0.5): return "🔹 Notable Performer"
-    return ""
-
-_pi = _pi_series(metrics)
-p90 = float(np.nanpercentile(_pi.dropna(), 90)) if _pi.notna().any() else np.nan
-trust = _trust_from_field(len(metrics))
-
-# Rank by PI_RS (fallback PI) and compute ΔNext/ΔPack/DS for top 5 only
-ranked = metrics.assign(_PI=_pi).sort_values("_PI", ascending=False).reset_index(drop=True)
-k = min(5, len(ranked))
-delta_next = []
-for i in range(k):
-    cur = ranked.loc[i, "_PI"]
-    nxt = ranked.loc[i+1, "_PI"] if (i+1) < len(ranked) else np.nan
-    dn = float(cur - nxt) if (pd.notna(cur) and pd.notna(nxt)) else 0.0
-    delta_next.append(dn)
-
-top5 = ranked.head(k).copy()
-top5["DeltaNext"] = delta_next
-top5["DeltaPack"] = (top5["_PI"] - p90) if np.isfinite(p90) else np.nan
-# Dominance Score: (0.6·ΔPack/1.5 + 0.4·ΔNext/1.0) × trust
-top5["DS"] = (0.6 * (top5["DeltaPack"] / 1.5).clip(lower=0.0) +
-              0.4 * (top5["DeltaNext"] / 1.0).clip(lower=0.0)) * trust
-top5["PerfBadge"] = [_badge_for(pi, ds) for pi, ds in zip(top5["_PI"], top5["DS"])]
-
-# Push summary columns back into `metrics` (others become NaN for non-top5)
-for col in ["DeltaNext","DeltaPack","DS","PerfBadge"]:
-    metrics[col] = np.nan
-    metrics.loc[metrics["Horse"].isin(top5["Horse"]), col] = top5.set_index("Horse")[col]
-metrics["Top5Flag"] = metrics["PerfBadge"].notna() & (metrics["PerfBadge"].astype(str) != "")
-
-# ---------- UI: table ----------
-st.markdown("## Top 5 Standout Performers — dominance within this race")
-if top5.empty or top5["_PI"].isna().all():
-    st.info("Insufficient PI data to identify standout performers.")
-else:
-    top5_view = (top5[["Horse","_PI","DeltaNext","DeltaPack","DS","PerfBadge"]]
-                 .rename(columns={"_PI":"PI_RS"})
-                 .round({"PI_RS":2,"DeltaNext":2,"DeltaPack":2,"DS":2}))
-    st.dataframe(top5_view, use_container_width=True)
 
 # ======================= Sectional Metrics table =====================
 st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
