@@ -1889,19 +1889,24 @@ def _export_pdf_report(*,
     step= metrics.attrs.get("STEP", None)
     cg  = "ON" if USE_CG else "OFF"
     cg_line = f"CG: {cg}"
-    if fsr is not None:
-        cg_line += f" · FSR={float(fsr):.3f}"
-    if cs is not None:
-        cg_line += f" · CollapseSeverity={float(cs):.1f} pts"
-    if step is not None:
-        cg_line += f" · Splits: {int(step)} m"
-    rqs_val = metrics.attrs.get("RQS", None)
-    if rqs_val is not None:
-        cg_line += f" · RQS={float(rqs_val):.1f}/100"
-    if going_pdf:
-        cg_line += f" · Going: {going_pdf}"
-    story.append(Paragraph(cg_line, styles["Normal"]))
-    story.append(Spacer(0, 6))
+    # RQS / RPS / Profile in the PDF header
+    rqs_pdf = metrics.attrs.get("RQS", None)
+    rps_pdf = metrics.attrs.get("RPS", None)
+    prof_pdf = metrics.attrs.get("RACE_PROFILE", "")
+    line_bits = []
+    if rqs_pdf is not None:
+        line_bits.append(f"RQS: {float(rqs_pdf):.1f}/100")
+    if rps_pdf is not None:
+        line_bits.append(f"RPS: {float(rps_pdf):.1f}/100")
+    if prof_pdf:
+        line_bits.append(prof_pdf)
+    if line_bits:
+        story.append(Paragraph(" · ".join(line_bits), styles["Normal"]))
+        story.append(Paragraph(
+            "RQS = field depth/consistency; RPS = peak performance; Profile = depth vs dominance.",
+            styles["Italic"]
+        ))
+        story.append(Spacer(0, 6))
 
     # Sectional Metrics table (safe cast to string)
     story.append(Paragraph("Sectional Metrics", styles["Heading3"]))
@@ -1987,8 +1992,8 @@ def _save_current_race_to_db(db_path: str,
     fsr_val     = float(metrics.attrs.get("FSR", 1.0))
     collapse_pt = float(metrics.attrs.get("CollapseSeverity", 0.0))
     rsbi_val    = float(metrics.attrs.get("RSBI", np.nan)) if hasattr(metrics, "attrs") else np.nan
-    rsp_val     = float(metrics.attrs.get("RSP",  np.nan)) if hasattr(metrics, "attrs") else np.nan
-
+    rsp_val     = float(metrics.attrs.get("RPS",  np.nan))  # <-- use RPS here
+   
     use_cg_val  = 1 if USE_CG else 0
     dampen_val  = 1 if DAMPEN_CG else 0
     use_shape_val = 1 if ('USE_SHAPE' in globals() and USE_SHAPE) else 0
