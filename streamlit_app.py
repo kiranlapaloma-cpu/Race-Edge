@@ -920,45 +920,50 @@ def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
 # Compute once and store into attrs (used by header / PDF / DB)
 metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
 
-# ----------------------- Race Peak Strength (RPS) + Race Profile -----------------------
 def compute_rps(df: pd.DataFrame) -> float:
     """
-    RPS (0..100): peak performance in this race.
-    By default uses p95(PI_RS) to avoid single outliers.
-    Falls back to max(PI_RS) when the field is tiny (<5 valid).
+    RPS (0..100): star-aware peak strength.
+    Blends p95(PI_RS) with the true peak based on dominance and field-size trust.
     """
     if df is None or len(df) == 0:
         return 0.0
+
     pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce").dropna()
-    if pi.size == 0:
+    n = int(pi.size)
+    if n == 0:
         return 0.0
-    peak = float(np.nanmax(pi)) if pi.size < 5 else float(np.nanpercentile(pi, 95))
-    return float(np.clip(round(10.0 * peak, 1), 0.0, 100.0))
 
-def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
-    """
-    Return (label, color_hex) for the badge.
-    - 🔴 Top-Heavy  when RPS - RQS ≥ 18
-    - 🟢 Deep Field when RQS ≥ RPS - 10
-    - ⚪ Average Profile otherwise
-    """
-    if not (math.isfinite(rqs) and math.isfinite(rps)):
-        return ("Unknown", "#7f8c8d")
-    delta = rps - rqs
-    if delta >= 18.0:
-        return ("🔴 Top-Heavy", "#e74c3c")
-    elif rqs >= (rps - 10.0):
-        return ("🟢 Deep Field", "#2ecc71")
+    p95 = float(np.nanpercentile(pi, 95)) if n >= 5 else float(np.nanmax(pi))
+    p90 = float(np.nanpercentile(pi, 90)) if n >= 4 else p95
+    pmax = float(np.nanmax(pi))
+    # second-best (for Gap2)
+    if n >= 2:
+        top2 = np.partition(pi.values, -2)[-2]
     else:
-        return ("⚪ Average Profile", "#95a5a6")
+        top2 = p90
 
-metrics.attrs["RPS"] = compute_rps(metrics)
-_profile_label, _profile_color = classify_race_profile(
-    float(metrics.attrs.get("RQS", np.nan)),
-    float(metrics.attrs.get("RPS", np.nan))
-)
-metrics.attrs["RACE_PROFILE"] = _profile_label
-metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
+    # Dominance signals (in PI points, not ×10)
+    gap_top = max(0.0, pmax - p90)       # how far top is beyond the elite band
+    gap_2   = max(0.0, pmax - float(top2))  # separation to 2nd
+
+    # Field-size trust: 0 at ≤6; 1 at ≥12 (same shape as you used elsewhere)
+    trust = max(0.0, min(1.0, (n - 6) / 6.0))
+
+    # Turn dominance into [0..1] via a smooth ramp that saturates ~3pts
+    # (≈ 3 PI points above the pack is huge)
+    def smooth_saturate(x, mid=1.8, span=1.2):
+        # 0 at x=0; ~0.5 at mid; →1 near mid+span (~3.0)
+        return max(0.0, min(1.0, (x / (mid + span))))
+
+    dom = max(smooth_saturate(gap_top), smooth_saturate(gap_2))
+
+    # Final blend weight toward the max:
+    # base 0.30 (slight pull to max), + up to +0.40 from dominance*trust
+    w_star = 0.30 + 0.40 * dom * trust
+    w_star = max(0.0, min(0.95, w_star))  # safety clamp
+
+    rps_pi = (1.0 - w_star) * p95 + w_star * pmax
+    return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
 
 # ======================= Data Integrity & Header (post compute) ==========================
 def _expected_segments(distance_m: float, step:int) -> list[str]:
