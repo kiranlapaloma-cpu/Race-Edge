@@ -1011,6 +1011,31 @@ def compute_rps(df: pd.DataFrame) -> float:
     rps_pi = (1.0 - w_star) * p95 + w_star * pmax
     return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
 
+def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
+    """
+    Return (label, color_hex) for the badge.
+    - 🔴 Top-Heavy  when RPS - RQS ≥ 18
+    - 🟢 Deep Field when RQS ≥ RPS - 10
+    - ⚪ Average Profile otherwise
+    """
+    if not (math.isfinite(rqs) and math.isfinite(rps)):
+        return ("Unknown", "#7f8c8d")
+    delta = rps - rqs
+    if delta >= 18.0:
+        return ("🔴 Top-Heavy", "#e74c3c")
+    elif rqs >= (rps - 10.0):
+        return ("🟢 Deep Field", "#2ecc71")
+    else:
+        return ("⚪ Average Profile", "#95a5a6")
+
+metrics.attrs["RPS"] = compute_rps(metrics)
+_profile_label, _profile_color = classify_race_profile(
+    float(metrics.attrs.get("RQS", np.nan)),
+    float(metrics.attrs.get("RPS", np.nan))
+)
+metrics.attrs["RACE_PROFILE"] = _profile_label
+metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
+
 # ======================= Data Integrity & Header (post compute) ==========================
 def _expected_segments(distance_m: float, step:int) -> list[str]:
     cols = [f"{m}_Time" for m in range(int(distance_m)-step, step-1, -step)]
