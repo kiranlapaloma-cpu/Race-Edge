@@ -686,6 +686,19 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         field_n=len(w),
         return_meta=True
     )
+    # ------------------- Compute RQS / RPS & store -------------------
+metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
+metrics.attrs["RPS"] = compute_rps(metrics)
+
+_profile_label, _profile_color = classify_race_profile(
+    float(metrics.attrs.get("RQS", np.nan)),
+    float(metrics.attrs.get("RPS", np.nan))
+)
+
+metrics.attrs["RACE_PROFILE"] = _profile_label
+metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
+
+
 
     # Store for captions/DB/PDF
     w.attrs["GOING"] = going_for_pi
@@ -1016,6 +1029,81 @@ _profile_label, _profile_color = classify_race_profile(
 )
 metrics.attrs["RACE_PROFILE"] = _profile_label
 metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
+
+# ===============================================================
+# Race Quality & Peak Strength (RQS + RPS + Race Profile)
+# ===============================================================
+
+import math
+import numpy as np
+import pandas as pd
+
+def _safe_med(s):
+    s = pd.to_numeric(s, errors="coerce")
+    return float(np.nanmedian(s)) if s.notna().any() else np.nan
+
+def _prop_ge(s, thr):
+    s = pd.to_numeric(s, errors="coerce")
+    if not s.notna().any():
+        return 0.0
+    return float((s >= thr).mean())
+
+# ----------------- Race Quality Score (RQS v2) -----------------
+def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
+    if df is None or len(df) == 0:
+        return 0.0
+    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
+    gci = pd.to_numeric(df.get("GCI_RS", df.get("GCI")), errors="coerce")
+
+    p90 = np.nanpercentile(pi.dropna(), 90) if pi.notna().any() else np.nan
+    S1 = 10.0 * p90 if np.isfinite(p90) else 0.0
+    med_gci = _safe_med(gci)
+    S2 = 10.0 * med_gci if np.isfinite(med_gci) else 0.0
+    depth = _prop_ge(pi, 6.5)
+    S3 = 100.0 * depth
+
+    z = pi - 5.0
+    mad = np.nanmedian(np.abs(z - np.nanmedian(z))) if np.isfinite(z).any() else 1.2
+    S4 = 100.0 * max(0.0, 1.0 - abs(mad - 1.2) / 1.2)
+
+    n = len(df.index)
+    trust = max(0.85, min(1.15, 0.85 + 0.30 * max(0.0, min(1.0, (n - 6) / 8.0))))
+    fra = int(attrs.get("FRA_APPLIED", 0))
+    sci = float(attrs.get("SCI", 1.0))
+    penalty = 0.0
+    if fra and sci >= 0.6:
+        penalty = min(10.0, max(0.0, 10.0 * (sci - 0.6) / 0.4))
+
+    w1, w2, w3 = 0.55, 0.25, 0.20
+    base = w1 * S1 + w2 * S2 + w3 * S3
+    rqs = base * trust - penalty
+    return float(np.clip(round(rqs, 1), 0.0, 100.0))
+
+# ----------------- Race Peak Strength (RPS) --------------------
+def compute_rps(df: pd.DataFrame) -> float:
+    if df is None or len(df) == 0:
+        return 0.0
+    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce").dropna()
+    if len(pi) == 0:
+        return 0.0
+    n = len(pi)
+    p95 = np.nanpercentile(pi, 95)
+    pmax = np.nanmax(pi)
+    w_star = max(0.1, min(0.4, (12.0 / (n + 2.0))))
+    rps_pi = (1.0 - w_star) * p95 + w_star * pmax
+    return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
+
+# ----------------- Race Profile Badge --------------------------
+def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
+    if not (math.isfinite(rqs) and math.isfinite(rps)):
+        return ("Unknown", "#7f8c8d")
+    delta = rps - rqs
+    if delta >= 18.0:
+        return ("🔴 Top-Heavy", "#e74c3c")
+    elif rqs >= (rps - 10.0):
+        return ("🟢 Deep Field", "#2ecc71")
+    else:
+        return ("⚪ Average Profile", "#95a5a6")
 
 # ======================= Data Integrity & Header (post compute) ==========================
 def _expected_segments(distance_m: float, step:int) -> list[str]:
