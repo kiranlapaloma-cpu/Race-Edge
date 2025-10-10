@@ -813,35 +813,35 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
                 if lull_gap >= 1.2:   gLM *= m2
                 elif lull_gap >= 0.8: gLM *= m1
 
-    # --- Sprint helper (≤1200 m) — emphasise Accel and ease slow gate slightly
-use_sprint_rule = False
-if D <= 1200:
-    # Early-vs-mid driver for sprints: weight Accel more than Grind
-    dLM_sprint = (0.75*acc + 0.25*grd) - mid
+        # --- Sprint helper (≤1200 m) — emphasise Accel and ease slow gate slightly
+        use_sprint_rule = False
+        if D <= 1200:
+            # Early-vs-mid driver for sprints: weight Accel more than Grind
+            dLM_sprint = (0.75*acc + 0.25*grd) - mid
 
-    # Gate derived from dispersion, but a touch easier than the generic gate
-    gLM_sprint = max(1.6, 0.5 * _mad(dLM_sprint))
+        # Gate derived from dispersion, but a touch easier than the generic gate
+        gLM_sprint = max(1.6, 0.5 * _mad(dLM_sprint))
 
-    # --- micro-boost for pure sprints (1000–1200 m) on clear V-shapes
-    # If the mid is clearly under par AND the late kick is strong, relax the gate a little.
-    gLM_sprint_eff = gLM_sprint * 0.90  # 10% easier than before
+        # --- micro-boost for pure sprints (1000–1200 m) on clear V-shapes
+        # If the mid is clearly under par AND the late kick is strong, relax the gate a little.
+        gLM_sprint_eff = gLM_sprint * 0.90  # 10% easier than before
 
-    # sanity guards to avoid mis-labelling genuine fast runs as slow-early
-    mid_under_med = (pd.to_numeric(mid, errors="coerce")
-                     <= pd.to_numeric(mid, errors="coerce").median(skipna=True) - 0.3)
+        # sanity guards to avoid mis-labelling genuine fast runs as slow-early
+        mid_under_med = (pd.to_numeric(mid, errors="coerce")
+                         <= pd.to_numeric(mid, errors="coerce").median(skipna=True) - 0.3)
 
-    # allow a hotter break than before; still require the late kick to dominate
-    f_not_hot = (pd.to_numeric(w["F200_idx"], errors="coerce")
-                 <= pd.to_numeric(acc, errors="coerce") + 0.8)
+        # allow a hotter break than before; still require the late kick to dominate
+        f_not_hot = (pd.to_numeric(w["F200_idx"], errors="coerce")
+                     <= pd.to_numeric(acc, errors="coerce") + 0.8)
 
-    med_dLM_sprint = float(pd.to_numeric(dLM_sprint, errors="coerce").median(skipna=True))
+        med_dLM_sprint = float(pd.to_numeric(dLM_sprint, errors="coerce").median(skipna=True))
 
-    use_sprint_rule = (
-        np.isfinite(med_dLM_sprint)
-        and med_dLM_sprint >= gLM_sprint_eff
-        and float(mid_under_med.mean()) >= 0.45   # was 0.50
-        and float(f_not_hot.mean())     >= 0.40   # was 0.50 and +0.4 margin
-    )
+        use_sprint_rule = (
+            np.isfinite(med_dLM_sprint)
+            and med_dLM_sprint >= gLM_sprint_eff
+            and float(mid_under_med.mean()) >= 0.45   # was 0.50
+            and float(f_not_hot.mean())     >= 0.40   # was 0.50 and +0.4 margin
+        )
 
         if (use_sprint_rule and D <= 1200) or (med_dLM >= +gLM and sci2 >= sci_gate_slow):
             shape_tag = "SLOW_EARLY"
