@@ -756,25 +756,24 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
                       0.35*pd.to_numeric(w["tsSPI"],    errors="coerce"))
     w["LATE_idx"]  = (0.60*pd.to_numeric(w["Accel"],    errors="coerce") +
                       0.40*pd.to_numeric(w[GR_COL],      errors="coerce"))
+    # ----- Race Shape (ΔLA core) + FRA (mild) -----
+    # Always start with RS copies so downstream code is safe
+    w["PI_RS"]  = w["PI"].astype(float)
+    w["GCI_RS"] = w["GCI"].astype(float)
 
-# ----- Race Shape (ΔLA core) + FRA (mild) -----
-# Always start with RS copies so downstream code is safe
-w["PI_RS"]  = w["PI"].astype(float)
-w["GCI_RS"] = w["GCI"].astype(float)
+    shape_tag   = "EVEN"
+    finish_flav = "Balanced Finish"
+    fra_applied = 0
+    sci         = 0.0
 
-shape_tag   = "EVEN"
-finish_flav = "Balanced Finish"
-fra_applied = 0
-sci         = 0.0
-
-if use_race_shape:
-    acc = pd.to_numeric(w["Accel"],  errors="coerce")
-    mid = pd.to_numeric(w["tsSPI"],  errors="coerce")
-    grd = pd.to_numeric(w[GR_COL],   errors="coerce")
-
-    # Core deltas
-    dLM = ((acc + grd)/2.0) - mid   # late+finish vs mid → shape driver
-    dLG = grd - acc                 # finish flavour driver
+    if use_race_shape:
+        acc = pd.to_numeric(w["Accel"],  errors="coerce")
+        mid = pd.to_numeric(w["tsSPI"],  errors="coerce")
+        grd = pd.to_numeric(w[GR_COL],   errors="coerce")
+ 
+        # Core deltas
+        dLM = ((acc + grd)/2.0) - mid   # late+finish vs mid → shape driver
+        dLG = grd - acc                 # finish flavour driver
 
     # Robust gates from dispersion; scale with trip length
     def _mad(s):
