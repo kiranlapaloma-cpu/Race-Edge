@@ -757,104 +757,111 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["LATE_idx"]  = (0.60*pd.to_numeric(w["Accel"],    errors="coerce") +
                       0.40*pd.to_numeric(w[GR_COL],      errors="coerce"))
 
-    # ----- Race Shape (ΔLA core) + FRA -----
-    # Always provide PI_RS/GCI_RS copies so downstream code stays happy
-    w["PI_RS"]  = w["PI"].astype(float)
-    w["GCI_RS"] = w["GCI"].astype(float)
+# ----- Race Shape (ΔLA core) + FRA (mild) -----
+# Always start with RS copies so downstream code is safe
+w["PI_RS"]  = w["PI"].astype(float)
+w["GCI_RS"] = w["GCI"].astype(float)
 
-    if use_race_shape:
-        # Core signals
-        acc = pd.to_numeric(w["Accel"],  errors="coerce")
-        mid = pd.to_numeric(w["tsSPI"],  errors="coerce")
-        grd = pd.to_numeric(w[GR_COL],   errors="coerce")  # GR_COL already picks Grind_CG if CG is ON
+shape_tag   = "EVEN"
+finish_flav = "Balanced Finish"
+fra_applied = 0
+sci         = 0.0
 
-        dLM = ((acc + grd)/2.0) - mid    # late+finish vs mid (context check, not the tag driver)
-        dLG = grd - acc                  # grind over acceleration (finish flavour only)
+if use_race_shape:
+    acc = pd.to_numeric(w["Accel"],  errors="coerce")
+    mid = pd.to_numeric(w["tsSPI"],  errors="coerce")
+    grd = pd.to_numeric(w[GR_COL],   errors="coerce")
 
-        # Robust gates from dispersion; scale with trip length a touch
-        def _mad(s):
-            v = mad_std(pd.to_numeric(s, errors="coerce"))
-            return 0.0 if (not np.isfinite(v)) else float(v)
+    # Core deltas
+    dLM = ((acc + grd)/2.0) - mid   # late+finish vs mid → shape driver
+    dLG = grd - acc                 # finish flavour driver
 
-        gLM = max(2.0, 0.6 * _mad(dLM))
-        gLG = max(1.6, 0.6 * _mad(dLG))
-        if   D <= 1200: scale = 1.00
-        elif D <  1800: scale = 1.08
-        else:           scale = 1.15
-        gLM *= scale; gLG *= scale
+    # Robust gates from dispersion; scale with trip length
+    def _mad(s):
+        v = mad_std(pd.to_numeric(s, errors="coerce"))
+        return 0.0 if (not np.isfinite(v)) else float(v)
 
-        # Field medians
-        med_dLM = float(pd.to_numeric(dLM, errors="coerce").median(skipna=True))
-        med_dLG = float(pd.to_numeric(dLG, errors="coerce").median(skipna=True))
+    gLM = max(2.0, 0.6 * _mad(dLM))
+    gLG = max(1.6, 0.6 * _mad(dLG))
+    if   D <= 1200: scale = 1.00
+    elif D <  1800: scale = 1.08
+    else:           scale = 1.15
+    gLM *= scale; gLG *= scale
 
-        # Agreement (% runners with same sign as med_dLM)
-        sgn_med = 0 if med_dLM == 0 else (1 if med_dLM > 0 else -1)
-        if sgn_med == 0:
-            sci2 = 0.0
-        else:
-            same = np.sign(pd.to_numeric(dLM, errors="coerce").dropna().to_numpy())
-            sci2 = float((same == sgn_med).mean()) if same.size else 0.0
+    # Field medians
+    med_dLM = float(pd.to_numeric(dLM, errors="coerce").median(skipna=True))
+    med_dLG = float(pd.to_numeric(dLG, errors="coerce").median(skipna=True))
 
-        # Base tag from ΔLA (built late vs spent early)
-        if  med_dLM >= +gLM and sci2 >= 0.55:
-            shape_tag = "SLOW_EARLY"
-        elif med_dLM <= -gLM and sci2 >= 0.55:
-            shape_tag = "FAST_EARLY"
-        else:
-            shape_tag = "EVEN"
-
-        # Finish flavour from Grind vs Accel (doesn't change tag)
-        if   med_dLG >= +gLG: finish_flavour = "Attritional Finish"
-        elif med_dLG <= -gLG: finish_flavour = "Sprint Finish"
-        else:                 finish_flavour = "Balanced Finish"
-
-        # RSI: 0..10 “how shaped” (magnitude * consensus)
-        shape_mag = abs(med_dLM) * sci2
-        if   shape_mag < 3.0: rsi = 2.0 + shape_mag       # ~0..6
-        elif shape_mag < 5.0: rsi = 6.0 + 1.5*(shape_mag-3.0)   # 6..9
-        elif shape_mag < 6.0: rsi = 9.0 + (shape_mag-5.0)       # 9..10
-        else:                 rsi = 10.0
-        rsi = float(clamp(rsi, 0.0, 10.0))
-
-        # FRA (mild, transparent), scaled by RSI (stronger shape → stronger adj)
-        strength = 0.05 + 0.015 * rsi       # ≈ 0.05..0.20
-        strength = float(clamp(strength, 0.05, 0.20))
-
-        fra_applied = 0
-        if shape_tag == "SLOW_EARLY":
-            # Kickers (accel >> mid) trimmed a touch; steady/attritional protected
-            kicker_excess = (acc - mid).clip(lower=0.0).fillna(0.0)
-            adj_pi  = (strength * (kicker_excess / 6.0)).clip(upper=0.60)     # per-horse cap
-            adj_gci = 0.80 * adj_pi
-            w["PI_RS"]  = (w["PI"]  - adj_pi).clip(0.0, 10.0)
-            w["GCI_RS"] = (w["GCI"] - adj_gci).clip(0.0, 10.0)
-            fra_applied = 1
-
-        elif shape_tag == "FAST_EARLY":
-            # Sturdiness rewarded (grind over accel) with a little mid support
-            sturdiness = ((grd - acc) + (grd - mid)/2.0).clip(lower=0.0).fillna(0.0)
-            bonus_pi  = (strength * (sturdiness / 6.0)).clip(upper=0.60)
-            bonus_gci = 0.80 * bonus_pi
-            w["PI_RS"]  = (w["PI"]  + bonus_pi).clip(0.0, 10.0)
-            w["GCI_RS"] = (w["GCI"] + bonus_gci).clip(0.0, 10.0)
-            fra_applied = 1
-
-        # Save attrs
-        w.attrs["SHAPE_TAG"]     = shape_tag
-        w.attrs["FINISH_FLAV"]   = finish_flavour
-        w.attrs["SCI"]           = float(clamp(sci2, 0.0, 1.0))
-        w.attrs["RSI"]           = float(rsi)
-        w.attrs["FRA_APPLIED"]   = int(fra_applied)
-
+    # Consensus of sign with the median (SCI 0..1)
+    sgn_med = 0 if med_dLM == 0 else (1 if med_dLM > 0 else -1)
+    if sgn_med == 0:
+        sci2 = 0.0
     else:
-        # Race shape module off → RS copies = originals
-        w["PI_RS"]  = w["PI"].astype(float)
-        w["GCI_RS"] = w["GCI"].astype(float)
-        w.attrs["SHAPE_TAG"]   = "EVEN"
-        w.attrs["FINISH_FLAV"] = "Balanced Finish"
-        w.attrs["SCI"]         = 0.0
-        w.attrs["RSI"]         = 0.0
-        w.attrs["FRA_APPLIED"] = 0
+        same = np.sign(pd.to_numeric(dLM, errors="coerce").dropna().to_numpy())
+        sci2 = float((same == sgn_med).mean()) if same.size else 0.0
+
+    # Tag from ΔLA (built late vs spent early)
+    if  med_dLM >= +gLM and sci2 >= 0.55:
+        shape_tag = "SLOW_EARLY"
+    elif med_dLM <= -gLM and sci2 >= 0.55:
+        shape_tag = "FAST_EARLY"
+    else:
+        shape_tag = "EVEN"
+
+    # Finish flavour from Grind vs Accel
+    if   med_dLG >= +gLG: finish_flav = "Attritional Finish"
+    elif med_dLG <= -gLG: finish_flav = "Sprint Finish"
+    else:                 finish_flav = "Balanced Finish"
+
+    # RSI: “how shaped” 0..10 from magnitude * consensus
+    shape_mag = abs(med_dLM) * sci2
+    if   shape_mag < 3.0: rsi = 2.0 + shape_mag            # ~0..6
+    elif shape_mag < 5.0: rsi = 6.0 + 1.5*(shape_mag-3.0)  # 6..9
+    elif shape_mag < 6.0: rsi = 9.0 + (shape_mag-5.0)      # 9..10
+    else:                 rsi = 10.0
+    rsi = float(clamp(rsi, 0.0, 10.0))
+    sci = float(clamp(sci2, 0.0, 1.0))
+
+    # FRA strength: mild, scaled by RSI (stronger shape → stronger adj)
+    strength = float(clamp(0.05 + 0.015 * rsi, 0.05, 0.20))   # ≈ 5%..20%
+
+    if shape_tag == "SLOW_EARLY":
+        # Kickers trimmed a touch; steady/attritional protected
+        kicker_excess = (acc - mid).clip(lower=0.0).fillna(0.0)
+        adj_pi  = (strength * (kicker_excess / 6.0)).clip(upper=0.60)
+        adj_gci = 0.80 * adj_pi
+        w["PI_RS"]  = (w["PI"]  - adj_pi).clip(0.0, 10.0)
+        w["GCI_RS"] = (w["GCI"] - adj_gci).clip(0.0, 10.0)
+        fra_applied = 1
+
+    elif shape_tag == "FAST_EARLY":
+        # Sturdiness rewarded (grind over accel) with some mid support
+        sturdiness = ((grd - acc) + (grd - mid)/2.0).clip(lower=0.0).fillna(0.0)
+        bonus_pi  = (strength * (sturdiness / 6.0)).clip(upper=0.60)
+        bonus_gci = 0.80 * bonus_pi
+        w["PI_RS"]  = (w["PI"]  + bonus_pi).clip(0.0, 10.0)
+        w["GCI_RS"] = (w["GCI"] + bonus_gci).clip(0.0, 10.0)
+        fra_applied = 1
+else:
+    # Module off → keep originals
+    shape_tag = "EVEN"; finish_flav = "Balanced Finish"; sci = 0.0; fra_applied = 0
+
+# ----- Final rounding & attrs -----
+for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
+          "PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
+    if c in w.columns:
+        w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
+
+w.attrs["FSR"] = float(FSR)
+w.attrs["CollapseSeverity"] = float(CollapseSeverity)
+w.attrs["GR_COL"] = GR_COL
+w.attrs["STEP"] = step
+w.attrs["SHAPE_TAG"] = shape_tag
+w.attrs["FINISH_FLAV"] = finish_flav       # <— new
+w.attrs["SCI"] = float(sci)
+w.attrs["RSI"] = float(0.0 if shape_tag=="EVEN" else rsi)  # rsi only meaningful if shaped
+w.attrs["FRA_APPLIED"] = int(fra_applied)
+
 
 # ---- Compute metrics + race shape now ----
 try:
