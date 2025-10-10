@@ -757,13 +757,69 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["LATE_idx"]  = (0.60*pd.to_numeric(w["Accel"],    errors="coerce") +
                       0.40*pd.to_numeric(w[GR_COL],      errors="coerce"))
 
-    # ----- Race Shape + FRA (tsSPI vs Accel/Grind) -----
-    # Definitions:
-    # ΔLM = ((Accel + GR)/2) - tsSPI    → +ve = built late (slow early / sprint home)
-    # ΔLG = GR - Accel                  → +ve = attritional finish; -ve = sprint finish
-    shape_tag = "EVEN"; finish_flavour = "Balanced Finish"; fra_applied = 0
-    sci2 = 1.0; rsi = 0.0
+    # ----- Race Shape + FRA (ΔLA = Accel − tsSPI core version) -----
+shape_tag = "EVEN"
+fra_applied = 0
+sci = 1.0
 
+# ΔLA and ΔLG per horse
+w["ΔLA"] = pd.to_numeric(w["Accel"], errors="coerce") - pd.to_numeric(w["tsSPI"], errors="coerce")
+w["ΔLG"] = pd.to_numeric(w[GR_COL], errors="coerce") - pd.to_numeric(w["Accel"], errors="coerce")
+
+# Medians across field
+med_dla = float(pd.to_numeric(w["ΔLA"], errors="coerce").median(skipna=True))
+mad_dla = mad_std(w["ΔLA"])
+sci = float((abs(w["ΔLA"] - med_dla) <= 1.5).mean()) if w["ΔLA"].notna().any() else 1.0
+
+# Determine race-shape tag
+if med_dla >= +1.5:
+    shape_tag = "SLOW_EARLY"
+elif med_dla <= -1.5:
+    shape_tag = "FAST_EARLY"
+else:
+    shape_tag = "EVEN"
+
+# Compute RSI = |ΔLA| × SCI × 10 (scaled for readability 0–10)
+RSI = float(min(10.0, abs(med_dla) * sci))
+
+# Finish flavour tag (ΔLG)
+if np.isfinite(med_dla):
+    med_dlg = float(pd.to_numeric(w["ΔLG"], errors="coerce").median(skipna=True))
+    if med_dlg >= +2.0:
+        finish_flavour = "Attritional Finish"
+    elif med_dlg <= -2.0:
+        finish_flavour = "Sprint Finish"
+    else:
+        finish_flavour = "Balanced Finish"
+else:
+    finish_flavour = "Balanced Finish"
+
+# FRA adjustment based on ΔLA polarity
+w["PI_RS"]  = w["PI"].astype(float)
+w["GCI_RS"] = w["GCI"].astype(float)
+if shape_tag == "SLOW_EARLY" and sci >= 0.60:
+    f = 0.10 + 0.05 * (sci - 0.60) / 0.40
+    late_excess = ((w["Accel"] - w["tsSPI"]).clip(lower=0.0, upper=8.0)).fillna(0.0)
+    w["PI_RS"]  = (w["PI"]  - f * (late_excess / 4.0)).clip(0.0, 10.0)
+    w["GCI_RS"] = (w["GCI"] - f * (late_excess / 3.0)).clip(0.0, 10.0)
+    fra_applied = 1
+elif shape_tag == "FAST_EARLY" and sci >= 0.60:
+    f = 0.08 + 0.04 * (sci - 0.60) / 0.40
+    sturdiness = ((w["tsSPI"] - w["Accel"]).clip(lower=0.0, upper=8.0)).fillna(0.0)
+    w["PI_RS"]  = (w["PI"]  + f * (sturdiness / 4.0)).clip(0.0, 10.0)
+    w["GCI_RS"] = (w["GCI"] + f * (sturdiness / 3.0)).clip(0.0, 10.0)
+    fra_applied = 1
+
+# Round key fields
+for c in ["ΔLA", "ΔLG"]:
+    w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
+
+# Store to attrs
+w.attrs["SHAPE_TAG"] = shape_tag
+w.attrs["SCI"] = float(sci)
+w.attrs["RSI"] = float(RSI)
+w.attrs["FINISH_FLAVOUR"] = finish_flavour
+w.attrs["FRA_APPLIED"] = int(fra_applied)
     # Always provide PI_RS/GCI_RS (copy) so downstream code stays happy
     w["PI_RS"]  = w["PI"].astype(float)
     w["GCI_RS"] = w["GCI"].astype(float)
@@ -856,41 +912,6 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w.attrs["SCI"]         = float(clamp(sci2, 0.0, 1.0))
     w.attrs["RSI"]         = float(rsi)
     w.attrs["FRA_APPLIED"] = int(fra_applied)
-
-    # ----- Final rounding & attrs -----
-    for c in ["EARLY_idx","LATE_idx","F200_idx","tsSPI","Accel","Grind","Grind_CG",
-              "PI","PI_RS","GCI","GCI_RS","RaceTime_s","DeltaG","FinisherFactor","GrindAdjPts"]:
-        if c in w.columns:
-            w[c] = pd.to_numeric(w[c], errors="coerce").round(3)
-
-    w.attrs["FSR"] = float(FSR)
-    w.attrs["CollapseSeverity"] = float(CollapseSeverity)
-    w.attrs["GR_COL"] = GR_COL
-    w.attrs["STEP"] = step
-    w.attrs["SHAPE_TAG"] = shape_tag
-    w.attrs["SCI"] = float(sci)
-    w.attrs["FRA_APPLIED"] = int(fra_applied)
-
-    if debug:
-        st.write({"FSR":FSR, "CollapseSeverity":CollapseSeverity, "PI_W":PI_W,
-                  "SHAPE_TAG":shape_tag, "SCI":sci, "FRA_APPLIED":fra_applied})
-    return w, seg_markers
-
-# ---- Compute metrics + race shape now ----
-try:
-    metrics, seg_markers = build_metrics_and_shape(
-        work,
-        float(race_distance_input),
-        int(split_step),
-        USE_CG,
-        DAMPEN_CG,
-        USE_RACE_SHAPE,
-        DEBUG
-    )
-except Exception as e:
-    st.error("Metric computation failed.")
-    st.exception(e)
-    st.stop()
 
 # ----------------------- Race Quality Score (RQS v2) -----------------------
 def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
