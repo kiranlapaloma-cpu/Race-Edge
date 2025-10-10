@@ -822,6 +822,8 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w.attrs["RSI"] = float(RSI)
     w.attrs["FINISH_FLAVOUR"] = finish_flavour
     w.attrs["FRA_APPLIED"] = int(fra_applied)
+    # Compute and attach RQS to metrics attributes
+    w.attrs["RQS"] = compute_rqs(w, w.attrs)
 
 # ----------------------- Race Quality Score (RQS v2) -----------------------
 def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
@@ -884,7 +886,6 @@ def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
     return float(np.clip(round(rqs, 1), 0.0, 100.0))
 
 # Compute once and store into attrs (used by header / PDF / DB)
-metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
 
 def compute_rps(df: pd.DataFrame) -> float:
     """
