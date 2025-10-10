@@ -978,12 +978,23 @@ def compute_rps(df: pd.DataFrame) -> float:
     rps_pi = (1.0 - w_star) * p95 + w_star * pmax
     return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
 
+# ---------------------- Race Quality Score (RQS v2) ----------------------
+def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
+    ...
+    return float(np.clip(round(rqs, 1), 0.0, 100.0))
+
+# ---------------------- Race Peak Strength (RPS) -------------------------
+def compute_rps(df: pd.DataFrame) -> float:
+    ...
+    return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
+
+# ---------------------- Race Profile badge -------------------------------
 def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
     """
-    Return (label, color_hex) for the badge.
-    - 🔴 Top-Heavy  when RPS - RQS ≥ 18
-    - 🟢 Deep Field when RQS ≥ RPS - 10
-    - ⚪ Average Profile otherwise
+    Returns (label, color_hex):
+      🔴 Top-Heavy if RPS − RQS ≥ 18
+      🟢 Deep Field if RQS ≥ RPS − 10
+      ⚪ Average otherwise
     """
     if not (math.isfinite(rqs) and math.isfinite(rps)):
         return ("Unknown", "#7f8c8d")
@@ -995,10 +1006,13 @@ def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
     else:
         return ("⚪ Average Profile", "#95a5a6")
 
+# ---- compute & stash (TOP-LEVEL — no indentation) -----------------------
+metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
 metrics.attrs["RPS"] = compute_rps(metrics)
+
 _profile_label, _profile_color = classify_race_profile(
     float(metrics.attrs.get("RQS", np.nan)),
-    float(metrics.attrs.get("RPS", np.nan))
+    float(metrics.attrs.get("RPS", np.nan)),
 )
 metrics.attrs["RACE_PROFILE"] = _profile_label
 metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
