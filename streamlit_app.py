@@ -965,6 +965,52 @@ def compute_rps(df: pd.DataFrame) -> float:
     rps_pi = (1.0 - w_star) * p95 + w_star * pmax
     return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
 
+# ----------------------- Race Peak Strength (RPS) + Race Profile -----------------------
+def compute_rps(df: pd.DataFrame) -> float:
+    """
+    RPS (0..100): star-aware peak strength.
+    Blends p95(PI_RS) with the true peak based on dominance and field-size trust.
+    """
+    if df is None or len(df) == 0:
+        return 0.0
+
+    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce").dropna()
+    n = int(pi.size)
+    if n == 0:
+        return 0.0
+
+    p95 = float(np.nanpercentile(pi, 95)) if n >= 5 else float(np.nanmax(pi))
+    p90 = float(np.nanpercentile(pi, 90)) if n >= 4 else p95
+    pmax = float(np.nanmax(pi))
+    # second-best (for Gap2)
+    if n >= 2:
+        top2 = np.partition(pi.values, -2)[-2]
+    else:
+        top2 = p90
+
+    # Dominance signals (in PI points, not ×10)
+    gap_top = max(0.0, pmax - p90)       # how far top is beyond the elite band
+    gap_2   = max(0.0, pmax - float(top2))  # separation to 2nd
+
+    # Field-size trust: 0 at ≤6; 1 at ≥12 (same shape as you used elsewhere)
+    trust = max(0.0, min(1.0, (n - 6) / 6.0))
+
+    # Turn dominance into [0..1] via a smooth ramp that saturates ~3pts
+    # (≈ 3 PI points above the pack is huge)
+    def smooth_saturate(x, mid=1.8, span=1.2):
+        # 0 at x=0; ~0.5 at mid; →1 near mid+span (~3.0)
+        return max(0.0, min(1.0, (x / (mid + span))))
+
+    dom = max(smooth_saturate(gap_top), smooth_saturate(gap_2))
+
+    # Final blend weight toward the max:
+    # base 0.30 (slight pull to max), + up to +0.40 from dominance*trust
+    w_star = 0.30 + 0.40 * dom * trust
+    w_star = max(0.0, min(0.95, w_star))  # safety clamp
+
+    rps_pi = (1.0 - w_star) * p95 + w_star * pmax
+    return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
+
 # ======================= Data Integrity & Header (post compute) ==========================
 def _expected_segments(distance_m: float, step:int) -> list[str]:
     cols = [f"{m}_Time" for m in range(int(distance_m)-step, step-1, -step)]
