@@ -759,6 +759,23 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["LATE_idx"]  = (0.60*pd.to_numeric(w["Accel"],    errors="coerce") +
                       0.40*pd.to_numeric(w[GR_COL],     errors="coerce"))
 
+         # --- put this right BEFORE the "Race Shape gates (UNIVERSAL, eased)" block ---
+
+    # Which grind column are we using?
+    w.attrs["GR_COL"] = GR_COL
+    w.attrs["STEP"]   = step
+    w.attrs["FSR"]    = FSR
+    w.attrs["CollapseSeverity"] = CollapseSeverity
+
+    # Series for shape calculations
+    acc = pd.to_numeric(w["Accel"],  errors="coerce")
+    mid = pd.to_numeric(w["tsSPI"],  errors="coerce")
+    grd = pd.to_numeric(w[GR_COL],   errors="coerce")
+
+    # Deltas: late vs mid, and finish vs late
+    dLM = acc - mid   # +ve = late stronger than mid  → SLOW_EARLY candidate
+    dLG = grd - acc   # +ve = grind tougher than late → Attritional finish
+
         # ================= Race Shape gates (UNIVERSAL, eased) =================
     # Inputs already available in your block:
     #   acc = Accel series, mid = tsSPI series, grd = Grind/Grind_CG series
@@ -849,7 +866,8 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
 
     # --- 8) FRA strength (mildly stronger when the shape is clearer) --------
     fra_strength = float(clamp(0.06 + 0.020 * rsi, 0.06, 0.18))  # was 0.05 + 0.015*rsi (→ 0.20 cap)
-
+    fra_applied = 0   # initialize; set to 1 later if you actually apply FRA
+   
     # Save attrs you already expose
     w.attrs["SCI"]         = sci
     w.attrs["RSI"]         = 0.0 if shape_tag == "EVEN" else rsi
@@ -858,7 +876,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w.attrs["SCI"]               = float(sci)
     w.attrs["RSI"]               = float(0.0 if shape_tag=="EVEN" else rsi)
     w.attrs["FRA_APPLIED"]       = int(fra_applied)
-
+    w.attrs["GR_COL"] = GR_COL
     return w, seg_markers
 
 
