@@ -381,6 +381,11 @@ def _grind_speed(row, step):
         tfin = pd.to_numeric(row.get("Finish_Time"), errors="coerce")
         return np.nan if (pd.isna(tfin) or tfin <= 0) else 200.0 / float(tfin)
 
+def _pct_at_or_above(s, thr):
+    s = pd.to_numeric(s, errors="coerce")
+    s = s[s.notna()]
+    return 0.0 if s.empty else float((s >= thr).mean())
+
 # -------- Adaptive F-window + tsSPI start --------
 def _adaptive_f_cols_and_dist(D, step, markers, frame_cols):
     """
@@ -835,74 +840,67 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-# ----------------------- Race Quality Score (RQS) -----------------------
-def _safe_med(s):
-    s = pd.to_numeric(s, errors="coerce")
-    return float(np.nanmedian(s)) if s.notna().any() else np.nan
-
-def _prop_ge(s, thr):
-    s = pd.to_numeric(s, errors="coerce")
-    if not s.notna().any(): return 0.0
-    return float((s >= thr).mean())
-
+# ----------------------- Race Quality Score (RQS v2) -----------------------
 def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
     """
-    RQS (0..100): single-race class/quality indicator.
-    Ingredients (blended):
-      • Peak sectional talent: p90(PI_RS) or p90(PI)  → S1
-      • Overall quality: median(GCI_RS) or median(GCI) → S2
-      • Depth: share with PI_RS >= 6.5                 → S3
-      • Dispersion health (MAD of PI_RS ~ 1.2)         → S4
-      • Field-size trust (n>=12 best)                  → S5 (as a multiplier)
-      • Mild FRA penalty for confirmed false runs      → penalty
+    RQS v2 (0..100): single-race class/quality indicator, handicap-friendly.
+
+    Ingredients (no GCI in the core):
+      • Peak talent  (S1): p90(PI_RS or PI) scaled to 0..100
+      • Depth        (S2): share with PI_RS >= 6.8 (good/strong mark)
+      • Dispersion   (S3): how healthy the spread is (MAD target ≈ 1.0)
+      • Field trust  (mult): small lift for bigger fields, small trim for tiny fields
+      • False-run penalty: if FRA applied with real conviction (SCI high)
     """
     if df is None or len(df) == 0:
         return 0.0
 
-    # Choose RS-adjusted series if present
-    pi_series  = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
-    gci_series = pd.to_numeric(df.get("GCI_RS", df.get("GCI")), errors="coerce")
+    # Prefer RS-adjusted; fall back cleanly
+    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
+    pi = pi[pi.notna()]
+    if pi.empty:
+        return 0.0
 
-    # S1: Peak sectional talent (scale PI 0..10 to 0..100 via p90)
-    p90_pi = float(np.nanpercentile(pi_series.dropna(), 90)) if pi_series.notna().any() else np.nan
-    S1 = 10.0 * p90_pi if np.isfinite(p90_pi) else 0.0
+    # ---------- S1: Peak talent (p90 of PI) ----------
+    p90 = float(np.nanpercentile(pi.values, 90))
+    S1  = 10.0 * p90                    # 0..100
 
-    # S2: Overall quality (median) → 0..100
-    med_gci = _safe_med(gci_series)
-    S2 = 10.0 * med_gci if np.isfinite(med_gci) else 0.0
+    # ---------- S2: Depth above a strong bar ----------
+    # 6.8 is a “solid black-type” effort in your scale.
+    depth_prop = _pct_at_or_above(pi, 6.8)
+    S2 = 100.0 * depth_prop             # 0..100
 
-    # S3: Depth (% runners at/above a good PI_RS bar)
-    depth_prop = _prop_ge(pi_series, 6.5)
-    S3 = 100.0 * depth_prop
+    # ---------- S3: Dispersion “health” ----------
+    # We want not-too-blanket, not-chaos. Target MAD ≈ 1.0 (of PI), taper to 0 at 0 or 2.0
+    deltas = (pi - float(np.nanmedian(pi)))
+    mad = mad_std(deltas)               # robust MAD→σ
+    if not np.isfinite(mad): mad = 1.0
+    S3 = 100.0 * max(0.0, 1.0 - abs(mad - 1.0) / 1.0)   # peak at 1.0; 0 at 0 or 2.0
 
-    # S4: Dispersion health — prefer robust spread around ~1.2 MAD
-    #     Penalize if too tight (blankets/false) or too wide (messy).
-    z = (pi_series - 5.0)  # center not used; MAD insensitive
-    mad = mad_std(z)
-    if not np.isfinite(mad): mad = 1.2
-    # score peaks at MAD ≈ 1.2; falls linearly to 0 at ±1.2 away (i.e., 0 or 2.4)
-    S4 = 100.0 * max(0.0, 1.0 - abs(mad - 1.2) / 1.2)
-
-    # S5: field-size trust factor (small fields discounted)
+    # ---------- field-size trust (multiplier 0.85..1.15) ----------
     n = int(len(df.index))
-    trust = max(0.0, min(1.0, (n - 6) / 6.0))  # 0 at n<=6 → 1 at n>=12
+    # 6 → 0.85 ; 10 → ~1.02 ; 12 → 1.08 ; 14+ → 1.15 (capped)
+    trust = 0.85 + 0.30 * max(0.0, min(1.0, (n - 6) / 8.0))
+    trust = float(min(1.15, max(0.85, trust)))
 
-    # FRA (false-run) mild penalty if we actually applied it and SCI is decent
+    # ---------- False-run penalty (only when FRA actually applied & SCI meaningful) ----------
     fra_applied = int(attrs.get("FRA_APPLIED", 0) or 0)
-    shape_tag   = str(attrs.get("SHAPE_TAG", "EVEN") or "EVEN")
     sci         = float(attrs.get("SCI", 1.0))
     penalty = 0.0
-    if fra_applied == 1 and shape_tag in ("SLOW_EARLY", "FAST_EARLY"):
-        # up to 10 pts at SCI=1.0, scaled down if SCI just over 0.60
-        penalty = max(0.0, min(10.0, 10.0 * (sci - 0.60) / 0.40))
+    if fra_applied == 1 and sci >= 0.60:
+        # Up to 10 pts at SCI=1.0, scaled from 0 at 0.60
+        penalty = 10.0 * (sci - 0.60) / 0.40
+        penalty = float(min(10.0, max(0.0, penalty)))
 
-    # Blend (weights sum to 1.0 before multiplier)
-    w1, w2, w3, w4 = 0.35, 0.35, 0.15, 0.15
-    base = w1*S1 + w2*S2 + w3*S3 + w4*S4
-    rqs  = (base * (0.70 + 0.30*trust)) - penalty  # trust lifts up to +30%
+    # ---------- Blend (weights sum to 1.0 before multiplier) ----------
+    # Handicap-friendly: put most weight on peak & depth; dispersion still matters.
+    w1, w2, w3 = 0.55, 0.25, 0.20
+    base = w1*S1 + w2*S2 + w3*S3
+
+    rqs = base * trust - penalty
     return float(np.clip(round(rqs, 1), 0.0, 100.0))
 
-# Compute once and store into attrs
+# Compute once and store into attrs (used by header / PDF / DB)
 metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
 
 # ======================= Data Integrity & Header (post compute) ==========================
