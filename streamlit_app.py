@@ -849,7 +849,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     if abs(rsi) < 1.2:
         shape_tag = "EVEN"
     elif rsi > 0:
-        shape_tag = "SLOW_EARLY"
+        shape_tag = "SLOW_EARLhttps://github.com/kiranlapaloma-cpu/Race-Edge/edit/main/streamlit_app.pyY"
     else:
         shape_tag = "FAST_EARLY"
 
@@ -2043,81 +2043,44 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
                          categories=["Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"])
     return out.assign(_k=cat).sort_values(["_k","RIE_Score"], ascending=[True, False]).drop(columns=["_k"])
 
-# =========================
-# NRCI v2.1 — Safe drop-in
-# =========================
+# ============================================
+# NRCI v2.2 — Explicit safe version (no guessing)
+# ============================================
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- Helpers ----------
 def _as_num(s): return pd.to_numeric(s, errors="coerce")
-
-def _rank_pct(x: pd.Series) -> pd.Series:
+def _rank_pct(x):
     x = _as_num(x)
     n = x.notna().sum()
-    if n <= 1:  # avoid div/0 in very small fields
-        return pd.Series(np.zeros(len(x)), index=x.index)
-    r = x.rank(method="average", na_option="keep")
-    return (r - 1) / (n - 1)
-
+    if n <= 1: return pd.Series(np.zeros(len(x)), index=x.index)
+    return (x.rank(method="average", na_option="keep") - 1) / (n - 1)
 def _clip01(s): return s.clip(0.0, 1.0)
 
-def _resolve_base_df() -> pd.DataFrame:
-    """Find a DataFrame produced earlier (RIE table or main race df)."""
-    candidates = [
-        "rie_df", "rie_table", "rie_out", "rie",
-        "race_df", "final_df", "full_df", "metrics_df",
-        "view", "table", "data", "df"
-    ]
-    g = globals()
-    for name in candidates:
-        if name in g and isinstance(g[name], pd.DataFrame) and len(g[name]) > 0:
-            return g[name]
-    # Try Streamlit session_state as a backup
-    for k, v in st.session_state.items():
-        if isinstance(v, pd.DataFrame) and len(v) > 0:
-            return v
-    return None
+def compute_nrci(df):
+    out = df.copy()
 
-# ---------- NRCI core ----------
-def compute_nrci(source_df: pd.DataFrame) -> pd.DataFrame:
-    out = source_df.copy()
-
-    # Map RIE pillars -> NRCI sub-pillars (use .get to avoid KeyErrors)
+    # --- Map RIE pillars to NRCI sub-pillars ---
     out["A_Ability"]     = _as_num(out.get("P1_Engine"))
     out["S_Shape"]       = _as_num(out.get("P3_ShapeFit"))
     out["P_Pressure"]    = _as_num(out.get("P4_Tenacity"))
     out["E_Efficiency"]  = _as_num(out.get("P2_Efficiency"))
     out["R_Reliability"] = _as_num(out.get("P6_Reliability"))
 
-    # Check required inputs
-    req = ["A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability","Horse"]
-    missing = [c for c in req if c not in out.columns]
-    if missing:
-        st.warning(f"NRCI: missing columns {missing}. Showing available fields only.")
-        # Create any missing columns as NaN so downstream code still works
-        for c in missing:
-            out[c] = np.nan
-        if "Horse" not in out.columns:  # cannot proceed without Horse
-            return out
+    # --- Normalize within race ---
+    A, S, P, E = map(_rank_pct, [out["A_Ability"], out["S_Shape"], out["P_Pressure"], out["E_Efficiency"]])
+    R = _clip01(0.5 * (out["R_Reliability"] / 10.0) + 0.5 * _rank_pct(out["R_Reliability"]))
 
-    # Normalize within race (0–1)
-    A = _rank_pct(out["A_Ability"])
-    S = _rank_pct(out["S_Shape"])
-    P = _rank_pct(out["P_Pressure"])
-    E = _rank_pct(out["E_Efficiency"])
-    R_lin = _clip01(out["R_Reliability"] / 10.0)
-    R = _clip01(0.5 * R_lin + 0.5 * _rank_pct(out["R_Reliability"]))
-
-    # Weights
+    # --- Weighted core (sum = 1.00) ---
     wA, wS, wP, wE, wR = 0.25, 0.15, 0.15, 0.25, 0.20
+    core = wA*A + wS*S + wP*P + wE*E + wR*R
 
-    # NRCI scale 1.00–1.60
-    core = (wA*A + wS*S + wP*P + wE*E + wR*R)
+    # --- NRCI on 1.00–1.60 scale ---
     out["NRCI"] = (1.00 + 0.60 * core).clip(1.00, 1.60)
 
-    # Verdicts
+    # --- Punter verdicts ---
     def _verdict(v):
         if v >= 1.36: return "High confidence"
         if v >= 1.28: return "Strong chance"
@@ -2125,21 +2088,31 @@ def compute_nrci(source_df: pd.DataFrame) -> pd.DataFrame:
         if v >= 1.14: return "Each-way"
         return "Speculative"
     out["PunterVerdict"] = out["NRCI"].apply(_verdict)
-
-    # Optional: replace with your class-move logic
     out["ClassResponse"] = "Better kept to same/slightly easier"
 
-    # Order/round for display
-    cols = ["Horse","NRCI","PunterVerdict","A_Ability","S_Shape",
-            "P_Pressure","E_Efficiency","R_Reliability","ClassResponse"]
-    cols = [c for c in cols if c in out.columns]
-    out = out[cols].sort_values("NRCI", ascending=False, kind="mergesort").reset_index(drop=True)
-
+    cols = ["Horse","NRCI","PunterVerdict","A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability","ClassResponse"]
+    out = out[[c for c in cols if c in out.columns]].sort_values("NRCI", ascending=False).reset_index(drop=True)
     for c in ["NRCI","A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability"]:
-        if c in out.columns:
-            out[c] = _as_num(out[c]).round(2)
-
+        if c in out.columns: out[c] = _as_num(out[c]).round(2)
     return out
+
+
+# === EXPLICIT HANDOFF ===
+# replace 'rie_table' with the actual DataFrame you built above
+if "rie_table" in locals():
+    base_df = rie_table
+elif "rie_df" in locals():
+    base_df = rie_df
+elif "df" in locals():
+    base_df = df
+else:
+    base_df = None
+
+if base_df is None or not isinstance(base_df, pd.DataFrame) or base_df.empty:
+    st.error("⚠️ NRCI: No source DataFrame found. Pass your RIE table variable explicitly before this block.")
+else:
+    nrci_table = compute_nrci(base_df)
+    st.dataframe(nrci_table, use_container_width=True, hide_index=True)
 
 # ---------- Resolve DF and render ----------
 _base = _resolve_base_df()
