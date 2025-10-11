@@ -1837,6 +1837,231 @@ st.markdown("## Race Insight Engine™ (RIE)")
 if metrics.attrs.get("WIND_AFFECTED", False):
     st.caption(f"⚠ Wind note: {metrics.attrs.get('WIND_TAG','Wind')}. Insights consider potential wind influence.")
 
+# ======================= Race Insight Engine (RIE) — Builder =======================
+# Inputs expected:
+#   • metrics (DataFrame)  with columns like: Horse, tsSPI, Accel, Grind or Grind_CG, PI, GCI, IAI, HiddenScore,
+#                           AbilityScore, AbilityTier, NearEliteFlag, AH_Tier, AHS, DirectionHint, Confidence, etc.
+#   • metrics.attrs providing: SHAPE_TAG, RSI (0–10), SCI, GOING, WIND flags (optional).
+# Safe: runs even if some inputs are missing.
+
+import numpy as np
+import pandas as pd
+
+def _nz(v, alt=0.0):
+    try:
+        f = float(v)
+        return f if np.isfinite(f) else alt
+    except Exception:
+        return alt
+
+def _rank_pct(s):
+    s = pd.to_numeric(s, errors="coerce")
+    return s.rank(pct=True, method="average").fillna(0.0).clip(0.0, 1.0)
+
+def _shape_alignment_tag(shape_tag: str, accel: float, grind: float, ts: float,
+                         a_med: float, g_med: float, t_med: float) -> tuple[str, float]:
+    """
+    Returns (emoji_tag, score) where score ∈ [-1..+1] (against..with).
+    Uses signs vs field medians to avoid leaking any internals.
+    """
+    dA = _nz(accel) - _nz(a_med)
+    dG = _nz(grind) - _nz(g_med)
+    dT = _nz(ts)    - _nz(t_med)
+
+    # Normalize to soft z's using MAD proxy from percentiles
+    def soft_z(x):
+        return x / (1.0 + abs(x)/3.0)
+
+    zA, zG, zT = map(soft_z, (dA, dG, dT))
+    s = shape_tag.upper()
+
+    # Directional template
+    # FAST_EARLY → (ts high, accel low)
+    # SLOW_EARLY → (accel high, grind fair/high)
+    # EVEN       → near zero mix
+    if s == "FAST_EARLY":
+        align = ( +0.55*np.sign(zT) - 0.45*np.sign(zA) + 0.10*np.sign(zG) )
+    elif s == "SLOW_EARLY":
+        align = ( +0.60*np.sign(zA) + 0.30*np.sign(zG) - 0.10*np.sign(zT) )
+    else:  # EVEN
+        align = ( 0.35*np.sign(zA) + 0.35*np.sign(zG) + 0.30*np.sign(zT) )
+        # push “near zero” toward neutral
+        if abs(zA)+abs(zG)+abs(zT) < 1.0:
+            align *= 0.5
+
+    align = float(max(-1.0, min(1.0, align)))
+
+    tag = "⬆️ with shape" if align > 0.25 else ("⬇️ against shape" if align < -0.25 else "⟷ neutral")
+    return tag, align
+
+def _distance_note(accel: float, grind: float, ts: float) -> str:
+    a, g, t = _nz(accel), _nz(grind), _nz(ts)
+    # relative to par=100
+    if a >= 102.2 and g <= 99.5 and t >= 100:
+        return "Prefers sharp trips; 1000–1200 suited."
+    if g >= 102.0 and a <= 100.5:
+        return "Stays on; 1400–1800 (or stiffer) in scope."
+    if 99.5 <= a <= 101.5 and 99.5 <= g <= 101.5:
+        return "Versatile on trip; placement key."
+    if t >= 102 and a >= 101:
+        return "Strong mid-race engine; 1200–1400 optimal."
+    return "Trip flexible."
+
+def _track_profile(accel: float, grind: float) -> str:
+    a, g = _nz(accel), _nz(grind)
+    if a - g >= 2.0:
+        return "Best on turn-of-foot tracks / short straights."
+    if g - a >= 2.0:
+        return "Best on long straights / rising finishes."
+    return "Track shape agnostic."
+
+def _flags(row) -> list:
+    out = []
+    tier = str(row.get("AbilityTier","")).strip()
+    near = str(row.get("NearEliteFlag","")).strip()
+    hh_t = str(row.get("Tier","")).strip()  # Hidden Horses tier if present
+    ah_t = str(row.get("AH_Tier","")).strip()
+
+    if tier.startswith("🥇"): out.append("Elite profile")
+    elif tier.startswith("🥈"): out.append("High profile")
+    elif tier.startswith("🥉"): out.append("Competitive")
+
+    if near: out.append(near)
+    if "Top Hidden" in hh_t: out.append("Top Hidden")
+    elif "Notable Hidden" in hh_t: out.append("Hidden Notable")
+    if ah_t in {"🏆 Dominant","🔥 Clear Ahead","🟢 Ahead"}:
+        out.append(f"AHS: {ah_t}")
+    return out
+
+def _ceiling(row) -> str:
+    # gentle ceiling based on AbilityScore / PI / HiddenScore
+    abil = _nz(row.get("AbilityScore"))
+    pi   = _nz(row.get("PI"))
+    hid  = _nz(row.get("HiddenScore"))
+    if abil >= 8.5 and pi >= 7.0:
+        return "Ceiling: Group-class potential."
+    if abil >= 7.2 or (pi >= 6.4 and hid >= 1.2):
+        return "Ceiling: Listed/black-type possible."
+    return "Ceiling: Handy handicapper."
+
+def _why_bits(shape_tag, align_tag, dist_note, track_note, flags) -> str:
+    bits = []
+    if align_tag != "⟷ neutral":
+        bits.append(align_tag)
+    if dist_note: bits.append(dist_note)
+    if track_note: bits.append(track_note)
+    if flags: bits.append(", ".join(flags[:2]))
+    return " · ".join(bits)
+
+def _nrc_index(row, align_score: float, sci: float, rsi: float) -> float:
+    """
+    NRCI 0–10, non-revealing blend:
+      • AbilityScore (scaled)
+      • Alignment (+/-)
+      • HiddenScore (small)
+      • Confidence (field size proxy via row['Confidence'])
+      • shape strength (SCI/RSI) to weight alignment importance
+    """
+    abil = _nz(row.get("AbilityScore"))
+    hid  = _nz(row.get("HiddenScore"))
+    conf = str(row.get("Confidence","")).lower()
+    conf_w = 1.00 if conf == "high" else (0.90 if conf == "med" else 0.80)
+
+    # shape emphasis (0.7..1.3 multiplier)
+    sci = float(sci) if isinstance(sci,(int,float)) else 0.5
+    rsi = float(rsi) if isinstance(rsi,(int,float)) else 5.0
+    shape_w = 0.7 + 0.6 * min(1.0, max(0.0, ((sci-0.50)/0.50 + rsi/10.0)/2.0))
+
+    # base from ability (soft clamp around 6.5–9.5)
+    base = 4.5 + 0.6*max(0.0, abil)  # AbilityScore already 0..10-ish
+    # hidden sweetener
+    sweet = 0.3 * min(2.0, hid)
+    # alignment (±)
+    align_term = 2.0 * align_score * shape_w   # -2..+2 scaled by shape
+
+    nrc = base + sweet + align_term
+    nrc = float(np.clip(nrc * conf_w, 0.0, 10.0))
+    return round(nrc, 2)
+
+def build_rie_table(metrics: pd.DataFrame) -> pd.DataFrame:
+    df = metrics.copy()
+
+    # choose grind column
+    gr_col = metrics.attrs.get("GR_COL", "Grind")
+    if gr_col not in df.columns and "Grind" in df.columns:
+        gr_col = "Grind"
+
+    # pull shape context
+    shape_tag = str(metrics.attrs.get("SHAPE_TAG", "EVEN"))
+    sci = metrics.attrs.get("SCI", 0.5)
+    rsi = metrics.attrs.get("RSI", 5.0)
+
+    # medians for alignment
+    a_med = pd.to_numeric(df.get("Accel"), errors="coerce").median(skipna=True)
+    g_med = pd.to_numeric(df.get(gr_col), errors="coerce").median(skipna=True)
+    t_med = pd.to_numeric(df.get("tsSPI"), errors="coerce").median(skipna=True)
+
+    out_rows = []
+    for _, r in df.iterrows():
+        horse = str(r.get("Horse","")).strip() or "(Unnamed)"
+        acc   = _nz(r.get("Accel"))
+        grd   = _nz(r.get(gr_col))
+        tss   = _nz(r.get("tsSPI"))
+
+        align_tag, align_score = _shape_alignment_tag(shape_tag, acc, grd, tss, a_med, g_med, t_med)
+        dnote = _distance_note(acc, grd, tss)
+        tnote = _track_profile(acc, grd)
+        flg   = _flags(r)
+        ceil  = _ceiling(r)
+        why   = _why_bits(shape_tag, align_tag, dnote, tnote, flg)
+
+        nrc = _nrc_index(r, align_score, sci, rsi)
+
+        # Verdict buckets (non-revealing)
+        if nrc >= 8.2:
+            verdict = "Strong Win Candidate"
+        elif nrc >= 7.2:
+            verdict = "Win/Place Material"
+        elif nrc >= 6.2:
+            verdict = "Competitive Chance"
+        else:
+            verdict = "Needs Setup / Place"
+
+        out_rows.append({
+            "Horse": horse,
+            "Verdict": verdict,
+            "NRCI": nrc,                          # 0–10
+            "ShapeAlignment": align_tag,          # ⬆️ / ⬇️ / ⟷
+            "DistanceNote": dnote,
+            "TrackProfile": tnote,
+            "Flags": flg,                         # list for UI; PDF will stringify
+            "Ceiling": ceil,
+            "Why": why
+        })
+
+    out = pd.DataFrame(out_rows)
+    # sort by verdict strength then NRCI then finish (if present)
+    strength_key = pd.Categorical(out["Verdict"], ordered=True, categories=[
+        "Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"
+    ])
+    out = out.assign(_key=strength_key).sort_values(["_key","NRCI"], ascending=[True, False]).drop(columns=["_key"])
+
+    return out
+
+# ---- Build and show RIE table (place this after Ability Matrix section) ----
+st.markdown("## Race Insight Engine (RIE)")
+try:
+    RIE_view = build_rie_table(metrics)
+    # Pretty print Flags as comma-separated for the UI
+    _rie_show = RIE_view.copy()
+    _rie_show["Flags"] = _rie_show["Flags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
+    st.dataframe(_rie_show, use_container_width=True)
+    st.caption("NRCI = Narrative Race Confidence Index (0–10). Alignment arrow shows with/against the identified race shape.")
+    st.markdown("**Legend:** ⬆️ with shape · ⬇️ against shape · ⟷ neutral")
+except Exception as e:
+    st.error("Failed to build RIE.")
+    st.exception(e)
+
 # ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
 import sqlite3
 import io
