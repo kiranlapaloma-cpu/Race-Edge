@@ -2048,7 +2048,6 @@ def build_rie_table(metrics: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ---- Build and show RIE table (place this after Ability Matrix section) ----
-st.markdown("## Race Insight Engine (RIE)")
 try:
     RIE_view = build_rie_table(metrics)
     # Pretty print Flags as comma-separated for the UI
