@@ -1129,6 +1129,9 @@ if rqs_v is not None:
 if rps_v is not None:
     _hdr += f"  |  **RPS:** {float(rps_v):.1f}/100"
 
+metrics.attrs["WIND_AFFECTED"] = bool(WIND_AFFECTED)
+metrics.attrs["WIND_TAG"] = str(WIND_TAG)
+
 st.markdown(_hdr)
 
 # Badge + short legend line
@@ -1824,6 +1827,16 @@ AM_view = AM.sort_values(
 )[am_cols]
 st.dataframe(AM_view, use_container_width=True)
 
+# ... end of Ability Matrix render (plot + AM_view table) ...
+
+# ======================= Race Insight Engine (RIE) =======================
+st.markdown("---")
+st.markdown("## Race Insight Engine™ (RIE)")
+# (Your RIE table/notes go here; it reads from metrics/AM/HH but shows only summary insights.)
+# Make sure RIE uses metrics.attrs['WIND_AFFECTED'] to print the same disclaimer:
+if metrics.attrs.get("WIND_AFFECTED", False):
+    st.caption(f"⚠ Wind note: {metrics.attrs.get('WIND_TAG','Wind')}. Insights consider potential wind influence.")
+
 # ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
 import sqlite3
 import io
@@ -1970,6 +1983,14 @@ def _export_pdf_report(*,
             styles["Italic"]
         ))
         story.append(Spacer(0, 6))
+    # After header lines / before tables
+    if getattr(metrics, "attrs", {}).get("WIND_AFFECTED", False):
+        tag = metrics.attrs.get("WIND_TAG", "Wind")
+        story.append(Paragraph(f"<font color='#C0392B'><b>Wind disclaimer:</b> {tag}. "
+                               "Some sectional patterns may reflect wind effect.</font>", styles["Normal"]))
+        story.append(Spacer(0, 6))
+
+   
 
     # Sectional Metrics table (safe cast to string)
     story.append(Paragraph("Sectional Metrics", styles["Heading3"]))
