@@ -1829,15 +1829,16 @@ st.dataframe(AM_view, use_container_width=True)
 
 # ... end of Ability Matrix render (plot + AM_view table) ...
 
-# ======================= RIE v1.1 + NRCI v2.1 — COMBINED DROP-IN (fixed) =======================
-# Trainer-facing Race Intelligence Engine (Six-Pillar) + Punter-facing NRCI (Run-Only)
-# No field-size placement, no “trip/track fit/weight/class move/form cycle” — run-only signals.
+# ======================= RIE v1.1 + NRCI v2.1 — ACCURACY PATCH (DROP-IN) =======================
+# Trainer-facing RIE (six pillars) + Punter-facing NRCI (run-only)
+# Enhancements: rank-CDF normalization, alpha shrink, shape evidence gate, coherence multiplier,
+# reliability moderation, adaptive verdict thresholds, precise trainer narratives.
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- Local helpers (safe, conflict-free) ----------
+# ---------- Tiny safe helpers ----------
 def _nz(x, alt=0.0):
     try:
         v = float(x)
@@ -1845,272 +1846,257 @@ def _nz(x, alt=0.0):
     except Exception:
         return alt
 
-def _soft_clip(v, lo, hi): return max(lo, min(hi, float(v)))
-
-def _pct01(x): return _soft_clip(x, 0.0, 1.0)
-
-def _absdiff_to_score(x, target=100.0, span=6.0):  # 100±span → full, then falls off
-    if not np.isfinite(x): return 0.0
-    d = abs(float(x) - target)
-    if d >= 2*span: return 0.0
-    # triangle peak 1.0 at d=0 → 0 at d=2*span
-    return _pct01(1.0 - d/(2.0*span))
-
-def _norm01(series):
-    s = pd.to_numeric(series, errors="coerce")
-    vals = s.dropna()
-    if vals.empty: return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
-    lo, hi = np.nanpercentile(vals, 10), np.nanpercentile(vals, 90)
-    if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
-        return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
-    return ((s - lo) / (hi - lo)).clip(0.0, 1.0)
-
-# --- Safe helper for scalar → Series conversion (used in Reliability/TFS) ---
 def _as_series(x, n, fill=np.nan):
     if isinstance(x, pd.Series):
         return pd.to_numeric(x, errors="coerce")
     try:
         return pd.Series(pd.to_numeric(x, errors="coerce"))
     except Exception:
-        return pd.Series([fill] * n)
+        return pd.Series([fill]*n)
 
-# --- Shape alignment (neutral = 5.0 if RSI unknown) ---
-def _shape_alignment_score(rsi, sci, accel, mid, grind):
-    """
-    Alignment with detected shape using this run only.
-    +ve RSI = SLOW_EARLY (late favoured)  → reward (accel-mid)+ and (grind-accel)- a touch
-    -ve RSI = FAST_EARLY (early favoured) → reward (accel-mid)- and (grind-accel)+ a touch
-    """
-    if not np.isfinite(rsi):
-        return 5.0   # neutral (important fix)
-    sci = 0.0 if not np.isfinite(sci) else float(sci)
-    a = _nz(accel); m = _nz(mid); g = _nz(grind)
-    dLM = a - m    # + late vs mid
-    dLG = g - a    # + attritional finish flavour
-    core = np.tanh((dLM/2.0)) * (1.0 if rsi >= 0 else -1.0)
-    flav = np.tanh((dLG/3.0))             # seasoning
-    gate = 0.60 + 0.40 * _pct01(sci)      # 0.6..1.0
-    score = (0.85*core + 0.15*flav) * gate
-    return _soft_clip(5.0 + 5.0*score, 0.0, 10.0)
+def _cdf01(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    return s.rank(pct=True, method="average").fillna(0.0).clip(0.0, 1.0)
 
-def _make_engine(df, gr_col):
-    # Prefer IAI; else composite from indices present.
-    if "IAI" in df.columns:
-        return pd.to_numeric(df["IAI"], errors="coerce")
-    return (
-        0.35*pd.to_numeric(df.get("tsSPI"), errors="coerce") +
-        0.25*pd.to_numeric(df.get("Accel"), errors="coerce") +
-        0.25*pd.to_numeric(df.get(gr_col), errors="coerce") +
-        0.15*pd.to_numeric(df.get("F200_idx"), errors="coerce")
-    )
+def _alpha(n_valid: int) -> float:
+    n = max(0, int(n_valid))
+    return n / (n + 6.0)
 
-# ---------- Build RIE v1.1 (Trainer) ----------
-def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
-    df = metrics.copy()
-    if "Horse" not in df.columns:
-        df["Horse"] = "(Unnamed)"
+def _shape_strength(RSI: float, SCI: float) -> float:
+    r = 0.0 if not np.isfinite(RSI) else min(1.0, abs(float(RSI))/6.0)
+    s = 0.0 if not np.isfinite(SCI) else float(SCI)
+    return r * (0.5 + 0.5*s)  # 0..1
 
-    # Which grind column are we using?
-    gr_col = metrics.attrs.get("GR_COL", "Grind")
+def _coherence(a01: float, p01: float, e01: float) -> float:
+    # require ability + (pressure OR efficiency)
+    return 0.5 + 0.5 * min(a01, max(p01, e01))  # 0.5..1.0
+
+def _reliability_multiplier(R10: float) -> float:
+    # R10 is 0..10 pillar; keep moderation mild
+    return 0.85 + 0.15 * max(0.0, min(10.0, float(R10))) / 10.0
+
+def _absdiff_tri(x, target) -> float:
+    if not np.isfinite(x): return 0.0
+    d = abs(float(x) - float(target))
+    # peak 1 at d=0, →0 at d≈12 (broad tolerance for late balance)
+    span = 12.0
+    return max(0.0, 1.0 - d/span)
+
+# ---------- Common primitives ----------
+def _pick_gr_col(df):
+    gr_col = getattr(df, "attrs", {}).get("GR_COL", "Grind")
     if gr_col not in df.columns and "Grind" in df.columns:
         gr_col = "Grind"
+    return gr_col
 
-    rsi = float(metrics.attrs.get("RSI", np.nan))
-    sci = float(metrics.attrs.get("SCI", 0.0))
+def _engine_vector(df, gr_col):
+    if "IAI" in df.columns:
+        return pd.to_numeric(df["IAI"], errors="coerce")
+    return (0.35*pd.to_numeric(df.get("tsSPI"), errors="coerce") +
+            0.25*pd.to_numeric(df.get("Accel"), errors="coerce") +
+            0.25*pd.to_numeric(df.get(gr_col), errors="coerce") +
+            0.15*pd.to_numeric(df.get("F200_idx"), errors="coerce"))
 
-    # Pillar 1 — Engine (0..10): normalize IAI (or composite) within race
-    eng_raw = _make_engine(df, gr_col)
-    P1 = (10.0 * _norm01(eng_raw)).fillna(0.0)
+def _shape_alignment_base(rsi, sci, accel, mid, grind):
+    if not np.isfinite(rsi): return 5.0  # neutral 5/10
+    a = _nz(accel, 100.0); m = _nz(mid, 100.0); g = _nz(grind, 100.0)
+    dLM = a - m               # + late vs mid
+    dLG = g - a               # + attritional finish
+    core = np.tanh(dLM/2.0) * (1.0 if rsi >= 0 else -1.0)
+    flav = np.tanh(dLG/3.0)
+    gate = 0.60 + 0.40 * (0.0 if not np.isfinite(sci) else float(sci))  # 0.6..1.0
+    score = (0.85*core + 0.15*flav) * gate     # -1..1
+    return float(5.0 + 5.0*score)              # 0..10
 
-    # Pillar 2 — Efficiency (0..10): closeness of BAL/COMP to 100
+def _adaptive_verdicts(scores: pd.Series, labels: tuple[str, str, str, str]):
+    # Labels ordered weakest→strongest
+    s = pd.to_numeric(scores, errors="coerce").fillna(0.0)
+    p50, p65, p80 = np.percentile(s, [50, 65, 80]) if len(s) else (6.0, 7.0, 8.0)
+    out = []
+    for v in s:
+        if v >= p80: out.append(labels[3])
+        elif v >= p65: out.append(labels[2])
+        elif v >= p50: out.append(labels[1])
+        else: out.append(labels[0])
+    return out
+
+# ---------- RIE v1.1 (Trainer) ----------
+def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
+    df = metrics.copy()
+    if "Horse" not in df.columns: df["Horse"] = "(Unnamed)"
+    gr_col = _pick_gr_col(df)
+    rsi = float(df.attrs.get("RSI", np.nan))
+    sci = float(df.attrs.get("SCI", 0.0))
+
+    # Pillar 1 — Engine (CDF)
+    eng_raw = _engine_vector(df, gr_col)
+    eng01   = _cdf01(eng_raw); P1 = 10.0*eng01*_alpha(eng01.notna().sum())
+
+    # Pillar 2 — Efficiency (balance & comp around per-race medians)
     if "BAL" not in df.columns:
         df["BAL"] = 100.0 - (pd.to_numeric(df.get("Accel"), errors="coerce")
                               - pd.to_numeric(df.get(gr_col), errors="coerce")).abs()/2.0
     if "COMP" not in df.columns:
         df["COMP"] = 100.0 - (pd.to_numeric(df.get("tsSPI"), errors="coerce") - 100.0).abs()
-    eff = 0.6*df["BAL"].map(lambda v: _absdiff_to_score(v, 100.0, span=6.0)) + \
-          0.4*df["COMP"].map(lambda v: _absdiff_to_score(v, 100.0, span=8.0))
-    P2 = (10.0 * eff).fillna(0.0)
+    bal_med = float(pd.to_numeric(df["BAL"], errors="coerce").median(skipna=True))
+    comp_med = float(pd.to_numeric(df["COMP"], errors="coerce").median(skipna=True))
+    eff01 = 0.6*df["BAL"].map(lambda v: _absdiff_tri(v, bal_med)) + \
+            0.4*df["COMP"].map(lambda v: _absdiff_tri(v, comp_med))
+    P2 = 10.0*pd.to_numeric(eff01, errors="coerce")*_alpha(np.isfinite(eff01).sum())
 
-    # Pillar 3 — Shape Fit (0..10): alignment with this race’s RSI/SCI using only this run
+    # Pillar 3 — Shape Fit (base × evidence)
     accel = pd.to_numeric(df.get("Accel"), errors="coerce")
     mid   = pd.to_numeric(df.get("tsSPI"), errors="coerce")
     grind = pd.to_numeric(df.get(gr_col), errors="coerce")
-    P3 = pd.Series(
-        [_shape_alignment_score(rsi, sci, a, m, g)
-         for a, m, g in zip(accel.fillna(100.0), mid.fillna(100.0), grind.fillna(100.0))],
-        index=df.index, dtype=float
-    )
+    base = pd.Series([_shape_alignment_base(rsi, sci, a, m, g)
+                      for a, m, g in zip(accel.fillna(100), mid.fillna(100), grind.fillna(100))], index=df.index)
+    strength = _shape_strength(rsi, sci)  # 0..1
+    P3 = base * strength
 
-    # Pillar 4 — Tenacity (0..10): corrected grind & finish resilience from this run
+    # Pillar 4 — Tenacity (hold late speed; asymm weighting)
     gr_idx = pd.to_numeric(df.get(gr_col), errors="coerce")
-    dG     = pd.to_numeric(df.get("DeltaG"), errors="coerce")            # 100*(grd/mid)
-    finF   = pd.to_numeric(df.get("FinisherFactor"), errors="coerce")    # 0..1
-    ten = (
-        0.65 * ((gr_idx - 98.0)/6.0).clip(0.0, 1.0) +
-        0.25 * ((dG - 98.0)/6.0).clip(0.0, 1.0) +
-        0.10 * finF.clip(0.0, 1.0).fillna(0.0)
-    )
-    P4 = (10.0 * ten).fillna(0.0)
+    dG     = pd.to_numeric(df.get("DeltaG"), errors="coerce")
+    ten_core = 0.70 * (gr_idx - 100.0).clip(lower=0.0) + 0.30 * (dG - 98.0).clip(lower=0.0)
+    P4 = 10.0 * _cdf01(ten_core) * _alpha(np.isfinite(ten_core).sum())
 
-    # Pillar 5 — Big-Moment Index (0..10): GCI/GCI_RS scaled within race
+    # Pillar 5 — Big-Moment (GCI within race)
     gci = pd.to_numeric(df.get("GCI_RS", df.get("GCI")), errors="coerce")
-    P5  = (10.0 * _norm01(gci)).fillna(0.0)
+    P5 = 10.0 * _cdf01(gci) * _alpha(gci.notna().sum())
 
-    # Pillar 6 — Reliability (0..10): completeness + low friction + late stability
-    have_cols = [c for c in ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"] if c in df.columns]
-    if have_cols:
-        completeness = df[have_cols].notna().sum(axis=1) / float(len(have_cols))
-    else:
-        completeness = pd.Series(0.6, index=df.index, dtype=float)
-
-    tfs_ser = _as_series(df.get("TFS"), len(df)).where(lambda s: np.isfinite(s))
-    valid_tfs = tfs_ser.dropna()
+    # Pillar 6 — Reliability (integrity + late stability − TFS)
+    valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
+    completeness = df[valid_cols].notna().sum(axis=1) / len(valid_cols)
+    tfs = _as_series(df.get("TFS"), len(df)).where(lambda x: x>=0)
+    valid_tfs = tfs.dropna()
     if len(valid_tfs) >= 3:
-        spread = float(valid_tfs.quantile(0.85) - valid_tfs.quantile(0.15))
-        spread = max(spread, 1e-6)
-        tfs_pen = (tfs_ser / spread).clip(0.0, 1.0).fillna(0.0)
+        spread = float(valid_tfs.quantile(0.85) - valid_tfs.quantile(0.15)) or 1e-6
+        tfs_pen = (tfs / spread).clip(0.0, 1.0).fillna(0.0)
     else:
         tfs_pen = pd.Series(0.0, index=df.index)
+    late_stab = 1.0 - (abs(accel - grind)/6.0).clip(0.0, 1.0)
+    R01 = (0.55*completeness + 0.20*(1.0 - tfs_pen) + 0.25*late_stab).clip(0.0, 1.0)
+    P6 = 10.0 * R01
 
-    late_stability = 1.0 - (abs(pd.to_numeric(df.get("Accel"), errors="coerce")
-                           - pd.to_numeric(df.get(gr_col), errors="coerce")) / 6.0).clip(0.0, 1.0)
-    rel = (0.55 * completeness +
-           0.20 * (1.0 - tfs_pen) +
-           0.25 * late_stability.fillna(0.0))
-    P6 = (10.0 * rel.clip(0.0, 1.0)).fillna(0.0)
-
-    # Weights (sum = 1.0) — trainer lens: Engine/Tenacity/Shape carry more
+    # Trainer headline: weights + coherence + reliability moderation
+    # (Engine, Tenacity, Shape carry more weight)
     w1,w2,w3,w4,w5,w6 = 0.26,0.12,0.18,0.20,0.14,0.10
-    RIE = (w1*P1 + w2*P2 + w3*P3 + w4*P4 + w5*P5 + w6*P6).round(2)
+    # Coherence uses 0..1 components
+    coh = _coherence(eng01.fillna(0.0), _cdf01(ten_core).fillna(0.0), pd.to_numeric(eff01, errors="coerce").clip(0,1).fillna(0.0))
+    headline = (w1*P1 + w2*P2 + w3*P3 + w4*P4 + w5*P5 + w6*P6)
+    RIE = (headline * coh * _reliability_multiplier(P6)).round(2)
 
-    # Verdict & Trainer Narrative
-    def _verdict(s):
-        if s >= 8.2: return "Strong Win Candidate"
-        if s >= 7.2: return "Win/Place Material"
-        if s >= 6.2: return "Competitive Chance"
-        return "Needs Setup / Place"
+    # Adaptive verdicts
+    verdicts = _adaptive_verdicts(RIE, (
+        "Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"
+    ))
 
-    def _trainer_note(row, score):
+    # Trainer narrative (ordered triggers, contradiction guard)
+    def _trainer_note(row, p3, score):
         bits = []
-        if score >= 7.2 and _nz(row.get(gr_col)) >= 101.0: bits.append("finishes off strongly")
-        if score >= 7.2 and _nz(row.get("Accel")) >= 101.5: bits.append("turn-of-foot confirmed")
-        if np.isfinite(rsi) and abs(rsi) >= 2.0:
-            align_sc = _shape_alignment_score(rsi, sci, row.get("Accel"), row.get("tsSPI"), row.get(gr_col))
-            bits.append("ran with shape" if align_sc >= 6.5 else "ran against shape")
-        if _nz(row.get("BAL")) >= 100.0: bits.append("late balance sound")
-        if not bits: bits.append("solid run-only profile")
-        return "; ".join(bits).capitalize() + "."
+        a = _nz(row.get("Accel")); g = _nz(row.get(gr_col)); t = _nz(row.get("tsSPI"))
+        bal = _nz(row.get("BAL"))
+        # A) late strength
+        if (g >= 101.0) or (a >= 101.5): bits.append("finishes off strongly")
+        # B) rhythm
+        if (t >= 100.5) and (g >= 100.5): bits.append("maintained strong rhythm")
+        # C) shape
+        if _shape_strength(rsi, sci) >= 0.35:
+            align = "with shape" if p3 >= 6.5 else "against shape"
+            bits.append(f"ran {align}")
+        # D) balance
+        if bal >= 100.0: bits.append("late balance sound")
+        if not bits:
+            bits.append("solid run-only profile")
+        # tidy
+        msg = "; ".join(bits)
+        msg = msg.replace("with shape; against shape","with shape") \
+                 .replace("against shape; with shape","against shape")
+        return msg[0].upper() + msg[1:] + "."
 
     out = pd.DataFrame({
         "Horse": df["Horse"].astype(str),
         "RIE_Score": RIE,
-        "Verdict": [ _verdict(s) for s in RIE ],
+        "Verdict": verdicts,
         "P1_Engine": P1.round(2),
         "P2_Efficiency": P2.round(2),
         "P3_ShapeFit": P3.round(2),
         "P4_Tenacity": P4.round(2),
         "P5_BigMoment": P5.round(2),
         "P6_Reliability": P6.round(2),
-        "TrainerNote": [ _trainer_note(r, s) for (_, r), s in zip(df.iterrows(), RIE) ]
+        "TrainerNote": [ _trainer_note(r, p3, s) for (_, r), p3, s in zip(df.iterrows(), P3, RIE) ]
     })
     cat = pd.Categorical(out["Verdict"], ordered=True,
                          categories=["Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"])
     return out.assign(_k=cat).sort_values(["_k","RIE_Score"], ascending=[True, False]).drop(columns=["_k"])
 
-# ---------- NRCI helpers ----------
-def _calc_class_response(rqs_value: float, ability_pulse: pd.Series, ncri: pd.Series) -> pd.Series:
-    """
-    Purely this run: compare runner ability (0..10) to a race 'class bar' from RQS.
-    """
-    class_bar = min(10.0, max(0.0, 3.5 + 0.07 * float(rqs_value or 0.0)))  # 50->~7.0, 80->~9.1
-    delta = ability_pulse.fillna(0.0) - class_bar
-    out = []
-    for d, score in zip(delta, ncri.fillna(0.0)):
-        if d >= 1.0 and score >= 6.8:
-            out.append("Can step up in class")
-        elif d >= 0.3 and score >= 6.0:
-            out.append("Can step up slightly")
-        elif d <= -1.2 and score <= 5.2:
-            out.append("Better kept to easier grade")
-        elif d <= -0.4:
-            out.append("Better kept to same/slightly easier")
-        else:
-            out.append("Suited to similar opposition")
-    return pd.Series(out, index=ability_pulse.index)
-
-# ---------- Build NRCI v2.1 (Punter; Run-Only + Class Response Hint) ----------
+# ---------- NRCI v2.1 (Punter) ----------
 def build_NRCI_v21(metrics: pd.DataFrame) -> pd.DataFrame:
     df = metrics.copy()
-    if "Horse" not in df.columns:
-        df["Horse"] = "(Unnamed)"
-    gr_col = metrics.attrs.get("GR_COL", "Grind")
-    if gr_col not in df.columns and "Grind" in df.columns:
-        gr_col = "Grind"
+    if "Horse" not in df.columns: df["Horse"] = "(Unnamed)"
+    gr_col = _pick_gr_col(df)
+    rsi = float(df.attrs.get("RSI", np.nan))
+    sci = float(df.attrs.get("SCI", 0.0))
 
-    rsi = float(metrics.attrs.get("RSI", np.nan))
-    sci = float(metrics.attrs.get("SCI", 0.0))
-    rqs = float(metrics.attrs.get("RQS", np.nan))
-
-    # A) Ability pulse: PI within race (prefer PI_RS)
+    # Components (all run-only) mapped by CDF and shrunk
     pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
-    A  = (10.0 * _norm01(pi)).fillna(0.0)
+    A01 = _cdf01(pi); A = 10.0*A01*_alpha(A01.notna().sum())
 
-    # B) Shape alignment (same mapping as RIE)
     accel = pd.to_numeric(df.get("Accel"), errors="coerce")
     mid   = pd.to_numeric(df.get("tsSPI"), errors="coerce")
     grind = pd.to_numeric(df.get(gr_col), errors="coerce")
-    S = pd.Series([ _shape_alignment_score(rsi, sci, a, m, g)
-                    for a, m, g in zip(accel.fillna(100.0), mid.fillna(100.0), grind.fillna(100.0)) ],
-                  index=df.index, dtype=float)
+    S_base10 = pd.Series([_shape_alignment_base(rsi, sci, a, m, g)
+                          for a, m, g in zip(accel.fillna(100), mid.fillna(100), grind.fillna(100))], index=df.index)
+    S = S_base10 * _shape_strength(rsi, sci)
 
-    # C) Pressure/finish mettle: corrected grind & DeltaG
     gr_idx = pd.to_numeric(df.get(gr_col), errors="coerce")
     dG     = pd.to_numeric(df.get("DeltaG"), errors="coerce")
-    P = (10.0 * (0.70*((gr_idx-98.0)/6.0).clip(0.0,1.0) + 0.30*((dG-98.0)/6.0).clip(0.0,1.0))).fillna(0.0)
+    press_core = 0.70*(gr_idx-100.0).clip(lower=0.0) + 0.30*(dG-98.0).clip(lower=0.0)
+    P01 = _cdf01(press_core); P = 10.0*P01*_alpha(P01.notna().sum())
 
-    # D) Efficiency: BAL closeness
     if "BAL" not in df.columns:
-        df["BAL"] = 100.0 - (pd.to_numeric(df.get("Accel"), errors="coerce")
-                              - pd.to_numeric(df.get(gr_col), errors="coerce")).abs()/2.0
-    E = (10.0 * df["BAL"].map(lambda v: _absdiff_to_score(v, 100.0, span=6.0))).fillna(0.0)
+        df["BAL"] = 100.0 - (accel - grind).abs()/2.0
+    bal_med = float(pd.to_numeric(df["BAL"], errors="coerce").median(skipna=True))
+    E01 = df["BAL"].map(lambda v: _absdiff_tri(v, bal_med))
+    E = 10.0*pd.to_numeric(E01, errors="coerce")*_alpha(np.isfinite(E01).sum())
 
-    # E) Reliability: data completeness only
-    have_cols = [c for c in ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"] if c in df.columns]
-    if have_cols:
-        completeness = df[have_cols].notna().sum(axis=1) / float(len(have_cols))
-    else:
-        completeness = pd.Series(0.6, index=df.index, dtype=float)
-    R = (10.0 * completeness).fillna(0.0)
+    valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
+    completeness = df[valid_cols].notna().sum(axis=1) / len(valid_cols)
+    R = 10.0*completeness
 
-    # Weights — punter lens
+    # Headline (punter weights)
     wA,wS,wP_,wE,wR_ = 0.34, 0.26, 0.20, 0.12, 0.08
-    ncri = (wA*A + wS*S + wP_*P + wE*E + wR_*R).round(2)
+    coh = _coherence(A01.fillna(0.0), P01.fillna(0.0), pd.to_numeric(E01, errors="coerce").clip(0,1).fillna(0.0))
+    ncri = (wA*A + wS*S + wP_*P + wE*E + wR_*R) * coh * _reliability_multiplier(R)
+    ncri = ncri.round(2)
 
-    # Class response (text)
-    ClassResponse = _calc_class_response(rqs, A, ncri)
+    # Verdicts (adaptive to race)
+    pv = _adaptive_verdicts(ncri, ("Speculative","Each-way","Solid chance","High confidence"))
 
-    def _ncri_verdict(s):
-        if s >= 8.2: return "High confidence"
-        if s >= 7.0: return "Solid chance"
-        if s >= 6.0: return "Each-way"
-        return "Speculative"
+    # Class response hint (simple, run-only inference)
+    IAI = pd.to_numeric(df.get("IAI"), errors="coerce")
+    if not isinstance(IAI, pd.Series): IAI = pd.Series([np.nan]*len(df))
+    p90 = float(np.nanpercentile(pi.fillna(0), 90)) if np.isfinite(pi).any() else np.nan
+    def _class_hint(pi_v, iai_v):
+        pi_v = _nz(pi_v); eng = _nz(iai_v)
+        if (np.isfinite(p90) and pi_v >= p90) and eng >= 101.5: return "Likely copes up one grade"
+        if pi_v >= _nz(np.nanpercentile(pi.fillna(0), 60), pi_v) and eng >= 100.5: return "Suited to similar grade"
+        return "Better kept to same/slightly easier"
+    ClassHint = [ _class_hint(pv, iv) for pv, iv in zip(pi, IAI) ]
 
     out = pd.DataFrame({
         "Horse": df["Horse"].astype(str),
         "NRCI": ncri,
-        "PunterVerdict": [ _ncri_verdict(s) for s in ncri ],
+        "PunterVerdict": pv,
         "A_Ability": A.round(2),
         "S_Shape": S.round(2),
         "P_Pressure": P.round(2),
         "E_Efficiency": E.round(2),
         "R_Reliability": R.round(2),
-        "ClassResponse": ClassResponse
+        "ClassResponse": ClassHint
     }).sort_values("NRCI", ascending=False)
-
     return out
 
-# ---------- Render UI ----------
+# ---------- Render ----------
 st.markdown("---")
 st.markdown("## Race Intelligence Suite")
 
@@ -2118,7 +2104,7 @@ try:
     RIE_v11_view = build_RIE_v11(metrics)
     st.markdown("### RIE v1.1 — Six-Pillar Intelligence (Trainer)")
     st.dataframe(RIE_v11_view, use_container_width=True)
-    st.caption("RIE pillars (0–10): Engine · Efficiency · ShapeFit · Tenacity · Big-Moment · Reliability. Verdict and note are run-only.")
+    st.caption("RIE (0–10): Engine · Efficiency · ShapeFit · Tenacity · Big-Moment · Reliability. Verdicts are adaptive to the race spread; notes are run-only.")
 except Exception as e:
     st.error("RIE v1.1 failed.")
     st.exception(e)
@@ -2127,12 +2113,11 @@ try:
     NRCI_v21_view = build_NRCI_v21(metrics)
     st.markdown("### NRCI v2.1 — Punter Confidence (Run-Only)")
     st.dataframe(NRCI_v21_view, use_container_width=True)
-    st.caption("NRCI combines only this race’s signals (no trip/track fit/weight/class move/form cycle). ClassResponse compares ability to a class bar inferred from RQS.")
+    st.caption("NRCI blends Ability, Shape, Pressure, Efficiency and Reliability (run-only), with coherence and reliability moderation. Verdicts are adaptive.")
 except Exception as e:
     st.error("NRCI v2.1 failed.")
     st.exception(e)
-
-# ======================= /END RIE v1.1 + NRCI v2.1 DROP-IN =======================
+# ======================= /END ACCURACY PATCH =======================
 # ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
 import sqlite3
 import io
