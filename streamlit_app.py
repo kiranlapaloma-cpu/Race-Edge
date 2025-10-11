@@ -2071,47 +2071,43 @@ def _merge_context_for_rie(metrics_df: pd.DataFrame,
 
 # ---- Build and show RIE table (place this after Ability Matrix section) ----
 try:
-    # Merge AM/HH/AH context so _flags() has what it needs
-    _ctx_for_rie = _merge_context_for_rie(
-        metrics,
-        AM_view if 'AM_view' in globals() else None,
-        hh_view if 'hh_view' in globals() else None,
-        AH_view if 'AH_view' in globals() else None
-    )
+    RIE_view = build_rie_table(metrics)
 
-    # Build core RIE from the enriched context
-    RIE_view = build_rie_table(_ctx_for_rie)
-
-    # ---- Add explicit Next-Up Confidence label (🟢/🟡/⚪/🔴) ----
-    def _nextup_label(row, rsi=metrics.attrs.get("RSI",0.0), sci=metrics.attrs.get("SCI",0.5)):
-        nrc = float(row.get("NRCI", 0.0))
-        abil = float(row.get("AbilityScore", 0.0)) if "AbilityScore" in row else 0.0
-        hid  = float(row.get("HiddenScore", 0.0)) if "HiddenScore" in row else 0.0
-        align = str(row.get("ShapeAlignment",""))
-        # Base 0..1 from NRCI, lightly sweetened by Ability/Hidden
-        score = (nrc/10.0) + 0.15*(abil/10.0) + 0.08*min(hid/2.0, 1.0)
-        # Shape interaction: small boost if with-shape and RSI has some bite; small trim if against
+    # Optional: “next race confidence” label per row (kept simple & non-revealing)
+    def _nextup_label(row):
+        # Base from NRCI (0–10)
+        score = float(row.get("NRCI", 0.0)) if pd.notna(row.get("NRCI", np.nan)) else 0.0
+        # Flags sweetener
+        flags = row.get("Flags", [])
+        if isinstance(flags, list):
+            if any("Elite" in f or "Top Hidden" in f for f in flags):
+                score += 0.4
+            if any("Near-Elite" in f or "High profile" in f for f in flags):
+                score += 0.2
+        # With/against shape nudge
+        align = str(row.get("ShapeAlignment","")).lower()
+        rsi = float(metrics.attrs.get("RSI", 0.0))
+        sci = float(metrics.attrs.get("SCI", 0.5))
         if "with shape" in align and abs(rsi) >= 2.0:
-            score += 0.06 * (0.6 + 0.4*min(1.0, abs(rsi)/6.0)) * (0.6 + 0.4*max(0.0, (sci-0.5)/0.5))
-        if "against shape" in align and abs(rsi) >= 3.0:
-            score -= 0.05
-        score = max(0.0, min(1.0, score))
-        if score >= 0.75: return "🟢 High"
-        if score >= 0.55: return "🟡 Medium"
-        if score >= 0.40: return "⚪ Low"
-        return "🔴 Speculative"
+            score += 0.6 * (0.6 + 0.4*min(1.0, abs(rsi)/6.0)) * (0.6 + 0.4*max(0.0, (sci-0.5)/0.5))
+        elif "against shape" in align and abs(rsi) >= 3.0:
+            score -= 0.5
+        score = max(0.0, min(10.0, score))
+        if score >= 7.5:  return "🟢 High"
+        if score >= 6.5:  return "🟡 Medium"
+        if score >= 5.4:  return "🔵 Low"
+        return "⚪ Speculative"
 
-    # Attach NextUpConfidence + stringify Flags for UI
-        _rie_show = RIE_view.copy()
-        _rie_show["NextUpConfidence"] = _rie_show.apply(_nextup_label, axis=1)
-        _rie_show["Flags"] = _rie_show["Flags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
+    _rie_show = RIE_view.copy()
+    _rie_show["NextUpConfidence"] = _rie_show.apply(_nextup_label, axis=1)
+    _rie_show["Flags"] = _rie_show["Flags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
 
     st.dataframe(_rie_show, use_container_width=True)
     st.caption("NRCI = Narrative Race Confidence Index (0–10). Alignment arrow shows with/against the identified race shape.")
     st.markdown("**Legend:** ⬆️ with shape · ⬇️ against shape · ⟷ neutral")
 
 except Exception as e:
-    st.error("❌ Failed to build RIE.")
+    st.error("Failed to build RIE.")
     st.exception(e)
 
 # ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
@@ -2203,10 +2199,13 @@ def _insert_or_replace(conn: sqlite3.Connection, tbl: str, row_dict: dict):
     cols_present = _table_cols(conn, tbl)
     payload = {k: v for k, v in row_dict.items() if k in cols_present}
     if not payload:
-    return
+        return
     keys = ",".join(payload.keys())
     qmarks = ",".join(["?"] * len(payload))
-    conn.execute(f"INSERT OR REPLACE INTO {tbl} ({keys}) VALUES ({qmarks})", list(payload.values()))
+    conn.execute(
+        f"INSERT OR REPLACE INTO {tbl} ({keys}) VALUES ({qmarks})",
+        list(payload.values())
+    )
 
 # ----------------------- PDF Export -----------------------
 def _export_pdf_report(*,
