@@ -1899,6 +1899,20 @@ def _norm01(series):
         return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
     return ((s - lo) / (hi - lo)).clip(0.0, 1.0)
 
+# --- Safe helper for scalar → Series conversion (used in RIE v1.1 TFS patch) ---
+def _as_series(x, n, fill=np.nan):
+    """Ensure numeric input is a Series of length n.
+    Scalars become a full-NaN Series; lists become a Series.
+    """
+    if isinstance(x, pd.Series):
+        return pd.to_numeric(x, errors="coerce")
+    try:
+        # Try to convert lists/arrays directly
+        return pd.Series(pd.to_numeric(x, errors="coerce"))
+    except Exception:
+        # Fallback to NaN-filled
+        return pd.Series([fill] * n)
+
 # ---------- Build RIE v1.1 (Trainer) ----------
 def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     df = metrics.copy()
@@ -1956,24 +1970,25 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     # (No form/field-size placement; purely this run’s integrity)
     valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
     completeness = df[valid_cols].notna().sum(axis=1) / len(valid_cols)
-    tfs = pd.to_numeric(df.get("TFS", np.nan), errors="coerce")
-    # Replace this line in build_RIE_v11:
-    tfs_pen = (tfs / (tfs.quantile(0.85) - tfs.quantile(0.15) + 1e-6)).clip(0.0, 1.0)
+    # --- Trip-friction (TFS) penalty — robust to scalar or missing inputs ---
+    tfs_ser = _as_series(df.get("TFS"), len(df))
+    tfs_ser = tfs_ser.where(np.isfinite(tfs_ser))
+    valid = tfs_ser.dropna()
 
-    # With this:
-    if isinstance(tfs, (float, int)):
-        tfs_pen = 0.0
+    if len(valid) >= 3:
+        spread = float(valid.quantile(0.85) - valid.quantile(0.15))
+        spread = max(spread, 1e-6)
+        tfs_pen = (tfs_ser / spread).clip(0.0, 1.0).fillna(0.0)
     else:
-        tfs = pd.to_numeric(tfs, errors="coerce")
-        if len(tfs.dropna()) > 1:
-            spread = (tfs.quantile(0.85) - tfs.quantile(0.15) + 1e-6)
-            tfs_pen = (tfs / spread).clip(0.0, 1.0)
-        else:
-            tfs_pen = 0.0
+        # Not enough data — disable penalty safely
+        tfs_pen = pd.Series(0.0, index=df.index)
+
     late_stability = 1.0 - (abs(pd.to_numeric(df.get("Accel"), errors="coerce")
-                           - pd.to_numeric(df.get(gr_col), errors="coerce"))/6.0).clip(0.0, 1.0)
-    rel = (0.55*completeness + 0.20*(1.0 - tfs_pen.fillna(0.0)) + 0.25*late_stability.fillna(0.0))
-    P6 = (10.0 * rel.clip(0.0,1.0)).fillna(0.0)
+                           - pd.to_numeric(df.get(gr_col), errors="coerce")) / 6.0).clip(0.0, 1.0)
+    rel = (0.55 * completeness +
+           0.20 * (1.0 - tfs_pen.fillna(0.0)) +
+           0.25 * late_stability.fillna(0.0))
+    P6 = (10.0 * rel.clip(0.0, 1.0)).fillna(0.0)
 
     # Weights (sum = 1.0) — trainer lens: Engine/Tenacity/Shape carry more
     w1,w2,w3,w4,w5,w6 = 0.26,0.12,0.18,0.20,0.14,0.10
