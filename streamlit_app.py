@@ -1957,7 +1957,19 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
     completeness = df[valid_cols].notna().sum(axis=1) / len(valid_cols)
     tfs = pd.to_numeric(df.get("TFS", np.nan), errors="coerce")
+    # Replace this line in build_RIE_v11:
     tfs_pen = (tfs / (tfs.quantile(0.85) - tfs.quantile(0.15) + 1e-6)).clip(0.0, 1.0)
+
+    # With this:
+    if isinstance(tfs, (float, int)):
+        tfs_pen = 0.0
+    else:
+        tfs = pd.to_numeric(tfs, errors="coerce")
+        if len(tfs.dropna()) > 1:
+            spread = (tfs.quantile(0.85) - tfs.quantile(0.15) + 1e-6)
+            tfs_pen = (tfs / spread).clip(0.0, 1.0)
+        else:
+            tfs_pen = 0.0
     late_stability = 1.0 - (abs(pd.to_numeric(df.get("Accel"), errors="coerce")
                            - pd.to_numeric(df.get(gr_col), errors="coerce"))/6.0).clip(0.0, 1.0)
     rel = (0.55*completeness + 0.20*(1.0 - tfs_pen.fillna(0.0)) + 0.25*late_stability.fillna(0.0))
@@ -2069,7 +2081,10 @@ def build_NRCI_v21(metrics: pd.DataFrame) -> pd.DataFrame:
         # Otherwise
         return "Better kept to same/slightly easier"
 
-    ClassHint = [ _class_hint(pv, iv) for pv, iv in zip(pi, df.get("IAI", np.nan)) ]
+    iai_series = pd.to_numeric(df.get("IAI"), errors="coerce")
+    if not isinstance(iai_series, pd.Series):
+        iai_series = pd.Series(np.repeat(np.nan, len(df)))
+    ClassHint = [ _class_hint(pv, iv) for pv, iv in zip(pi, iai_series) ]
 
     # Simple label for punters
     def _ncri_verdict(s):
