@@ -2043,76 +2043,99 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
                          categories=["Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"])
     return out.assign(_k=cat).sort_values(["_k","RIE_Score"], ascending=[True, False]).drop(columns=["_k"])
 
-# ---------- NRCI v2.1 (Punter) ----------
-def build_NRCI_v21(metrics: pd.DataFrame) -> pd.DataFrame:
-    df = metrics.copy()
-    if "Horse" not in df.columns: df["Horse"] = "(Unnamed)"
-    gr_col = _pick_gr_col(df)
-    rsi = float(df.attrs.get("RSI", np.nan))
-    sci = float(df.attrs.get("SCI", 0.0))
+# =========================
+# NRCI v2.1 — Punter-facing
+# =========================
+# Inputs expected from RIE stage:
+#   P1_Engine, P2_Efficiency, P3_ShapeFit, P4_Tenacity, P6_Reliability
+# These are used to derive:
+#   A_Ability, S_Shape, P_Pressure, E_Efficiency, R_Reliability
 
-    # Components (all run-only) mapped by CDF and shrunk
-    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
-    A01 = _cdf01(pi); A = 10.0*A01*_alpha(A01.notna().sum())
+import numpy as np
+import pandas as pd
 
-    accel = pd.to_numeric(df.get("Accel"), errors="coerce")
-    mid   = pd.to_numeric(df.get("tsSPI"), errors="coerce")
-    grind = pd.to_numeric(df.get(gr_col), errors="coerce")
-    S_base10 = pd.Series([_shape_alignment_base(rsi, sci, a, m, g)
-                          for a, m, g in zip(accel.fillna(100), mid.fillna(100), grind.fillna(100))], index=df.index)
-    S = S_base10 * _shape_strength(rsi, sci)
+def _as_num(s):
+    return pd.to_numeric(s, errors="coerce")
 
-    gr_idx = pd.to_numeric(df.get(gr_col), errors="coerce")
-    dG     = pd.to_numeric(df.get("DeltaG"), errors="coerce")
-    press_core = 0.70*(gr_idx-100.0).clip(lower=0.0) + 0.30*(dG-98.0).clip(lower=0.0)
-    P01 = _cdf01(press_core); P = 10.0*P01*_alpha(P01.notna().sum())
+def _rank_pct(x: pd.Series) -> pd.Series:
+    # Robust 0–1 scaling using average ranks (handles ties & small fields)
+    x = _as_num(x)
+    n = x.notna().sum()
+    if n <= 1:
+        return pd.Series(np.zeros(len(x)), index=x.index)  # avoid div by zero
+    r = x.rank(method="average", na_option="keep")
+    return (r - 1) / (n - 1)
 
-    if "BAL" not in df.columns:
-        df["BAL"] = 100.0 - (accel - grind).abs()/2.0
-    bal_med = float(pd.to_numeric(df["BAL"], errors="coerce").median(skipna=True))
-    E01 = df["BAL"].map(lambda v: _absdiff_tri(v, bal_med))
-    E = 10.0*pd.to_numeric(E01, errors="coerce")*_alpha(np.isfinite(E01).sum())
+def _clip01(s):
+    return s.clip(lower=0.0, upper=1.0)
 
-    valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
-    completeness = df[valid_cols].notna().sum(axis=1) / len(valid_cols)
-    R = 10.0*completeness
+def compute_nrci(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-    # Headline (punter weights)
-    wA,wS,wP_,wE,wR_ = 0.34, 0.26, 0.20, 0.12, 0.08
-    coh = _coherence(A01.fillna(0.0), P01.fillna(0.0), pd.to_numeric(E01, errors="coerce").clip(0,1).fillna(0.0))
-    ncri = (wA*A + wS*S + wP_*P + wE*E + wR_*R) * coh * _reliability_multiplier(R)
-    ncri = ncri.round(2)
+    # ---- Map RIE pillars to NRCI sub-pillars ----
+    out["A_Ability"]     = _as_num(out.get("P1_Engine", np.nan))
+    out["S_Shape"]       = _as_num(out.get("P3_ShapeFit", np.nan))
+    out["P_Pressure"]    = _as_num(out.get("P4_Tenacity", np.nan))
+    out["E_Efficiency"]  = _as_num(out.get("P2_Efficiency", np.nan))
+    out["R_Reliability"] = _as_num(out.get("P6_Reliability", np.nan))
 
-    # Verdicts (adaptive to race)
-    pv = _adaptive_verdicts(ncri, ("Speculative","Each-way","Solid chance","High confidence"))
+    # ---- Normalize to 0–1 (within-race percentiles) ----
+    A = _rank_pct(out["A_Ability"])
+    S = _rank_pct(out["S_Shape"])
+    P = _rank_pct(out["P_Pressure"])
+    E = _rank_pct(out["E_Efficiency"])
+    # Reliability is already on 0–10; scale to 0–1 with a light percentile blend
+    R_linear = _clip01(out["R_Reliability"] / 10.0)
+    R = _clip01(0.5 * R_linear + 0.5 * _rank_pct(out["R_Reliability"]))
 
-    # Class response hint (simple, run-only inference)
-    IAI = pd.to_numeric(df.get("IAI"), errors="coerce")
-    if not isinstance(IAI, pd.Series): IAI = pd.Series([np.nan]*len(df))
-    p90 = float(np.nanpercentile(pi.fillna(0), 90)) if np.isfinite(pi).any() else np.nan
-    def _class_hint(pi_v, iai_v):
-        pi_v = _nz(pi_v); eng = _nz(iai_v)
-        if (np.isfinite(p90) and pi_v >= p90) and eng >= 101.5: return "Likely copes up one grade"
-        if pi_v >= _nz(np.nanpercentile(pi.fillna(0), 60), pi_v) and eng >= 100.5: return "Suited to similar grade"
-        return "Better kept to same/slightly easier"
-    ClassHint = [ _class_hint(pv, iv) for pv, iv in zip(pi, IAI) ]
+    # ---- Weights (sum to 1.00) ----
+    wA, wS, wP, wE, wR = 0.25, 0.15, 0.15, 0.25, 0.20
 
-    out = pd.DataFrame({
-        "Horse": df["Horse"].astype(str),
-        "NRCI": ncri,
-        "PunterVerdict": pv,
-        "A_Ability": A.round(2),
-        "S_Shape": S.round(2),
-        "P_Pressure": P.round(2),
-        "E_Efficiency": E.round(2),
-        "R_Reliability": R.round(2),
-        "ClassResponse": ClassHint
-    }).sort_values("NRCI", ascending=False)
+    # ---- NRCI scale (1.00 to 1.60) ----
+    # Base = 1.00; bonus up to +0.60 from weighted normalized pillars
+    core = (wA*A + wS*S + wP*P + wE*E + wR*R)
+    out["NRCI"] = 1.00 + 0.60 * core
+    out["NRCI"] = out["NRCI"].clip(1.00, 1.60)
+
+    # ---- Punter verdicts ----
+    def verdict(v):
+        if v >= 1.36: return "High confidence"
+        if v >= 1.28: return "Strong chance"
+        if v >= 1.20: return "Solid chance"
+        if v >= 1.14: return "Each-way"
+        return "Speculative"
+
+    out["PunterVerdict"] = out["NRCI"].apply(verdict)
+
+    # (Optional) Class response placeholder; keep your existing logic if you have one
+    out["ClassResponse"] = "Better kept to same/slightly easier"
+
+    # ---- Pretty order (match your screenshot) ----
+    cols = [
+        "Horse", "NRCI", "PunterVerdict",
+        "A_Ability", "S_Shape", "P_Pressure",
+        "E_Efficiency", "R_Reliability",
+        "ClassResponse"
+    ]
+    # Only keep columns that exist; this allows safe use during dev
+    cols = [c for c in cols if c in out.columns]
+    out = out[cols].sort_values("NRCI", ascending=False, kind="mergesort").reset_index(drop=True)
+
+    # Round for display
+    num_cols = ["NRCI","A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability"]
+    for c in num_cols:
+        if c in out.columns:
+            out[c] = _as_num(out[c]).round(2)
+
     return out
 
 # ---------- Render ----------
-st.markdown("---")
-st.markdown("## Race Intelligence Suite")
+nrci_table = compute_nrci(rie_df if "rie_df" in locals() else df)  # use your RIE dataframe
+st.dataframe(
+    nrci_table,
+    use_container_width=True,
+    hide_index=True
+)
 
 try:
     RIE_v11_view = build_RIE_v11(metrics)
