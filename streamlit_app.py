@@ -1918,7 +1918,7 @@ def _flags(row) -> list:
     out = []
     tier = str(row.get("AbilityTier","")).strip()
     near = str(row.get("NearEliteFlag","")).strip()
-    hh_t = str(row.get("Tier","")).strip()  # Hidden Horses tier if present
+    hh_t = str(row.get("HH_Tier","")).strip()  # <-- renamed
     ah_t = str(row.get("AH_Tier","")).strip()
 
     if tier.startswith("🥇"): out.append("Elite profile")
@@ -1985,6 +1985,28 @@ def _nrc_index(row, align_score: float, sci: float, rsi: float) -> float:
 def build_rie_table(metrics: pd.DataFrame) -> pd.DataFrame:
     df = metrics.copy()
 
+def _merge_context_for_rie(metrics_df: pd.DataFrame,
+                           AM_view_df: pd.DataFrame | None = None,
+                           hh_view_df: pd.DataFrame | None = None,
+                           AH_view_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Light-merge the derived views back onto metrics by Horse so RIE can see tiers/flags."""
+    base = metrics_df.copy()
+    if isinstance(AM_view_df, pd.DataFrame) and not AM_view_df.empty:
+        keep = ["Horse","AbilityScore","AbilityTier","NearEliteFlag","DirectionHint","Confidence","PI","GCI"]
+        base = base.merge(AM_view_df[[c for c in keep if c in AM_view_df.columns]].drop_duplicates("Horse"),
+                          on="Horse", how="left")
+    if isinstance(hh_view_df, pd.DataFrame) and not hh_view_df.empty:
+        keep = ["Horse","HiddenScore","Tier"]
+        tmp = hh_view_df[[c for c in keep if c in hh_view_df.columns]].drop_duplicates("Horse")
+        # Avoid name clash with Ability 'Tier'
+        tmp = tmp.rename(columns={"Tier":"HH_Tier"})
+        base = base.merge(tmp, on="Horse", how="left")
+    if isinstance(AH_view_df, pd.DataFrame) and not AH_view_df.empty:
+        keep = ["Horse","AHS","AH_Tier","AH_Confidence"]
+        base = base.merge(AH_view_df[[c for c in keep if c in AH_view_df.columns]].drop_duplicates("Horse"),
+                          on="Horse", how="left")
+    return base
+
     # choose grind column
     gr_col = metrics.attrs.get("GR_COL", "Grind")
     if gr_col not in df.columns and "Grind" in df.columns:
@@ -2049,10 +2071,41 @@ def build_rie_table(metrics: pd.DataFrame) -> pd.DataFrame:
 
 # ---- Build and show RIE table (place this after Ability Matrix section) ----
 try:
-    RIE_view = build_rie_table(metrics)
-    # Pretty print Flags as comma-separated for the UI
+    # Merge AM/HH/AH context so _flags() has what it needs
+    _ctx_for_rie = _merge_context_for_rie(
+        metrics,
+        AM_view if 'AM_view' in globals() else None,
+        hh_view if 'hh_view' in globals() else None,
+        AH_view if 'AH_view' in globals() else None
+    )
+
+    # Build core RIE from the enriched context
+    RIE_view = build_rie_table(_ctx_for_rie)
+
+    # ---- Add explicit Next-Up Confidence label (🟢/🟡/⚪/🔴) ----
+    def _nextup_label(row, rsi=metrics.attrs.get("RSI",0.0), sci=metrics.attrs.get("SCI",0.5)):
+        nrc = float(row.get("NRCI", 0.0))
+        abil = float(row.get("AbilityScore", 0.0)) if "AbilityScore" in row else 0.0
+        hid  = float(row.get("HiddenScore", 0.0)) if "HiddenScore" in row else 0.0
+        align = str(row.get("ShapeAlignment",""))
+        # Base 0..1 from NRCI, lightly sweetened by Ability/Hidden
+        score = (nrc/10.0) + 0.15*(abil/10.0) + 0.08*min(hid/2.0, 1.0)
+        # Shape interaction: small boost if with-shape and RSI has some bite; small trim if against
+        if "with shape" in align and abs(rsi) >= 2.0:
+            score += 0.06 * (0.6 + 0.4*min(1.0, abs(rsi)/6.0)) * (0.6 + 0.4*max(0.0, (sci-0.5)/0.5))
+        if "against shape" in align and abs(rsi) >= 3.0:
+            score -= 0.05
+        score = max(0.0, min(1.0, score))
+        if score >= 0.75: return "🟢 High"
+        if score >= 0.55: return "🟡 Medium"
+        if score >= 0.40: return "⚪ Low"
+        return "🔴 Speculative"
+
+    # Attach NextUpConfidence + stringify Flags for UI
     _rie_show = RIE_view.copy()
+    _rie_show["NextUpConfidence"] = _rie_show.apply(_nextup_label, axis=1)
     _rie_show["Flags"] = _rie_show["Flags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
+
     st.dataframe(_rie_show, use_container_width=True)
     st.caption("NRCI = Narrative Race Confidence Index (0–10). Alignment arrow shows with/against the identified race shape.")
     st.markdown("**Legend:** ⬆️ with shape · ⬇️ against shape · ⟷ neutral")
