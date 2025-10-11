@@ -2130,7 +2130,12 @@ def compute_nrci(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ---------- Render ----------
-nrci_table = compute_nrci(rie_df if "rie_df" in locals() else df)  # use your RIE dataframe
+try:
+    base_df = rie_df
+except NameError:
+    base_df = df  # use whatever your main dataframe variable is called
+
+nrci_table = compute_nrci(base_df)
 st.dataframe(
     nrci_table,
     use_container_width=True,
