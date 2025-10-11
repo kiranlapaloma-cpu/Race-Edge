@@ -2202,7 +2202,7 @@ def _insert_or_replace(conn: sqlite3.Connection, tbl: str, row_dict: dict):
     cols_present = _table_cols(conn, tbl)
     payload = {k: v for k, v in row_dict.items() if k in cols_present}
     if not payload:
-        return
+    return
     keys = ",".join(payload.keys())
     qmarks = ",".join(["?"] * len(payload))
     conn.execute(f"INSERT OR REPLACE INTO {tbl} ({keys}) VALUES ({qmarks})", list(payload.values()))
