@@ -2069,46 +2069,46 @@ def _merge_context_for_rie(metrics_df: pd.DataFrame,
 
     return out
 
-# ---- Build and show RIE table (place this after Ability Matrix section) ----
-try:
-    RIE_view = build_rie_table(metrics)
+    # ---- Build and show RIE table (place this after Ability Matrix section) ----
+    try:
+        RIE_view = build_rie_table(metrics)
 
-    # Optional: “next race confidence” label per row (kept simple & non-revealing)
-    def _nextup_label(row):
-        # Base from NRCI (0–10)
-        score = float(row.get("NRCI", 0.0)) if pd.notna(row.get("NRCI", np.nan)) else 0.0
-        # Flags sweetener
-        flags = row.get("Flags", [])
-        if isinstance(flags, list):
-            if any("Elite" in f or "Top Hidden" in f for f in flags):
-                score += 0.4
-            if any("Near-Elite" in f or "High profile" in f for f in flags):
-                score += 0.2
-        # With/against shape nudge
-        align = str(row.get("ShapeAlignment","")).lower()
-        rsi = float(metrics.attrs.get("RSI", 0.0))
-        sci = float(metrics.attrs.get("SCI", 0.5))
-        if "with shape" in align and abs(rsi) >= 2.0:
-            score += 0.6 * (0.6 + 0.4*min(1.0, abs(rsi)/6.0)) * (0.6 + 0.4*max(0.0, (sci-0.5)/0.5))
-        elif "against shape" in align and abs(rsi) >= 3.0:
-            score -= 0.5
-        score = max(0.0, min(10.0, score))
-        if score >= 7.5:  return "🟢 High"
-        if score >= 6.5:  return "🟡 Medium"
-        if score >= 5.4:  return "🔵 Low"
-        return "⚪ Speculative"
+        # Optional: “next race confidence” label per row (kept simple & non-revealing)
+        def _nextup_label(row):
+            # Base from NRCI (0–10)
+            score = float(row.get("NRCI", 0.0)) if pd.notna(row.get("NRCI", np.nan)) else 0.0
+            # Flags sweetener
+            flags = row.get("Flags", [])
+            if isinstance(flags, list):
+                if any("Elite" in f or "Top Hidden" in f for f in flags):
+                    score += 0.4
+                if any("Near-Elite" in f or "High profile" in f for f in flags):
+                    score += 0.2
+            # With/against shape nudge
+            align = str(row.get("ShapeAlignment","")).lower()
+            rsi = float(metrics.attrs.get("RSI", 0.0))
+            sci = float(metrics.attrs.get("SCI", 0.5))
+            if "with shape" in align and abs(rsi) >= 2.0:
+                score += 0.6 * (0.6 + 0.4*min(1.0, abs(rsi)/6.0)) * (0.6 + 0.4*max(0.0, (sci-0.5)/0.5))
+            elif "against shape" in align and abs(rsi) >= 3.0:
+                score -= 0.5
+            score = max(0.0, min(10.0, score))
+            if score >= 7.5:  return "🟢 High"
+            if score >= 6.5:  return "🟡 Medium"
+            if score >= 5.4:  return "🔵 Low"
+            return "⚪ Speculative"
 
-    _rie_show = RIE_view.copy()
-    _rie_show["NextUpConfidence"] = _rie_show.apply(_nextup_label, axis=1)
-    _rie_show["Flags"] = _rie_show["Flags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
+        _rie_show = RIE_view.copy()
+        _rie_show["NextUpConfidence"] = _rie_show.apply(_nextup_label, axis=1)
+        _rie_show["Flags"] = _rie_show["Flags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
 
-    st.dataframe(_rie_show, use_container_width=True)
-    st.caption("NRCI = Narrative Race Confidence Index (0–10). Alignment arrow shows with/against the identified race shape.")
-    st.markdown("**Legend:** ⬆️ with shape · ⬇️ against shape · ⟷ neutral")
+        st.dataframe(_rie_show, use_container_width=True)
+        st.caption("NRCI = Narrative Race Confidence Index (0–10). Alignment arrow shows with/against the identified race shape.")
+        st.markdown("**Legend:** ⬆️ with shape · ⬇️ against shape · ⟷ neutral")
 
-except Exception as e:
-    st.error("Failed to build RIE.")
-    st.exception(e)
+    except Exception as e:
+        st.error("Failed to build RIE.")
+        st.exception(e)
 
 # ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
 import sqlite3
