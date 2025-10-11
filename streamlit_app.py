@@ -1837,7 +1837,6 @@ st.markdown("## Race Insight Engine™ (RIE)")
 if metrics.attrs.get("WIND_AFFECTED", False):
     st.caption(f"⚠ Wind note: {metrics.attrs.get('WIND_TAG','Wind')}. Insights consider potential wind influence.")
 
-# ======================= Race Insight Engine (RIE) — Builder =======================
 # Inputs expected:
 #   • metrics (DataFrame)  with columns like: Horse, tsSPI, Accel, Grind or Grind_CG, PI, GCI, IAI, HiddenScore,
 #                           AbilityScore, AbilityTier, NearEliteFlag, AH_Tier, AHS, DirectionHint, Confidence, etc.
