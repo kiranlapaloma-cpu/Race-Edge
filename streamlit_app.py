@@ -1867,9 +1867,19 @@ def _shape_strength(RSI: float, SCI: float) -> float:
     s = 0.0 if not np.isfinite(SCI) else float(SCI)
     return r * (0.5 + 0.5*s)  # 0..1
 
-def _coherence(a01: float, p01: float, e01: float) -> float:
-    # require ability + (pressure OR efficiency)
-    return 0.5 + 0.5 * min(a01, max(p01, e01))  # 0.5..1.0
+def _coherence(a01, p01, e01):
+    """
+    Vectorized coherence multiplier (0.5–1.0)
+    Requires ability + (pressure OR efficiency).
+    Handles Series or scalars safely.
+    """
+    a = pd.to_numeric(a01, errors="coerce").fillna(0.0)
+    p = pd.to_numeric(p01, errors="coerce").fillna(0.0)
+    e = pd.to_numeric(e01, errors="coerce").fillna(0.0)
+    # Element-wise core: min(ability, max(pressure, efficiency))
+    core = np.minimum(a, np.maximum(p, e))
+    # Clip range and map 0-1 → 0.5-1.0
+    return (0.5 + 0.5 * core.clip(0.0, 1.0)).fillna(0.5)
 
 def _reliability_multiplier(R10: float) -> float:
     # R10 is 0..10 pillar; keep moderation mild
