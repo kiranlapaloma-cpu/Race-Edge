@@ -1851,6 +1851,14 @@ def _merge_context_for_rie(metrics_df: pd.DataFrame,
         base = base.merge(AH_view_df[[c for c in keep if c in AH_view_df.columns]].drop_duplicates("Horse"),
                           on="Horse", how="left")
     return base
+                               
+def _nz(v, alt=0.0):
+    """Return float(v) if it’s finite, otherwise a fallback (default 0.0)."""
+    try:
+        f = float(v)
+        return f if np.isfinite(f) else alt
+    except Exception:
+        return alt
 
 def build_rie_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
     # merge in tiers/flags from other views
