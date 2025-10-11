@@ -2044,92 +2044,110 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     return out.assign(_k=cat).sort_values(["_k","RIE_Score"], ascending=[True, False]).drop(columns=["_k"])
 
 # =========================
-# NRCI v2.1 — Punter-facing
+# NRCI v2.1 — Safe drop-in
 # =========================
-# Inputs expected from RIE stage:
-#   P1_Engine, P2_Efficiency, P3_ShapeFit, P4_Tenacity, P6_Reliability
-# These are used to derive:
-#   A_Ability, S_Shape, P_Pressure, E_Efficiency, R_Reliability
-
 import numpy as np
 import pandas as pd
+import streamlit as st
 
-def _as_num(s):
-    return pd.to_numeric(s, errors="coerce")
+# ---------- Helpers ----------
+def _as_num(s): return pd.to_numeric(s, errors="coerce")
 
 def _rank_pct(x: pd.Series) -> pd.Series:
-    # Robust 0–1 scaling using average ranks (handles ties & small fields)
     x = _as_num(x)
     n = x.notna().sum()
-    if n <= 1:
-        return pd.Series(np.zeros(len(x)), index=x.index)  # avoid div by zero
+    if n <= 1:  # avoid div/0 in very small fields
+        return pd.Series(np.zeros(len(x)), index=x.index)
     r = x.rank(method="average", na_option="keep")
     return (r - 1) / (n - 1)
 
-def _clip01(s):
-    return s.clip(lower=0.0, upper=1.0)
+def _clip01(s): return s.clip(0.0, 1.0)
 
-def compute_nrci(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+def _resolve_base_df() -> pd.DataFrame:
+    """Find a DataFrame produced earlier (RIE table or main race df)."""
+    candidates = [
+        "rie_df", "rie_table", "rie_out", "rie",
+        "race_df", "final_df", "full_df", "metrics_df",
+        "view", "table", "data", "df"
+    ]
+    g = globals()
+    for name in candidates:
+        if name in g and isinstance(g[name], pd.DataFrame) and len(g[name]) > 0:
+            return g[name]
+    # Try Streamlit session_state as a backup
+    for k, v in st.session_state.items():
+        if isinstance(v, pd.DataFrame) and len(v) > 0:
+            return v
+    return None
 
-    # ---- Map RIE pillars to NRCI sub-pillars ----
-    out["A_Ability"]     = _as_num(out.get("P1_Engine", np.nan))
-    out["S_Shape"]       = _as_num(out.get("P3_ShapeFit", np.nan))
-    out["P_Pressure"]    = _as_num(out.get("P4_Tenacity", np.nan))
-    out["E_Efficiency"]  = _as_num(out.get("P2_Efficiency", np.nan))
-    out["R_Reliability"] = _as_num(out.get("P6_Reliability", np.nan))
+# ---------- NRCI core ----------
+def compute_nrci(source_df: pd.DataFrame) -> pd.DataFrame:
+    out = source_df.copy()
 
-    # ---- Normalize to 0–1 (within-race percentiles) ----
+    # Map RIE pillars -> NRCI sub-pillars (use .get to avoid KeyErrors)
+    out["A_Ability"]     = _as_num(out.get("P1_Engine"))
+    out["S_Shape"]       = _as_num(out.get("P3_ShapeFit"))
+    out["P_Pressure"]    = _as_num(out.get("P4_Tenacity"))
+    out["E_Efficiency"]  = _as_num(out.get("P2_Efficiency"))
+    out["R_Reliability"] = _as_num(out.get("P6_Reliability"))
+
+    # Check required inputs
+    req = ["A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability","Horse"]
+    missing = [c for c in req if c not in out.columns]
+    if missing:
+        st.warning(f"NRCI: missing columns {missing}. Showing available fields only.")
+        # Create any missing columns as NaN so downstream code still works
+        for c in missing:
+            out[c] = np.nan
+        if "Horse" not in out.columns:  # cannot proceed without Horse
+            return out
+
+    # Normalize within race (0–1)
     A = _rank_pct(out["A_Ability"])
     S = _rank_pct(out["S_Shape"])
     P = _rank_pct(out["P_Pressure"])
     E = _rank_pct(out["E_Efficiency"])
-    # Reliability is already on 0–10; scale to 0–1 with a light percentile blend
-    R_linear = _clip01(out["R_Reliability"] / 10.0)
-    R = _clip01(0.5 * R_linear + 0.5 * _rank_pct(out["R_Reliability"]))
+    R_lin = _clip01(out["R_Reliability"] / 10.0)
+    R = _clip01(0.5 * R_lin + 0.5 * _rank_pct(out["R_Reliability"]))
 
-    # ---- Weights (sum to 1.00) ----
+    # Weights
     wA, wS, wP, wE, wR = 0.25, 0.15, 0.15, 0.25, 0.20
 
-    # ---- NRCI scale (1.00 to 1.60) ----
-    # Base = 1.00; bonus up to +0.60 from weighted normalized pillars
+    # NRCI scale 1.00–1.60
     core = (wA*A + wS*S + wP*P + wE*E + wR*R)
-    out["NRCI"] = 1.00 + 0.60 * core
-    out["NRCI"] = out["NRCI"].clip(1.00, 1.60)
+    out["NRCI"] = (1.00 + 0.60 * core).clip(1.00, 1.60)
 
-    # ---- Punter verdicts ----
-    def verdict(v):
+    # Verdicts
+    def _verdict(v):
         if v >= 1.36: return "High confidence"
         if v >= 1.28: return "Strong chance"
         if v >= 1.20: return "Solid chance"
         if v >= 1.14: return "Each-way"
         return "Speculative"
+    out["PunterVerdict"] = out["NRCI"].apply(_verdict)
 
-    out["PunterVerdict"] = out["NRCI"].apply(verdict)
-
-    # (Optional) Class response placeholder; keep your existing logic if you have one
+    # Optional: replace with your class-move logic
     out["ClassResponse"] = "Better kept to same/slightly easier"
 
-    # ---- Pretty order (match your screenshot) ----
-    cols = [
-        "Horse", "NRCI", "PunterVerdict",
-        "A_Ability", "S_Shape", "P_Pressure",
-        "E_Efficiency", "R_Reliability",
-        "ClassResponse"
-    ]
-    # Only keep columns that exist; this allows safe use during dev
+    # Order/round for display
+    cols = ["Horse","NRCI","PunterVerdict","A_Ability","S_Shape",
+            "P_Pressure","E_Efficiency","R_Reliability","ClassResponse"]
     cols = [c for c in cols if c in out.columns]
     out = out[cols].sort_values("NRCI", ascending=False, kind="mergesort").reset_index(drop=True)
 
-    # Round for display
-    num_cols = ["NRCI","A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability"]
-    for c in num_cols:
+    for c in ["NRCI","A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability"]:
         if c in out.columns:
             out[c] = _as_num(out[c]).round(2)
 
     return out
 
-# ---------- Render ----------
+# ---------- Resolve DF and render ----------
+_base = _resolve_base_df()
+if _base is None or not isinstance(_base, pd.DataFrame) or _base.empty:
+    st.error("NRCI: No source DataFrame found. Ensure your RIE table (with P1_.., P2_.. etc.) is built before NRCI.")
+else:
+    nrci_table = compute_nrci(_base)
+    st.dataframe(nrci_table, use_container_width=True, hide_index=True)
 try:
     base_df = rie_df
 except NameError:
