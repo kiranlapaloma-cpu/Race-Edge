@@ -1881,9 +1881,13 @@ def _coherence(a01, p01, e01):
     # Clip range and map 0-1 → 0.5-1.0
     return (0.5 + 0.5 * core.clip(0.0, 1.0)).fillna(0.5)
 
-def _reliability_multiplier(R10: float) -> float:
-    # R10 is 0..10 pillar; keep moderation mild
-    return 0.85 + 0.15 * max(0.0, min(10.0, float(R10))) / 10.0
+def _reliability_multiplier(R10):
+    """
+    Vectorized reliability moderation (0.85–1.0 range)
+    Accepts Series or scalar, clips within 0–10, rescales to 0.85–1.0
+    """
+    r = pd.to_numeric(R10, errors="coerce").fillna(0.0)
+    return 0.85 + 0.15 * r.clip(0.0, 10.0) / 10.0
 
 def _absdiff_tri(x, target) -> float:
     if not np.isfinite(x): return 0.0
