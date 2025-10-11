@@ -1851,34 +1851,114 @@ def _merge_context_for_rie(metrics_df: pd.DataFrame,
         base = base.merge(AH_view_df[[c for c in keep if c in AH_view_df.columns]].drop_duplicates("Horse"),
                           on="Horse", how="left")
     return base
+# === RIE helpers (place ABOVE build_rie_table) ===
+import numpy as np
 
-def build_rie_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
-    # merge in tiers/flags from other views
-    df = _merge_context_for_rie(metrics_df, AM_view if 'AM_view' in globals() else None,
-                                hh_view if 'hh_view' in globals() else None,
-                                AH_view if 'AH_view' in globals() else None)
+def _nz(v, alt=0.0):
+    try:
+        f = float(v);  return f if np.isfinite(f) else alt
+    except Exception:
+        return alt
 
-    # choose grind column
+def _shape_alignment_tag(shape_tag: str, accel: float, grind: float, ts: float,
+                         a_med: float, g_med: float, t_med: float) -> tuple[str, float]:
+    dA = _nz(accel) - _nz(a_med)
+    dG = _nz(grind) - _nz(g_med)
+    dT = _nz(ts)    - _nz(t_med)
+
+    def soft_z(x): return x / (1.0 + abs(x)/3.0)
+    zA, zG, zT = map(soft_z, (dA, dG, dT))
+    s = (shape_tag or "EVEN").upper()
+
+    if s == "FAST_EARLY":
+        align = (+0.55*np.sign(zT) - 0.45*np.sign(zA) + 0.10*np.sign(zG))
+    elif s == "SLOW_EARLY":
+        align = (+0.60*np.sign(zA) + 0.30*np.sign(zG) - 0.10*np.sign(zT))
+    else:
+        align = (0.35*np.sign(zA) + 0.35*np.sign(zG) + 0.30*np.sign(zT))
+        if abs(zA)+abs(zG)+abs(zT) < 1.0: align *= 0.5
+
+    align = float(max(-1.0, min(1.0, align)))
+    tag = "⬆️ with shape" if align > 0.25 else ("⬇️ against shape" if align < -0.25 else "⟷ neutral")
+    return tag, align
+
+def _distance_note(accel: float, grind: float, ts: float) -> str:
+    a, g, t = _nz(accel), _nz(grind), _nz(ts)
+    if a >= 102.2 and g <= 99.5 and t >= 100: return "Prefers sharp trips; 1000–1200 suited."
+    if g >= 102.0 and a <= 100.5:             return "Stays on; 1400–1800 (or stiffer) in scope."
+    if 99.5 <= a <= 101.5 and 99.5 <= g <= 101.5: return "Versatile on trip; placement key."
+    if t >= 102 and a >= 101:                 return "Strong mid-race engine; 1200–1400 optimal."
+    return "Trip flexible."
+
+def _track_profile(accel: float, grind: float) -> str:
+    a, g = _nz(accel), _nz(grind)
+    if a - g >= 2.0: return "Best on turn-of-foot tracks / short straights."
+    if g - a >= 2.0: return "Best on long straights / rising finishes."
+    return "Track shape agnostic."
+
+def _flags(row) -> list:
+    out = []
+    tier = str(row.get("AbilityTier","")).strip()
+    near = str(row.get("NearEliteFlag","")).strip()
+    hh_t = str(row.get("HH_Tier","")).strip()
+    ah_t = str(row.get("AH_Tier","")).strip()
+    if tier.startswith("🥇"): out.append("Elite profile")
+    elif tier.startswith("🥈"): out.append("High profile")
+    elif tier.startswith("🥉"): out.append("Competitive")
+    if near: out.append(near)
+    if "Top Hidden" in hh_t: out.append("Top Hidden")
+    elif "Notable Hidden" in hh_t: out.append("Hidden Notable")
+    if ah_t in {"🏆 Dominant","🔥 Clear Ahead","🟢 Ahead"}: out.append(f"AHS: {ah_t}")
+    return out
+
+def _ceiling(row) -> str:
+    abil = _nz(row.get("AbilityScore")); pi = _nz(row.get("PI")); hid = _nz(row.get("HiddenScore"))
+    if abil >= 8.5 and pi >= 7.0:            return "Ceiling: Group-class potential."
+    if abil >= 7.2 or (pi >= 6.4 and hid >= 1.2): return "Ceiling: Listed/black-type possible."
+    return "Ceiling: Handy handicapper."
+
+def _why_bits(shape_tag, align_tag, dist_note, track_note, flags) -> str:
+    bits = []
+    if align_tag != "⟷ neutral": bits.append(align_tag)
+    if dist_note: bits.append(dist_note)
+    if track_note: bits.append(track_note)
+    if flags: bits.append(", ".join(flags[:2]))
+    return " · ".join(bits)
+
+def _nrc_index(row, align_score: float, sci: float, rsi: float) -> float:
+    abil = _nz(row.get("AbilityScore"))
+    hid  = _nz(row.get("HiddenScore"))
+    conf = str(row.get("Confidence","")).lower()
+    conf_w = 1.00 if conf == "high" else (0.90 if conf == "med" else 0.80)
+    sci = float(sci) if isinstance(sci,(int,float)) else 0.5
+    rsi = float(rsi) if isinstance(rsi,(int,float)) else 5.0
+    shape_w = 0.7 + 0.6 * min(1.0, max(0.0, ((sci-0.50)/0.50 + rsi/10.0)/2.0))
+    base = 4.5 + 0.6*max(0.0, abil)
+    sweet = 0.3 * min(2.0, hid)
+    align_term = 2.0 * align_score * shape_w
+    nrc = float(np.clip((base + sweet + align_term) * conf_w, 0.0, 10.0))
+    return round(nrc, 2)
+# === end helpers ===
+
+def build_rie_table(metrics: pd.DataFrame) -> pd.DataFrame:
+    df = metrics.copy()
+
     gr_col = metrics.attrs.get("GR_COL", "Grind")
     if gr_col not in df.columns and "Grind" in df.columns:
         gr_col = "Grind"
 
-    # race-shape context
     shape_tag = str(metrics.attrs.get("SHAPE_TAG", "EVEN"))
-    sci = float(metrics.attrs.get("SCI", 0.5))
-    rsi = float(metrics.attrs.get("RSI", 5.0))
+    sci = metrics.attrs.get("SCI", 0.5)
+    rsi = metrics.attrs.get("RSI", 5.0)
 
-    # medians for alignment
     a_med = pd.to_numeric(df.get("Accel"), errors="coerce").median(skipna=True)
     g_med = pd.to_numeric(df.get(gr_col), errors="coerce").median(skipna=True)
     t_med = pd.to_numeric(df.get("tsSPI"), errors="coerce").median(skipna=True)
 
-    out_rows = []
+    rows = []
     for _, r in df.iterrows():
         horse = str(r.get("Horse","")).strip() or "(Unnamed)"
-        acc   = _nz(r.get("Accel"))
-        grd   = _nz(r.get(gr_col))
-        tss   = _nz(r.get("tsSPI"))
+        acc, grd, tss = _nz(r.get("Accel")), _nz(r.get(gr_col)), _nz(r.get("tsSPI"))
 
         align_tag, align_score = _shape_alignment_tag(shape_tag, acc, grd, tss, a_med, g_med, t_med)
         dnote = _distance_note(acc, grd, tss)
@@ -1886,14 +1966,14 @@ def build_rie_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
         flg   = _flags(r)
         ceil  = _ceiling(r)
         why   = _why_bits(shape_tag, align_tag, dnote, tnote, flg)
-        nrc   = _nrc_index(r, align_score, sci, rsi)
 
-        if nrc >= 8.2:      verdict = "Strong Win Candidate"
-        elif nrc >= 7.2:    verdict = "Win/Place Material"
-        elif nrc >= 6.2:    verdict = "Competitive Chance"
-        else:               verdict = "Needs Setup / Place"
+        nrc = _nrc_index(r, align_score, sci, rsi)
+        verdict = ("Strong Win Candidate" if nrc >= 8.2 else
+                   "Win/Place Material"   if nrc >= 7.2 else
+                   "Competitive Chance"   if nrc >= 6.2 else
+                   "Needs Setup / Place")
 
-        out_rows.append({
+        rows.append({
             "Horse": horse,
             "Verdict": verdict,
             "NRCI": nrc,
@@ -1905,21 +1985,12 @@ def build_rie_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
             "Why": why
         })
 
-    out = pd.DataFrame(out_rows)
-    if out.empty:
-        return out
-    order = pd.Categorical(out["Verdict"], ordered=True, categories=[
+    out = pd.DataFrame(rows)
+    strength = pd.Categorical(out["Verdict"], ordered=True, categories=[
         "Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"
     ])
-    return out.assign(_key=order).sort_values(["_key","NRCI"], ascending=[True, False]).drop(columns=["_key"])
-def _nz(v, alt=0.0):
-    """Return float(v) if it’s finite, otherwise a fallback (default 0.0)."""
-    try:
-        f = float(v)
-        return f if np.isfinite(f) else alt
-    except Exception:
-        return alt
-        
+    return out.assign(_k=strength).sort_values(["_k","NRCI"], ascending=[True, False]).drop(columns=["_k"])
+    
 # ---- Build & render (guarded) ----
 try:
     RIE_view = build_rie_table(metrics)
