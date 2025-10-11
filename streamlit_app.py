@@ -140,6 +140,15 @@ with st.sidebar:
     SHOW_WARNINGS = st.toggle("Show data warnings", value=True)
     DEBUG = st.toggle("Debug info", value=False)
 
+    # --- Wind (display-only for now) ---
+    WIND_AFFECTED = st.toggle("Wind affected race?", value=False, help="Purely informational (disclaimer only).")
+    WIND_TAG = st.selectbox(
+        "Wind note",
+        options=["Headwind", "Tailwind", "Crosswind", "Negligible"],
+        index=0,
+        disabled=not WIND_AFFECTED,
+    ) if WIND_AFFECTED else "None"
+
     st.markdown("---")
     st.markdown("#### Database")
     db_path = st.text_input("Database path", value=DB_DEFAULT_PATH)
