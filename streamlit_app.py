@@ -1829,206 +1829,293 @@ st.dataframe(AM_view, use_container_width=True)
 
 # ... end of Ability Matrix render (plot + AM_view table) ...
 
-# ======================= Race Insight Engine (RIE) =======================
-st.markdown("---")
-st.markdown("## Race Insight Engine™ (RIE)")
+# ======================= RIE v1.1 + NRCI v2.1 — COMBINED DROP-IN =======================
+# Trainer-facing Race Intelligence Engine (Six-Pillar) + Punter-facing NRCI (Run-Only)
+# No field-size placement, no “trip/track fit/weight/class move/form cycle” — run-only signals.
 
-def _merge_context_for_rie(metrics_df: pd.DataFrame,
-                           AM_view_df: pd.DataFrame | None = None,
-                           hh_view_df: pd.DataFrame | None = None,
-                           AH_view_df: pd.DataFrame | None = None) -> pd.DataFrame:
-    base = metrics_df.copy()
-    if isinstance(AM_view_df, pd.DataFrame) and not AM_view_df.empty:
-        keep = ["Horse","AbilityScore","AbilityTier","NearEliteFlag","DirectionHint","Confidence","PI","GCI"]
-        base = base.merge(AM_view_df[[c for c in keep if c in AM_view_df.columns]].drop_duplicates("Horse"),
-                          on="Horse", how="left")
-    if isinstance(hh_view_df, pd.DataFrame) and not hh_view_df.empty:
-        keep = ["Horse","HiddenScore","Tier"]
-        tmp = hh_view_df[[c for c in keep if c in hh_view_df.columns]].drop_duplicates("Horse")
-        base = base.merge(tmp.rename(columns={"Tier":"HH_Tier"}), on="Horse", how="left")
-    if isinstance(AH_view_df, pd.DataFrame) and not AH_view_df.empty:
-        keep = ["Horse","AHS","AH_Tier","AH_Confidence"]
-        base = base.merge(AH_view_df[[c for c in keep if c in AH_view_df.columns]].drop_duplicates("Horse"),
-                          on="Horse", how="left")
-    return base
-# === RIE helpers (place ABOVE build_rie_table) ===
 import numpy as np
+import pandas as pd
+import streamlit as st
 
-def _nz(v, alt=0.0):
+# ---------- Local helpers (safe, conflict-free) ----------
+def _nz(x, alt=0.0):
     try:
-        f = float(v);  return f if np.isfinite(f) else alt
+        v = float(x)
+        return v if np.isfinite(v) else alt
     except Exception:
         return alt
 
-def _shape_alignment_tag(shape_tag: str, accel: float, grind: float, ts: float,
-                         a_med: float, g_med: float, t_med: float) -> tuple[str, float]:
-    dA = _nz(accel) - _nz(a_med)
-    dG = _nz(grind) - _nz(g_med)
-    dT = _nz(ts)    - _nz(t_med)
+def _exists(df, cols):
+    return all(c in df.columns for c in cols)
 
-    def soft_z(x): return x / (1.0 + abs(x)/3.0)
-    zA, zG, zT = map(soft_z, (dA, dG, dT))
-    s = (shape_tag or "EVEN").upper()
+def _soft_clip(v, lo, hi):
+    return max(lo, min(hi, float(v)))
 
-    if s == "FAST_EARLY":
-        align = (+0.55*np.sign(zT) - 0.45*np.sign(zA) + 0.10*np.sign(zG))
-    elif s == "SLOW_EARLY":
-        align = (+0.60*np.sign(zA) + 0.30*np.sign(zG) - 0.10*np.sign(zT))
-    else:
-        align = (0.35*np.sign(zA) + 0.35*np.sign(zG) + 0.30*np.sign(zT))
-        if abs(zA)+abs(zG)+abs(zT) < 1.0: align *= 0.5
+def _pct01(x):
+    return _soft_clip(x, 0.0, 1.0)
 
-    align = float(max(-1.0, min(1.0, align)))
-    tag = "⬆️ with shape" if align > 0.25 else ("⬇️ against shape" if align < -0.25 else "⟷ neutral")
-    return tag, align
+def _absdiff_to_score(x, target=100.0, span=6.0):  # 100±span → full, then falls off
+    if not np.isfinite(x): return 0.0
+    d = abs(float(x) - target)
+    if d >= 2*span: return 0.0
+    # triangle peak 1.0 at d=0 → 0 at d=2*span
+    return _pct01(1.0 - d/(2.0*span))
 
-def _distance_note(accel: float, grind: float, ts: float) -> str:
-    a, g, t = _nz(accel), _nz(grind), _nz(ts)
-    if a >= 102.2 and g <= 99.5 and t >= 100: return "Prefers sharp trips; 1000–1200 suited."
-    if g >= 102.0 and a <= 100.5:             return "Stays on; 1400–1800 (or stiffer) in scope."
-    if 99.5 <= a <= 101.5 and 99.5 <= g <= 101.5: return "Versatile on trip; placement key."
-    if t >= 102 and a >= 101:                 return "Strong mid-race engine; 1200–1400 optimal."
-    return "Trip flexible."
+def _shape_alignment_score(rsi, sci, accel, mid, grind):
+    """
+    Alignment with detected shape using this run only.
+    +ve RSI = SLOW_EARLY (late favoured)  → reward (accel-mid)+ and (grind-accel)- a touch
+    -ve RSI = FAST_EARLY (early favoured) → reward (accel-mid)- and (grind-accel)+ a touch
+    """
+    if not np.isfinite(rsi): return 0.0
+    sci = 0.0 if not np.isfinite(sci) else float(sci)
+    a = _nz(accel); m = _nz(mid); g = _nz(grind)
+    dLM = a - m    # + late vs mid
+    dLG = g - a    # + attritional finish flavour
+    # directional core
+    core = np.tanh((dLM/2.0)) * (1.0 if rsi >= 0 else -1.0)
+    # finish seasoning boosts magnitude only
+    flav = np.tanh((dLG/3.0))
+    # consensus gate
+    gate = 0.60 + 0.40 * _pct01(sci)  # 0.6..1.0
+    score = (0.85*core + 0.15*flav) * gate
+    # map [-1,1] → [0,10]
+    return _soft_clip(5.0 + 5.0*score, 0.0, 10.0)
 
-def _track_profile(accel: float, grind: float) -> str:
-    a, g = _nz(accel), _nz(grind)
-    if a - g >= 2.0: return "Best on turn-of-foot tracks / short straights."
-    if g - a >= 2.0: return "Best on long straights / rising finishes."
-    return "Track shape agnostic."
+def _make_engine(df, gr_col):
+    # Prefer IAI from your Ability Matrix; else build from indices present.
+    if "IAI" in df.columns:
+        return df["IAI"]
+    w = 0.35*pd.to_numeric(df.get("tsSPI"), errors="coerce") \
+      + 0.25*pd.to_numeric(df.get("Accel"), errors="coerce") \
+      + 0.25*pd.to_numeric(df.get(gr_col), errors="coerce") \
+      + 0.15*pd.to_numeric(df.get("F200_idx"), errors="coerce")
+    return w
 
-def _flags(row) -> list:
-    out = []
-    tier = str(row.get("AbilityTier","")).strip()
-    near = str(row.get("NearEliteFlag","")).strip()
-    hh_t = str(row.get("HH_Tier","")).strip()
-    ah_t = str(row.get("AH_Tier","")).strip()
-    if tier.startswith("🥇"): out.append("Elite profile")
-    elif tier.startswith("🥈"): out.append("High profile")
-    elif tier.startswith("🥉"): out.append("Competitive")
-    if near: out.append(near)
-    if "Top Hidden" in hh_t: out.append("Top Hidden")
-    elif "Notable Hidden" in hh_t: out.append("Hidden Notable")
-    if ah_t in {"🏆 Dominant","🔥 Clear Ahead","🟢 Ahead"}: out.append(f"AHS: {ah_t}")
-    return out
+def _norm01(series):
+    s = pd.to_numeric(series, errors="coerce")
+    lo, hi = np.nanpercentile(s, 10), np.nanpercentile(s, 90)
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+        return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
+    return ((s - lo) / (hi - lo)).clip(0.0, 1.0)
 
-def _ceiling(row) -> str:
-    abil = _nz(row.get("AbilityScore")); pi = _nz(row.get("PI")); hid = _nz(row.get("HiddenScore"))
-    if abil >= 8.5 and pi >= 7.0:            return "Ceiling: Group-class potential."
-    if abil >= 7.2 or (pi >= 6.4 and hid >= 1.2): return "Ceiling: Listed/black-type possible."
-    return "Ceiling: Handy handicapper."
-
-def _why_bits(shape_tag, align_tag, dist_note, track_note, flags) -> str:
-    bits = []
-    if align_tag != "⟷ neutral": bits.append(align_tag)
-    if dist_note: bits.append(dist_note)
-    if track_note: bits.append(track_note)
-    if flags: bits.append(", ".join(flags[:2]))
-    return " · ".join(bits)
-
-def _nrc_index(row, align_score: float, sci: float, rsi: float) -> float:
-    abil = _nz(row.get("AbilityScore"))
-    hid  = _nz(row.get("HiddenScore"))
-    conf = str(row.get("Confidence","")).lower()
-    conf_w = 1.00 if conf == "high" else (0.90 if conf == "med" else 0.80)
-    sci = float(sci) if isinstance(sci,(int,float)) else 0.5
-    rsi = float(rsi) if isinstance(rsi,(int,float)) else 5.0
-    shape_w = 0.7 + 0.6 * min(1.0, max(0.0, ((sci-0.50)/0.50 + rsi/10.0)/2.0))
-    base = 4.5 + 0.6*max(0.0, abil)
-    sweet = 0.3 * min(2.0, hid)
-    align_term = 2.0 * align_score * shape_w
-    nrc = float(np.clip((base + sweet + align_term) * conf_w, 0.0, 10.0))
-    return round(nrc, 2)
-# === end helpers ===
-
-def build_rie_table(metrics: pd.DataFrame) -> pd.DataFrame:
+# ---------- Build RIE v1.1 (Trainer) ----------
+def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     df = metrics.copy()
+    if "Horse" not in df.columns:
+        df["Horse"] = "(Unnamed)"
 
+    # Which grind column are we using?
     gr_col = metrics.attrs.get("GR_COL", "Grind")
     if gr_col not in df.columns and "Grind" in df.columns:
         gr_col = "Grind"
 
-    shape_tag = str(metrics.attrs.get("SHAPE_TAG", "EVEN"))
-    sci = metrics.attrs.get("SCI", 0.5)
-    rsi = metrics.attrs.get("RSI", 5.0)
+    rsi = float(metrics.attrs.get("RSI", np.nan))
+    sci = float(metrics.attrs.get("SCI", 0.0))
+    rqs = float(metrics.attrs.get("RQS", np.nan))
 
-    a_med = pd.to_numeric(df.get("Accel"), errors="coerce").median(skipna=True)
-    g_med = pd.to_numeric(df.get(gr_col), errors="coerce").median(skipna=True)
-    t_med = pd.to_numeric(df.get("tsSPI"), errors="coerce").median(skipna=True)
+    # Pillar 1 — Engine (0..10): normalize IAI (or composite) within race
+    eng_raw = _make_engine(df, gr_col)
+    eng01   = _norm01(eng_raw)
+    P1 = (10.0 * eng01).fillna(0.0)
 
-    rows = []
-    for _, r in df.iterrows():
-        horse = str(r.get("Horse","")).strip() or "(Unnamed)"
-        acc, grd, tss = _nz(r.get("Accel")), _nz(r.get(gr_col)), _nz(r.get("tsSPI"))
+    # Pillar 2 — Efficiency (0..10): closeness of BAL/COMP to 100
+    if "BAL" not in df.columns:
+        df["BAL"] = 100.0 - (pd.to_numeric(df.get("Accel"), errors="coerce")
+                              - pd.to_numeric(df.get(gr_col), errors="coerce")).abs()/2.0
+    if "COMP" not in df.columns:
+        df["COMP"] = 100.0 - (pd.to_numeric(df.get("tsSPI"), errors="coerce") - 100.0).abs()
+    eff = 0.6*df["BAL"].map(lambda v: _absdiff_to_score(v, 100.0, span=6.0)) + \
+          0.4*df["COMP"].map(lambda v: _absdiff_to_score(v, 100.0, span=8.0))
+    P2 = (10.0 * eff).fillna(0.0)
 
-        align_tag, align_score = _shape_alignment_tag(shape_tag, acc, grd, tss, a_med, g_med, t_med)
-        dnote = _distance_note(acc, grd, tss)
-        tnote = _track_profile(acc, grd)
-        flg   = _flags(r)
-        ceil  = _ceiling(r)
-        why   = _why_bits(shape_tag, align_tag, dnote, tnote, flg)
+    # Pillar 3 — Shape Fit (0..10): alignment with this race’s RSI/SCI using only this run
+    accel = pd.to_numeric(df.get("Accel"), errors="coerce")
+    mid   = pd.to_numeric(df.get("tsSPI"), errors="coerce")
+    grind = pd.to_numeric(df.get(gr_col), errors="coerce")
+    P3 = [ _shape_alignment_score(rsi, sci, a, m, g)
+           for a, m, g in zip(accel.fillna(100.0), mid.fillna(100.0), grind.fillna(100.0)) ]
+    P3 = pd.Series(P3, index=df.index, dtype=float)
 
-        nrc = _nrc_index(r, align_score, sci, rsi)
-        verdict = ("Strong Win Candidate" if nrc >= 8.2 else
-                   "Win/Place Material"   if nrc >= 7.2 else
-                   "Competitive Chance"   if nrc >= 6.2 else
-                   "Needs Setup / Place")
+    # Pillar 4 — Tenacity (0..10): corrected grind & finish resilience from this run
+    gr_idx = pd.to_numeric(df.get(gr_col), errors="coerce")
+    dG     = pd.to_numeric(df.get("DeltaG"), errors="coerce")            # 100*(grd/mid)
+    finF   = pd.to_numeric(df.get("FinisherFactor"), errors="coerce")    # 0..1
+    ten = (
+        0.65 * ((gr_idx - 98.0)/6.0).clip(0.0, 1.0) +            # grind > field
+        0.25 * ((dG - 98.0)/6.0).clip(0.0, 1.0) +                # held speed vs mid
+        0.10 * finF.clip(0.0, 1.0).fillna(0.0)                   # finisher credit
+    )
+    P4 = (10.0 * ten).fillna(0.0)
 
-        rows.append({
-            "Horse": horse,
-            "Verdict": verdict,
-            "NRCI": nrc,
-            "ShapeAlignment": align_tag,
-            "DistanceNote": dnote,
-            "TrackProfile": tnote,
-            "Flags": flg,
-            "Ceiling": ceil,
-            "Why": why
-        })
+    # Pillar 5 — Big-Moment Index (0..10): GCI/GCI_RS scaled within race
+    gci = pd.to_numeric(df.get("GCI_RS", df.get("GCI")), errors="coerce")
+    P5  = (10.0 * _norm01(gci)).fillna(0.0)
 
-    out = pd.DataFrame(rows)
-    strength = pd.Categorical(out["Verdict"], ordered=True, categories=[
-        "Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"
-    ])
-    return out.assign(_k=strength).sort_values(["_k","NRCI"], ascending=[True, False]).drop(columns=["_k"])
-    
-# ---- Build & render (guarded) ----
+    # Pillar 6 — Reliability (0..10): data completeness + low friction + stable late profile (run-only)
+    # (No form/field-size placement; purely this run’s integrity)
+    valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
+    completeness = df[valid_cols].notna().sum(axis=1) / len(valid_cols)
+    tfs = pd.to_numeric(df.get("TFS", np.nan), errors="coerce")
+    tfs_pen = (tfs / (tfs.quantile(0.85) - tfs.quantile(0.15) + 1e-6)).clip(0.0, 1.0)
+    late_stability = 1.0 - (abs(pd.to_numeric(df.get("Accel"), errors="coerce")
+                           - pd.to_numeric(df.get(gr_col), errors="coerce"))/6.0).clip(0.0, 1.0)
+    rel = (0.55*completeness + 0.20*(1.0 - tfs_pen.fillna(0.0)) + 0.25*late_stability.fillna(0.0))
+    P6 = (10.0 * rel.clip(0.0,1.0)).fillna(0.0)
+
+    # Weights (sum = 1.0) — trainer lens: Engine/Tenacity/Shape carry more
+    w1,w2,w3,w4,w5,w6 = 0.26,0.12,0.18,0.20,0.14,0.10
+    RIE = (w1*P1 + w2*P2 + w3*P3 + w4*P4 + w5*P5 + w6*P6).round(2)
+
+    # Verdict & Trainer Narrative (concise, run-only)
+    def _verdict(s):
+        if s >= 8.2: return "Strong Win Candidate"
+        if s >= 7.2: return "Win/Place Material"
+        if s >= 6.2: return "Competitive Chance"
+        return "Needs Setup / Place"
+
+    def _trainer_note(row, score):
+        bits = []
+        if score >= 7.2 and _nz(row.get(gr_col)) >= 101.0: bits.append("finishes off strongly")
+        if score >= 7.2 and _nz(row.get("Accel")) >= 101.5: bits.append("turn-of-foot confirmed")
+        if abs(rsi) >= 2.0:
+            align = "with shape" if _shape_alignment_score(rsi,sci,row.get("Accel"),row.get("tsSPI"),row.get(gr_col))>=6.5 else "against shape"
+            bits.append(f"ran {align}")
+        if _nz(row.get("BAL")) >= 100.0: bits.append("late balance sound")
+        if not bits: bits.append("solid run-only profile")
+        return "; ".join(bits).capitalize() + "."
+
+    out = pd.DataFrame({
+        "Horse": df["Horse"].astype(str),
+        "RIE_Score": RIE,
+        "Verdict": [ _verdict(s) for s in RIE ],
+        "P1_Engine": P1.round(2),
+        "P2_Efficiency": P2.round(2),
+        "P3_ShapeFit": P3.round(2),
+        "P4_Tenacity": P4.round(2),
+        "P5_BigMoment": P5.round(2),
+        "P6_Reliability": P6.round(2),
+        "TrainerNote": [ _trainer_note(r, s) for (_, r), s in zip(df.iterrows(), RIE) ]
+    })
+
+    # Sort by verdict strength then score
+    cat = pd.Categorical(out["Verdict"], ordered=True,
+                         categories=["Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"])
+    out = out.assign(_k=cat).sort_values(["_k","RIE_Score"], ascending=[True, False]).drop(columns=["_k"])
+    return out
+
+# ---------- Build NRCI v2.1 (Punter; Run-Only + Class Response Hint) ----------
+def build_NRCI_v21(metrics: pd.DataFrame) -> pd.DataFrame:
+    df = metrics.copy()
+    if "Horse" not in df.columns:
+        df["Horse"] = "(Unnamed)"
+    gr_col = metrics.attrs.get("GR_COL", "Grind")
+    if gr_col not in df.columns and "Grind" in df.columns:
+        gr_col = "Grind"
+
+    rsi = float(metrics.attrs.get("RSI", np.nan))
+    sci = float(metrics.attrs.get("SCI", 0.0))
+    rqs = float(metrics.attrs.get("RQS", np.nan))  # race quality context (single number; not field-size placement)
+
+    # Components (all run-only signals)
+    # A) Ability pulse: PI within race (peak indicator already centered in your code)
+    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
+    A = (10.0 * _norm01(pi)).fillna(0.0)
+
+    # B) Shape alignment (same mapping as RIE but punter-weighted)
+    accel = pd.to_numeric(df.get("Accel"), errors="coerce")
+    mid   = pd.to_numeric(df.get("tsSPI"), errors="coerce")
+    grind = pd.to_numeric(df.get(gr_col), errors="coerce")
+    S = pd.Series([ _shape_alignment_score(rsi, sci, a, m, g)
+                    for a, m, g in zip(accel.fillna(100.0), mid.fillna(100.0), grind.fillna(100.0)) ],
+                  index=df.index)
+
+    # C) Pressure/finish mettle: corrected grind & DeltaG
+    gr_idx = pd.to_numeric(df.get(gr_col), errors="coerce")
+    dG     = pd.to_numeric(df.get("DeltaG"), errors="coerce")
+    P = (10.0 * ((0.70*((gr_idx-98.0)/6.0).clip(0.0,1.0)) + 0.30*((dG-98.0)/6.0).clip(0.0,1.0))).fillna(0.0)
+
+    # D) Efficiency: BAL closeness
+    if "BAL" not in df.columns:
+        df["BAL"] = 100.0 - (pd.to_numeric(df.get("Accel"), errors="coerce")
+                              - pd.to_numeric(df.get(gr_col), errors="coerce")).abs()/2.0
+    E = (10.0 * df["BAL"].map(lambda v: _absdiff_to_score(v, 100.0, span=6.0))).fillna(0.0)
+
+    # E) Reliability (data integrity only; no form cycle)
+    valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
+    completeness = df[valid_cols].notna().sum(axis=1) / len(valid_cols)
+    R = (10.0 * completeness).fillna(0.0)
+
+    # Weights (sum=1.0) — punter lens: Ability & Shape highest, then Pressure, then Efficiency, then Reliability
+    wA,wS,wP_,wE,wR_ = 0.34, 0.26, 0.20, 0.12, 0.08
+    ncri = (wA*A + wS*S + wP_*P + wE*E + wR_*R).round(2)
+
+    # Grade response hint (text only; NO historic placement)
+    # Pure inference from this run + overall race quality (RQS) + where the horse’s PI/Engine sits.
+    # Buckets for a simple, understandable class message.
+    def _class_hint(pi_v, eng_v):
+        # crude engine proxy if IAI not present
+        if "IAI" in df.columns:
+            eng = _nz(eng_v)
+        else:
+            eng = _nz(0.35*_nz(df.get("tsSPI")) + 0.25*_nz(df.get("Accel")) + 0.25*_nz(df.get(gr_col)) + 0.15*_nz(df.get("F200_idx")))
+        pi_v = _nz(pi_v)
+        # If PI is top decile in-race and engine strong → can lift
+        if pi_v >= np.nanpercentile(pi.fillna(0), 90) and eng >= 101.5:
+            return "Likely copes up one grade"
+        # If mid/high PI but engine average → similar class suits
+        if pi_v >= np.nanpercentile(pi.fillna(0), 60) and eng >= 100.5:
+            return "Suited to similar grade"
+        # Otherwise
+        return "Better kept to same/slightly easier"
+
+    ClassHint = [ _class_hint(pv, iv) for pv, iv in zip(pi, df.get("IAI", np.nan)) ]
+
+    # Simple label for punters
+    def _ncri_verdict(s):
+        if s >= 8.2: return "High confidence"
+        if s >= 7.0: return "Solid chance"
+        if s >= 6.0: return "Each-way"
+        return "Speculative"
+
+    out = pd.DataFrame({
+        "Horse": df["Horse"].astype(str),
+        "NRCI": ncri,
+        "PunterVerdict": [ _ncri_verdict(s) for s in ncri ],
+        "A_Ability": A.round(2),
+        "S_Shape": S.round(2),
+        "P_Pressure": P.round(2),
+        "E_Efficiency": E.round(2),
+        "R_Reliability": R.round(2),
+        "ClassResponse": ClassHint
+    })
+
+    out = out.sort_values(["NRCI"], ascending=False)
+    return out
+
+# ---------- Render UI ----------
+st.markdown("---")
+st.markdown("## Race Intelligence Suite")
+
 try:
-    RIE_view = build_rie_table(metrics)
-    if RIE_view is None or (isinstance(RIE_view, pd.DataFrame) and RIE_view.empty):
-        st.info("RIE: no insights could be computed for this race.")
-    else:
-        def _nextup_label(row):
-            score = float(row.get("NRCI", 0.0)) if pd.notna(row.get("NRCI", np.nan)) else 0.0
-            flags = row.get("Flags", [])
-            if isinstance(flags, list):
-                if any("Elite" in f or "Top Hidden" in f for f in flags): score += 0.4
-                if any("Near-Elite" in f or "High profile" in f for f in flags): score += 0.2
-            align = str(row.get("ShapeAlignment","")).lower()
-            rsi = float(metrics.attrs.get("RSI", 0.0))
-            sci = float(metrics.attrs.get("SCI", 0.5))
-            if "with shape" in align and abs(rsi) >= 2.0:
-                score += 0.6 * (0.6 + 0.4*min(1.0, abs(rsi)/6.0)) * (0.6 + 0.4*max(0.0, (sci-0.5)/0.5))
-            elif "against shape" in align and abs(rsi) >= 3.0:
-                score -= 0.5
-            score = max(0.0, min(10.0, score))
-            if score >= 7.5:  return "🟢 High"
-            if score >= 6.5:  return "🟡 Medium"
-            if score >= 5.4:  return "🔵 Low"
-            return "⚪ Speculative"
-
-        _rie_show = RIE_view.copy()
-        _rie_show["NextUpConfidence"] = _rie_show.apply(_nextup_label, axis=1)
-        _rie_show["Flags"] = _rie_show["Flags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
-        st.dataframe(_rie_show, use_container_width=True)
-        st.caption("NRCI = Narrative Race Confidence Index (0–10). Alignment arrow shows with/against the identified race shape.")
-        st.markdown("**Legend:** ⬆️ with shape · ⬇️ against shape · ⟷ neutral")
+    RIE_v11_view = build_RIE_v11(metrics)
+    st.markdown("### RIE v1.1 — Six-Pillar Intelligence (Trainer)")
+    st.dataframe(RIE_v11_view, use_container_width=True)
+    st.caption("RIE pillars (0–10): Engine · Efficiency · ShapeFit · Tenacity · Big-Moment · Reliability. Verdict and note are run-only.")
 except Exception as e:
-    st.error("Failed to build RIE.")
+    st.error("RIE v1.1 failed.")
     st.exception(e)
 
-# Wind note (same place you had it)
-if metrics.attrs.get("WIND_AFFECTED", False):
-    st.caption(f"⚠ Wind note: {metrics.attrs.get('WIND_TAG','Wind')}. Insights consider potential wind influence.")
+try:
+    NRCI_v21_view = build_NRCI_v21(metrics)
+    st.markdown("### NRCI v2.1 — Punter Confidence (Run-Only)")
+    st.dataframe(NRCI_v21_view, use_container_width=True)
+    st.caption("NRCI combines only this race’s signals (no trip/track fit/weight/class move/form cycle). ClassResponse is an inference from the run.")
+except Exception as e:
+    st.error("NRCI v2.1 failed.")
+    st.exception(e)
+
+# ======================= /END RIE v1.1 + NRCI v2.1 DROP-IN =======================
 
 # ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
 import sqlite3
