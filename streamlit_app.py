@@ -2102,16 +2102,16 @@ try:
         return "🔴 Speculative"
 
     # Attach NextUpConfidence + stringify Flags for UI
-    _rie_show = RIE_view.copy()
-    _rie_show["NextUpConfidence"] = _rie_show.apply(_nextup_label, axis=1)
-    _rie_show["Flags"] = _rie_show["Flags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
+        _rie_show = RIE_view.copy()
+        _rie_show["NextUpConfidence"] = _rie_show.apply(_nextup_label, axis=1)
+        _rie_show["Flags"] = _rie_show["Flags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
 
-    st.dataframe(_rie_show, use_container_width=True)
-    st.caption("NRCI = Narrative Race Confidence Index (0–10). Alignment arrow shows with/against the identified race shape.")
-    st.markdown("**Legend:** ⬆️ with shape · ⬇️ against shape · ⟷ neutral")
-except Exception as e:
-    st.error("Failed to build RIE.")
-    st.exception(e)
+        st.dataframe(_rie_show, use_container_width=True)
+        st.caption("NRCI = Narrative Race Confidence Index (0–10). Alignment arrow shows with/against the identified race shape.")
+        st.markdown("**Legend:** ⬆️ with shape · ⬇️ against shape · ⟷ neutral")
+    except Exception as e:
+        st.error("Failed to build RIE.")
+        st.exception(e)
 
 # ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
 import sqlite3
