@@ -1986,9 +1986,11 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     P4 = 10.0 * ten01 * _alpha(np.isfinite(ten_core).sum())
 
     # P5 — BigMoment
-    gci = pd.to_numeric(df.get("GCI_RS", df.get("GCI")), errors="coerce")
-    gci01 = _cdf01(gci)
-    P5 = 10.0 * gci01 * _alpha(gci.notna().sum())
+    if gci.isna().all() or gci.nunique(dropna=True) <= 1:
+    # fall back to Engine as proxy for Big Moment
+        gci = pd.to_numeric(df.get("P1_Engine"), errors="coerce")
+        gci01 = _cdf01(gci)
+        P5 = 10.0 * gci01 * _alpha(gci.notna().sum())
 
     # P6 — Reliability
     valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
