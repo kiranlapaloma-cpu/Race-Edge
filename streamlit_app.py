@@ -2066,38 +2066,34 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     out = out.assign(_k=cat).sort_values(["_k","RIE_Score"], ascending=[True, False]).drop(columns=["_k"]).reset_index(drop=True)
     return out
 
-# ---------- NRCI v2.1 (Punter) ----------
-def build_NRCI_v21(rie_df: pd.DataFrame) -> pd.DataFrame:
-    # NRCI maps directly from RIE pillars; no double-counting of narrative fields
+# ---------- NRCI v2.1 (Punter) — adaptive & debuggable ----------
+def build_NRCI_v21(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
     df = rie_df.copy()
     if "Horse" not in df.columns:
         df["Horse"] = "(Unnamed)"
 
+    # Raw pillars (0–10 expected from RIE)
     A  = pd.to_numeric(df.get("P1_Engine"),     errors="coerce")
     S  = pd.to_numeric(df.get("P3_ShapeFit"),   errors="coerce")
     P  = pd.to_numeric(df.get("P4_Tenacity"),   errors="coerce")
     E  = pd.to_numeric(df.get("P2_Efficiency"), errors="coerce")
     R  = pd.to_numeric(df.get("P6_Reliability"),errors="coerce")
 
-    # normalize to 0..1 (rank CDF inside the race)
-    A01,S01,P01,E01,R01 = map(_cdf01, [A,S,P,E,R])
+    # Normalize within-race (0..1) via CDF
+    A01, S01, P01, E01, R01 = map(_cdf01, [A, S, P, E, R])
 
-    # weights + 1.00–1.60 band
-    wA,wS,wP,wE,wR = 0.25,0.15,0.15,0.25,0.20
-    core = wA*A01 + wS*S01 + wP*P01 + wE*E01 + wR*R01
+    # Weighted core → 1.00–1.60 band
+    wA, wS, wP, wE, wR = 0.25, 0.15, 0.15, 0.25, 0.20
+    core = (wA*A01 + wS*S01 + wP*P01 + wE*E01 + wR*R01).clip(0.0, 1.0)
     NRCI = (1.00 + 0.60*core).clip(1.00, 1.60)
 
-    def _pv(v):
-        if v >= 1.36: return "High confidence"
-        if v >= 1.28: return "Strong chance"
-        if v >= 1.20: return "Solid chance"
-        if v >= 1.14: return "Each-way"
-        return "Speculative"
+    # Race-relative verdicts (adaptive quantiles)
+    verdicts = _adaptive_verdicts(NRCI, ("Speculative","Each-way","Solid chance","High confidence"))
 
     out = pd.DataFrame({
         "Horse": df["Horse"].astype(str),
         "NRCI": NRCI.round(2),
-        "PunterVerdict": [_pv(v) for v in NRCI],
+        "PunterVerdict": verdicts,
         "A_Ability": A.round(2),
         "S_Shape": S.round(2),
         "P_Pressure": P.round(2),
@@ -2106,7 +2102,26 @@ def build_NRCI_v21(rie_df: pd.DataFrame) -> pd.DataFrame:
         "ClassResponse": ["Better kept to same/slightly easier"]*len(df)
     }).sort_values("NRCI", ascending=False).reset_index(drop=True)
 
+    if debug:
+        dbg = pd.DataFrame({
+            "Horse": df["Horse"],
+            "A01": A01.round(3), "S01": S01.round(3), "P01": P01.round(3),
+            "E01": E01.round(3), "R01": R01.round(3), "core": core.round(3), "NRCI": NRCI.round(3)
+        }).sort_values("NRCI", ascending=False).reset_index(drop=True)
+        with st.expander("NRCI debug (normalized pillars)"):
+            st.dataframe(dbg, use_container_width=True, hide_index=True)
+
     return out
+
+# ---------- Render NRCI (use rie_view as source) ----------
+try:
+    nrci_view = build_NRCI_v21(rie_view, debug=False)  # set True once to inspect inputs
+    st.markdown("### NRCI v2.1 — Punter Confidence (Run-Only)")
+    st.dataframe(nrci_view, use_container_width=True, hide_index=True)
+    st.caption("NRCI is race-relative (adaptive quantiles) on a 1.00–1.60 band. Verdicts adapt to the field.")
+except Exception as e:
+    st.error("NRCI v2.1 failed.")
+    st.exception(e)
 
 # ---------- Render (RIE = narrative paragraphs; NRCI = table) ----------
 st.markdown("---")
