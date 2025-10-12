@@ -762,6 +762,39 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         gci_vals.append(round(10.0 * (wT*T + wPACE*LQ + wSS*SS + wEFF*EFF), 3))
     w["GCI"] = gci_vals
 
+    # ---- GCI refinement by Race Shape (GCI_RS) ----
+    # RSI sign: + = slow-early (late favoured), - = fast-early (early favoured)
+    RSI_val = float(w.attrs.get("RSI", 0.0))
+    SCI_val = float(w.attrs.get("SCI", 0.0))
+
+    # per-horse exposure along same axis (late-minus-mid already computed for RS_Component)
+    dLM = (pd.to_numeric(w["Accel"], errors="coerce") -
+           pd.to_numeric(w["tsSPI"], errors="coerce"))
+
+    # normalise exposure into [-1, +1] softly (bigger fields → slightly stronger signal)
+    field_n = max(1, len(w))
+    expo = np.tanh((dLM / 6.0)) * np.sign(RSI_val)
+
+    # gate by consensus; reduce if consensus is weak
+    consensus = 0.60 + 0.40 * max(0.0, min(1.0, SCI_val))
+    expo *= consensus
+
+    # soft-sigmoid attenuation: trim “with-shape”, boost “against-shape”
+    # cap adjustment to ±0.60 GCI points
+    with_shape  = np.clip(expo, 0.0, 1.0)
+    against     = np.clip(-expo, 0.0, 1.0)
+    adj = 0.35*against - 0.22*with_shape
+
+    # small distance seasoning (mile gets a touch more)
+    Dm = float(D_actual_m)
+    dist_gain = 1.00 + (0.06 if 1400 <= Dm <= 1800 else 0.00)
+    adj *= dist_gain
+
+    # SCI failsafe: damp everything if SCI is very low
+    if SCI_val < 0.40:
+        adj *= 0.5
+
+    w["GCI_RS"] = (pd.to_numeric(w["GCI"], errors="coerce") + adj).clip(0.0, 10.0).round(3)                           
         # ----- EARLY/LATE (blended, for display only) -----
     w["EARLY_idx"] = (0.65*pd.to_numeric(w["F200_idx"], errors="coerce") +
                       0.35*pd.to_numeric(w["tsSPI"],    errors="coerce"))
@@ -1028,7 +1061,7 @@ def compute_rps(df: pd.DataFrame) -> float:
     if df is None or len(df) == 0:
         return 0.0
 
-    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce").dropna()
+    pi = pd.to_numeric(df.get("PI"), errors="coerce").dropna()
     n = int(pi.size)
     if n == 0:
         return 0.0
@@ -1171,21 +1204,17 @@ st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
 GR_COL = metrics.attrs.get("GR_COL","Grind")
 show_cols = [
     "Horse","Finish_Pos","RaceTime_s",
-    "F200_idx","tsSPI","Accel", "Grind", "Grind_CG",
+    "F200_idx","tsSPI","Accel","Grind","Grind_CG",
     "EARLY_idx","LATE_idx",
     "GrindAdjPts","DeltaG",
-    "PI","PI_RS","GCI","GCI_RS",
-    # NEW:
+    "PI","GCI","GCI_RS",
     "RSI","RS_Component","RSI_Cue"
 ]
-for c in show_cols:
-    if c not in metrics.columns:
-        metrics[c] = np.nan
-
+...
 display_df = metrics[show_cols].copy()
 _finish_sort = display_df["Finish_Pos"].fillna(1e9)
 display_df = display_df.assign(_FinishSort=_finish_sort).sort_values(
-    ["PI_RS","_FinishSort"], ascending=[False, True]
+    ["PI","_FinishSort"], ascending=[False, True]
 ).drop(columns=["_FinishSort"])
 st.dataframe(display_df, use_container_width=True)
 
@@ -1214,10 +1243,11 @@ st.markdown("## Ahead of Handicap — Single Race Field Context")
 
 AH = metrics.copy()
 # Safety: ensure required columns exist
-for c in ["PI_RS","PI","Accel",GR_COL,"Finish_Pos","Horse"]:
+for c in ["PI","Accel",GR_COL,"Finish_Pos","Horse"]:
     if c not in AH.columns:
         AH[c] = np.nan
-AH["PI_RS"] = pd.to_numeric(AH["PI_RS"], errors="coerce").fillna(pd.to_numeric(AH["PI"], errors="coerce"))
+
+pi_rs = AH["PI"].clip(lower=0.0, upper=10.0)  # keep variable name if you like
 
 # 1) Robust centre and spread (single race only)
 pi_rs = AH["PI_RS"].clip(lower=0.0, upper=10.0)
@@ -1266,7 +1296,7 @@ for c in ah_cols:
 
 AH_view = AH.sort_values(["AHS","Finish_Pos"], ascending=[False, True])[ah_cols]
 st.dataframe(AH_view, use_container_width=True)
-st.caption("AH = Ahead-of-Handicap (single race). Centre = trimmed median PI_RS; spread = MAD σ; FSI mildly rewards late balance.")
+st.caption("AH = Ahead-of-Handicap (single race). Centre = trimmed median PI; spread = MAD σ; FSI mildly rewards late balance.")
 # ======================= End Ahead of Handicap =======================
 # ======================= End of Batch 2 =======================
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
@@ -1559,11 +1589,14 @@ hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
 
 # --- Tier logic (race-shape-aware) ---
 def hh_tier_row(r):
-    pi_rs, gci_rs = as_num(r.get("PI_RS")), as_num(r.get("GCI_RS"))
-    if np.isfinite(pi_rs) and np.isfinite(gci_rs):
-        if pi_rs >= 7.2 and gci_rs >= 6.0: return "🔥 Top Hidden"
-        if pi_rs >= 6.2 and gci_rs >= 5.0: return "🟡 Notable Hidden"
-        return ""
+    pi_val = as_num(r.get("PI"))
+    ...
+    if np.isfinite(pi_val) and np.isfinite(gci_rs):
+        if pi_val >= 7.2 and gci_rs >= 6.0: ...
+        if pi_val >= 6.2 and gci_rs >= 5.0: ...
+    ...
+    if np.isfinite(pi_val) and np.isfinite(gci_rs):
+        bits.append(f"PI {pi_val:.2f}, GCI_RS {gci_rs:.2f}")
     hs = as_num(r.get("HiddenScore"))
     if not np.isfinite(hs): return ""
     if hs >= 1.8: return "🔥 Top Hidden"
