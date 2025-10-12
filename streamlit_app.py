@@ -2115,6 +2115,15 @@ def build_CeilingCore(metrics: pd.DataFrame) -> pd.DataFrame:
     ProjectedIndex = (ClassIndex_now + TotalAdj).clip(1, 7)
     ProjectedBand = [_gci_to_class( idx if isinstance(idx, (int,float)) else float(idx) )[0] for idx in ProjectedIndex]
 
+    # --- rebuild Conf defensively if not present ---
+    if "Conf" not in locals():
+        # Ability/pressure/efficiency coherence (0.5..1.0)
+        Ability01  = pd.to_numeric(gci_series, errors="coerce").rank(pct=True, method="average").fillna(0.0)
+        Pressure01 = press_core.rank(pct=True, method="average").fillna(0.0)
+        Eff01_coh  = (Eff/10.0).clip(0.0, 1.0)
+        core = np.minimum(Ability01, np.maximum(Pressure01, Eff01_coh))
+        coherence = 0.5 + 0.5*core  # 0.5..1.0
+        Conf = 0.5*coherence + 0.5*(Reliability/10.0)
     # Confidence buckets
     ConfLevel = np.where(Conf >= CONFIG["CONF_HIGH"], "High",
                   np.where(Conf >= CONFIG["CONF_MED"], "Medium", "Low"))
