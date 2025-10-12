@@ -2328,7 +2328,10 @@ if isinstance(rie_view, pd.DataFrame) and not rie_view.empty:
             "A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability",
             "GCI_Value","ClassBand","DeltaClass","ClassAdvice"
         ]
-        
+        st.dataframe(display_df[cols_to_show], use_container_width=True, hide_index=True)
+        st.markdown("### NRCI v2.4 — Punter Confidence (1–5, fused peaks + dominance)")
+        st.dataframe(nrci_view, use_container_width=True, hide_index=True)
+        st.caption("NRCI fuses Engine with PI, includes Big-Moment, adds a bounded dominance uplift, and applies gentle coherence & reliability.")
     except Exception as e:
         st.error("NRCI v2.3 failed.")
         st.exception(e)
