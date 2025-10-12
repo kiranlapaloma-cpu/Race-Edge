@@ -1947,73 +1947,81 @@ def gci_to_classband(gci_value: float):
     if g >= 5.3:   return "💠 Strong Handicapper",    2
     return "🔹 Low Handicapper",                      1
 
-# ---------- RAW GCI PICKER (strict, with provenance) ----------
-def _pick_gci_series(primary_df: pd.DataFrame,
-                     fallback_df: pd.DataFrame | None = None,
-                     return_source: bool = False):
+# ---- 1) Robust RAW GCI picker (joins by Horse; wide name coverage; provenance) ----
+def _pick_raw_gci_by_horse(rie_df: pd.DataFrame,
+                           metrics_df: pd.DataFrame | None,
+                           return_source: bool = False):
     """
-    Prefer true/raw GCI columns (0..10, not rank-shrunk). Only if none exist,
-    fall back to P5_BigMoment. Returns (Series, source_name) if return_source.
+    Returns a Series of raw GCI aligned to rie_df rows by Horse, plus a source tag.
+    Prefers metrics_df (raw), then rie_df (raw), then rie_df['P5_BigMoment'] as last resort.
     """
-    # Common raw names you've used/seen
-    raw_candidates = [
-        "GCI_Value", "GCI RS", "GCI_RS", "GCI (raw)", "GCI",
-        "CGI", "GCI_v3", "GCI_RS_v3", "GCI_raw"
+    # candidates you might have used
+    raw_names = [
+        "GCI_Value","GCI Value","GCI_RS","GCI RS","GCI (raw)","GCI_raw",
+        "GCI","CGI","GCI_v3","GCI_RS_v3","GCI_RS (v3.3)"
     ]
-    for col in raw_candidates:
-        if col in primary_df.columns:
-            s = pd.to_numeric(primary_df[col], errors="coerce")
-            if return_source: return s, f"primary:{col}"
-            return s
 
-    # If not in primary, try the same set on fallback_df (often rie_view)
-    if fallback_df is not None:
-        for col in raw_candidates:
-            if col in fallback_df.columns:
-                s = pd.to_numeric(fallback_df[col], errors="coerce")
-                if return_source: return s, f"fallback:{col}"
-                return s
+    def _extract(df, tag):
+        if df is None or "Horse" not in df.columns:
+            return None, None
+        for col in raw_names:
+            if col in df.columns:
+                s = pd.to_numeric(df[col], errors="coerce")
+                # align by Horse
+                tmp = df[["Horse"]].copy()
+                tmp["__gci__"] = s
+                aligned = rie_df[["Horse"]].merge(tmp, on="Horse", how="left")["__gci__"]
+                return aligned, f"{tag}:{col}"
+        return None, None
 
-    # Last resort: use P5_BigMoment (ranked/shrunk) but TAG it clearly
-    if fallback_df is not None and "P5_BigMoment" in fallback_df.columns:
-        s = pd.to_numeric(fallback_df["P5_BigMoment"], errors="coerce")
-        if return_source: return s, "fallback:P5_BigMoment"
-        return s
+    # 1) try metrics (preferred)
+    s, src = _extract(metrics_df, "metrics")
+    if s is not None and not s.isna().all():
+        return s, src if return_source else s
 
-    # Nothing found
-    s = pd.Series(np.nan, index=primary_df.index)
-    if return_source: return s, "none"
-    return s
+    # 2) try rie_df (raw inside RIE frame)
+    s, src = _extract(rie_df, "rie")
+    if s is not None and not s.isna().all():
+        return (s, src) if return_source else s
+
+    # 3) last resort: P5_BigMoment (note: ranked/shrunk)
+    if "P5_BigMoment" in rie_df.columns:
+        s = pd.to_numeric(rie_df["P5_BigMoment"], errors="coerce")
+        return (s, "rie:P5_BigMoment") if return_source else s
+
+    # nothing available
+    s = pd.Series(np.nan, index=rie_df.index)
+    return (s, "none") if return_source else s
 
 
-# ---------- ADD CLASS COLUMNS (uses strict raw GCI, warns on fallback) ----------
+# ---- 2) Add class columns using the raw GCI (with warnings & notes) ----
 def add_gci_class_columns(rie_df: pd.DataFrame, metrics_df: pd.DataFrame | None = None) -> pd.DataFrame:
-    # pick GCI + provenance
-    gci, gci_src = _pick_gci_series(primary_df=metrics_df if metrics_df is not None else rie_df,
-                                    fallback_df=rie_df, return_source=True)
+    gci, gci_src = _pick_raw_gci_by_horse(rie_df, metrics_df, return_source=True)
 
-    # (optional) small on-screen notice if we had to fall back
+    # light on-screen note if we had to fall back or found nothing
     try:
-        if gci_src.startswith("fallback"):
-            st.info(f"GCI class bands using fallback source: {gci_src}. "
-                    f"For best results, provide a raw GCI column (e.g., 'GCI_Value').")
-        elif gci_src == "none":
-            st.warning("No GCI column found; class bands may be blank.")
+        if gci_src == "none":
+            st.warning("No raw GCI column found in metrics or RIE; class bands will be blank.")
+        elif "P5_BigMoment" in gci_src:
+            st.info(f"GCI bands using fallback {gci_src}. For true class, supply a raw GCI column (e.g., 'GCI_Value').")
+        else:
+            st.caption(f"GCI bands source: {gci_src}")
     except Exception:
-        pass  # streamlit may not be available in some unit contexts
+        pass
 
+    # robust race class index from the aligned GCI
     race_idx = _robust_race_class_index(gci)
 
-    labels, idxs = zip(*[gci_to_classband(x) for x in gci.fillna(0.0)])
+    labels, idxs = zip(*[gci_to_classband(v) for v in gci.fillna(np.nan)])
     out = rie_df.copy()
-    out["GCI_Value"]  = gci.round(2)         # <-- now the true/raw GCI if present
-    out["GCI_Source"] = gci_src              # <-- shows exactly what fed the bands
+    out["GCI_Value"]  = pd.to_numeric(gci, errors="coerce").round(2)
+    out["GCI_Source"] = gci_src
     out["ClassBand"]  = labels
     out["ClassIndex"] = idxs
     out["RaceClassIndex"] = race_idx
     out["DeltaClass"] = (pd.to_numeric(out["ClassIndex"], errors="coerce") - race_idx).clip(-3, 3).round(1)
 
-    # portability guard (same as before)
+    # portability/downside guards (same as before)
     E = pd.to_numeric(out.get("P2_Efficiency"), errors="coerce")
     R = pd.to_numeric(out.get("P6_Reliability"), errors="coerce")
     E01 = (E / 10.0).clip(0.0, 1.0) if E is not None else pd.Series(0.5, index=out.index)
@@ -2035,49 +2043,14 @@ def add_gci_class_columns(rie_df: pd.DataFrame, metrics_df: pd.DataFrame | None 
         if fragile_peak:  msg = _downgrade(msg)
 
         note_bits = []
-        if fragile_peak:      note_bits.append("fragile peak")
-        elif portable_soft:   note_bits.append("portability a query")
-        notes.append(", ".join(note_bits) if note_bits else "")
+        if fragile_peak:    note_bits.append("fragile peak")
+        elif portable_soft: note_bits.append("portability a query")
         adv.append(msg)
+        notes.append(", ".join(note_bits) if note_bits else "")
 
     out["ClassAdvice"] = adv
     out["ClassNote"]   = notes
     return out
-
-def _robust_race_class_index(gci_series: pd.Series) -> int:
-    s = pd.to_numeric(gci_series, errors="coerce").dropna()
-    if len(s) == 0:
-        return 1
-    med = float(np.median(s))
-    mad = float(np.median(np.abs(s - med))) or 0.0
-    if mad > 0:
-        hi = med + 3.0 * 1.4826 * mad
-        s = s.clip(upper=hi)
-    s_sorted = s.sort_values(ascending=False)
-    top3 = s_sorted.head(3)
-    race_gci = float(np.median(top3)) if len(top3) else float(s_sorted.iloc[0])
-    return gci_to_classband(race_gci)[1]
-
-def _class_advice_core(delta_idx: float) -> str:
-    if delta_idx >= 2.0:  return "Ran above the race — step up ~1 class"
-    if delta_idx >= 1.0:  return "Progressive — try ½-step up or very strong same grade"
-    if delta_idx > -0.5:  return "Right level — repeat chance"
-    if delta_idx >= -1.0: return "Needs slight ease"
-    return "Needs easier company"
-
-def _downgrade(text: str) -> str:
-    ladder = [
-        "Ran above the race — step up ~1 class",
-        "Progressive — try ½-step up or very strong same grade",
-        "Right level — repeat chance",
-        "Needs slight ease",
-        "Needs easier company"
-    ]
-    try:
-        i = ladder.index(text)
-        return ladder[min(i+1, len(ladder)-1)]
-    except ValueError:
-        return text
 
 # ================== /GCI Class Calibrator ==================
 # ======================= Race Intelligence Suite — RIE narrative + NRCI (1–5, fused peaks) =======================
