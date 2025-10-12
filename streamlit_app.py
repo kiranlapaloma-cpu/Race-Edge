@@ -2061,13 +2061,16 @@ def build_NRCI_v22(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
     P    = pd.to_numeric(df.get("P4_Tenacity"),   errors="coerce")
     E    = pd.to_numeric(df.get("P2_Efficiency"), errors="coerce")
     R    = pd.to_numeric(df.get("P6_Reliability"),errors="coerce")
-    M_p5 = pd.to_numeric(df.get("P5_BigMoment"),  errors="coerce")    # Big Moment
+    M_p5 = pd.to_numeric(df.get("P5_BigMoment"),  errors="coerce")
 
-    # Raw PI / GCI if present (0–10 expected). Use to fuse peaks.
-    PI_raw  = pd.to_numeric(df.get("PI_RS", df.get("PI", np.nan)), errors="coerce")
-    GCI_raw = pd.to_numeric(df.get("GCI_RS", df.get("GCI", np.nan)), errors="coerce")
+    # --- ensure Series before concat ---
+    PI_raw  = df["PI_RS"] if "PI_RS" in df.columns else df.get("PI", pd.Series(np.nan, index=df.index))
+    PI_raw  = pd.to_numeric(PI_raw, errors="coerce")
 
-    # Ability fuse: use the stronger of Engine vs PI (if PI exists)
+    GCI_raw = df["GCI_RS"] if "GCI_RS" in df.columns else df.get("GCI", pd.Series(np.nan, index=df.index))
+    GCI_raw = pd.to_numeric(GCI_raw, errors="coerce")
+
+    # Fuse ability: use stronger of Engine vs PI (if PI exists)
     A = pd.concat([A_p1, PI_raw], axis=1).max(axis=1, skipna=True)
 
     # Big moment: prefer P5_BigMoment; else direct GCI if P5 missing
