@@ -695,6 +695,91 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         field_n=len(w),
         return_meta=True
     )
+    # ---- MASS (horse weight) awareness for PI ---------------------------------
+    # Detect/parse a mass column, default 60 kg. Accepts: kg, lb, st-lb ("9-4"), or strings.
+    def _parse_mass_to_kg(v):
+        if v is None or (isinstance(v, float) and not np.isfinite(v)): return np.nan
+        s = str(v).strip().lower()
+        if not s: return np.nan
+        # st-lb like "9-4" or "9st 4lb"
+        m = re.match(r"^\s*(\d+)\s*st[\s\-]*([0-9]{1,2})\s*(lb|lbs)?\s*$", s)
+        if m:
+            stn = float(m.group(1)); lb = float(m.group(2))
+            return (stn*14.0 + lb) * 0.45359237
+        # plain "9-4"
+        m = re.match(r"^\s*(\d+)\s*[\-\/]\s*([0-9]{1,2})\s*$", s)
+        if m:
+            stn = float(m.group(1)); lb = float(m.group(2))
+            return (stn*14.0 + lb) * 0.45359237
+        # numbers with unit
+        m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*(kg|kilogram|kilograms)\s*$", s)
+        if m:
+            return float(m.group(1))
+        m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*(lb|lbs|pound|pounds)\s*$", s)
+        if m:
+            return float(m.group(1)) * 0.45359237
+        # bare number → guess unit
+        try:
+            x = float(s)
+            # > 200 is almost surely lb; 30..120 plausible kg
+            if x > 200:      return x * 0.45359237
+            if 30 <= x <= 120: return x
+            # 100–200 could be lb; bias to lb if <= 90 kg equiv
+            if 100 <= x <= 200: return x * 0.45359237
+            return np.nan
+        except Exception:
+            return np.nan
+
+    def _pick_mass_column(df_cols):
+        # try common names (case-insensitive, strip spaces/underscores)
+        keys = { re.sub(r"[\s_]+","", c.lower()): c for c in df_cols }
+        for k in (
+            "horseweight","weight","wt","bodyweight","bw","mass",
+            "declaredweight","officialweight","carriedweight"
+        ):
+            if k in keys: return keys[k]
+        # fallbacks: any column containing "weight" (shortest name wins)
+        cands = [c for c in df_cols if "weight" in c.lower()]
+        return sorted(cands, key=len)[0] if cands else None
+
+    MASS_REF_KG = 60.0  # neutral reference
+    mass_col = _pick_mass_column(w.columns)
+    if mass_col:
+        mass_kg = w[mass_col].map(_parse_mass_to_kg)
+    else:
+        mass_kg = pd.Series(np.nan, index=w.index)
+
+    # Fill with median when available; else 60
+    if mass_kg.notna().any():
+        mass_kg = mass_kg.fillna(mass_kg.median(skipna=True))
+    mass_kg = mass_kg.fillna(MASS_REF_KG)
+
+    # Distance-sensitive per-kg penalty (in PI_pts space, pre-scaling)
+    # Calibrated so that ~1600m charges ~0.16 pts per kg around the reference.
+    def _perkg_pts(dm):
+        dm = float(dm)
+        # anchors: (1000m→0.10), (1200→0.12), (1400→0.14), (1600→0.16), (2000→0.20), (2400→0.24)
+        knots = [(1000,0.10),(1200,0.12),(1400,0.14),(1600,0.16),(2000,0.20),(2400,0.24)]
+        if dm <= knots[0][0]: return knots[0][1]
+        if dm >= knots[-1][0]: return knots[-1][1]
+        for (a,va),(b,vb) in zip(knots, knots[1:]):
+            if a <= dm <= b:
+                t = (dm-a)/(b-a)
+                return va + (vb - va)*t
+        return 0.16  # fallback near a mile
+
+    perkg = _perkg_pts(D)
+    # Persist a short note for UI/PDF (source + per-kg effect)
+    w.attrs["PI_MASS_NOTE"] = {
+        "mass_col": mass_col or "(none → 60 kg default)",
+        "ref_kg": MASS_REF_KG,
+        "perkg_pts": round(perkg, 3),
+        "distance_m": int(D),
+    }
+
+    # Signed adjustment vs reference (positive mass = penalty)
+    mass_delta = (mass_kg - MASS_REF_KG)
+                               
 
     # Store for captions/DB/PDF
     w.attrs["GOING"] = going_for_pi
@@ -706,15 +791,21 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         PI_W["Accel"] += shift*0.5
         PI_W["tsSPI"] += shift*0.5
 
-    def _pi_pts_row(r):
+        def _pi_pts_row(r):
         acc = r.get("Accel"); mid = r.get("tsSPI"); f  = r.get("F200_idx"); gr = r.get(GR_COL)
         parts = []
         if pd.notna(f):   parts.append(PI_W["F200_idx"]*(f-100.0))
         if pd.notna(mid): parts.append(PI_W["tsSPI"]   *(mid-100.0))
         if pd.notna(acc): parts.append(PI_W["Accel"]   *(acc-100.0))
         if pd.notna(gr):  parts.append(PI_W["Grind"]   *(gr-100.0))
-        return np.nan if not parts else sum(parts) / sum(PI_W.values())
-    w["PI_pts"] = w.apply(_pi_pts_row, axis=1)
+        base = (np.nan if not parts else sum(parts) / sum(PI_W.values()))
+        if not np.isfinite(base):
+            return np.nan
+        # mass penalty in PI_pts (kg heavier than ref lowers PI_pts)
+        # use the mass_kg Series aligned to w.index
+        idx = r.name
+        md = float(mass_delta.loc[idx]) if idx in mass_delta.index else 0.0
+        return base - perkg * md
 
     pts = pd.to_numeric(w["PI_pts"], errors="coerce")
     med = float(np.nanmedian(pts)) if np.isfinite(np.nanmedian(pts)) else 0.0
@@ -1247,10 +1338,7 @@ for c in ["PI","Accel",GR_COL,"Finish_Pos","Horse"]:
     if c not in AH.columns:
         AH[c] = np.nan
 
-pi_rs = AH["PI"].clip(lower=0.0, upper=10.0)  # keep variable name if you like
-
-# 1) Robust centre and spread (single race only)
-pi_rs = AH["PI_RS"].clip(lower=0.0, upper=10.0)
+pi_rs = AH["PI"].clip(lower=0.0, upper=10.0)
 med   = float(np.nanmedian(pi_rs))
 sigma = mad_std(pi_rs - med)
 sigma = 0.90 if (not np.isfinite(sigma) or sigma < 0.90) else sigma
@@ -1290,7 +1378,7 @@ AH["AH_Tier"]       = AH["AHS"].map(ah_tier)
 AH["AH_Confidence"] = ah_conf(N)
 
 # 6) Display table (sorted by AHS then finish)
-ah_cols = ["Horse","Finish_Pos","PI_RS","AHS","AH_Tier","AH_Confidence","z_FA","_FSI"]
+ah_cols = ["Horse","Finish_Pos","PI","AHS","AH_Tier","AH_Confidence","z_FA","_FSI"]
 for c in ah_cols:
     if c not in AH.columns: AH[c] = np.nan
 
@@ -1606,10 +1694,10 @@ hh["Tier"] = hh.apply(hh_tier_row, axis=1)
 
 # --- Descriptive note ---
 def hh_note(r):
-    pi_rs, gci_rs = as_num(r.get("PI_RS")), as_num(r.get("GCI_RS"))
+    pi, gci_rs = as_num(r.get("PI")), as_num(r.get("GCI_RS"))
     bits=[]
-    if np.isfinite(pi_rs) and np.isfinite(gci_rs):
-        bits.append(f"PI_RS {pi_rs:.2f}, GCI_RS {gci_rs:.2f}")
+    if np.isfinite(pi) and np.isfinite(gci_rs):
+        bits.append(f"PI {pi:.2f}, GCI_RS {gci_rs:.2f}")
     else:
         if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
         asi2 = as_num(r.get("ASI2"))
