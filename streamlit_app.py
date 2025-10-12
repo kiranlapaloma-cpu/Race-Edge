@@ -1949,7 +1949,7 @@ def gci_to_classband(gci_value: float):
 
 def _pick_gci_series(primary_df: pd.DataFrame, fallback_df: pd.DataFrame | None = None) -> pd.Series:
     s = None
-    for col in ["GCI_RS", "GCI", "CGI"]:
+    for col in ["GCI_RS", "GCI", "CGI", "GCI Value", "GCI_RS (v3.3)"]:
         if col in primary_df.columns:
             s = pd.to_numeric(primary_df[col], errors="coerce")
             break
@@ -1957,6 +1957,12 @@ def _pick_gci_series(primary_df: pd.DataFrame, fallback_df: pd.DataFrame | None 
         s = pd.to_numeric(fallback_df["P5_BigMoment"], errors="coerce")
     if s is None:
         s = pd.Series(np.nan, index=primary_df.index)
+    if s is None or s.isna().all():
+        # if all missing, pull fallback BigMoment or leave NaN
+        if fallback_df is not None and "P5_BigMoment" in fallback_df.columns:
+            s = pd.to_numeric(fallback_df["P5_BigMoment"], errors="coerce")
+        else:
+            s = pd.Series(np.nan, index=primary_df.index)
     return s
 
 def _robust_race_class_index(gci_series: pd.Series) -> int:
@@ -2322,10 +2328,7 @@ if isinstance(rie_view, pd.DataFrame) and not rie_view.empty:
             "A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability",
             "GCI_Value","ClassBand","DeltaClass","ClassAdvice"
         ]
-        st.dataframe(display_df[cols_to_show], use_container_width=True, hide_index=True)
-        st.markdown("### NRCI v2.4 — Punter Confidence (1–5, fused peaks + dominance)")
-        st.dataframe(nrci_view, use_container_width=True, hide_index=True)
-        st.caption("NRCI fuses Engine with PI, includes Big-Moment, adds a bounded dominance uplift, and applies gentle coherence & reliability.")
+        
     except Exception as e:
         st.error("NRCI v2.3 failed.")
         st.exception(e)
