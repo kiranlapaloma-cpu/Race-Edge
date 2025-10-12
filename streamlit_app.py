@@ -2383,7 +2383,16 @@ try:
 except Exception as e:
     st.error("RIE v1.1 failed.")
     st.exception(e)
-
+# --- GCI diagnostics (temporary) ---
+try:
+    st.write("metrics_df present:", metrics is not None)
+    if metrics is not None:
+        st.write("metrics columns (sample):", list(metrics.columns)[:20])
+        # show whether GCI columns exist
+        st.write("has 'GCI RS':", any(c.strip().lower().replace(" ","").replace("_","")== "gcirs" for c in metrics.columns))
+        st.write("has 'GCI':", any(c.strip().lower()=="gci" for c in metrics.columns))
+except Exception:
+    pass
 # NRCI table only if RIE succeeded
 if isinstance(rie_view, pd.DataFrame) and not rie_view.empty:
     try:
