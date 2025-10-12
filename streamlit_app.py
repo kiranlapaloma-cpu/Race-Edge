@@ -1354,9 +1354,10 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
 if split_step == 200:
     st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
 
-# ======================= Sectional Metrics table =====================
 st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
-GR_COL = metrics.attrs.get("GR_COL","Grind")
+
+GR_COL = metrics.attrs.get("GR_COL", "Grind")
+
 show_cols = [
     "Horse","Finish_Pos","RaceTime_s",
     "F200_idx","tsSPI","Accel","Grind","Grind_CG",
@@ -1365,18 +1366,29 @@ show_cols = [
     "PI","GCI","GCI_RS",
     "RSI","RS_Component","RSI_Cue"
 ]
-...
-display_df = metrics[show_cols].copy()
-_finish_sort = display_df["Finish_Pos"].fillna(1e9)
+
+# ---- make the column pick robust (no KeyError if some are missing) ----
+tmp = metrics.copy()
+for c in show_cols:
+    if c not in tmp.columns:
+        tmp[c] = np.nan
+display_df = tmp[show_cols].copy()
+
+# prefer sorting by finish as secondary key when present
+_finish_sort = pd.to_numeric(display_df["Finish_Pos"], errors="coerce").fillna(1e9)
 display_df = display_df.assign(_FinishSort=_finish_sort).sort_values(
     ["PI","_FinishSort"], ascending=[False, True]
 ).drop(columns=["_FinishSort"])
+
 st.dataframe(display_df, use_container_width=True)
 
-st.caption(
-    f"CG={'ON' if USE_CG else 'OFF'} (FSR={metrics.attrs.get('FSR',1.0):.3f}; Collapse={metrics.attrs.get('CollapseSeverity',0.0):.1f}).  "
-    f"Race Shape={metrics.attrs.get('SHAPE_TAG','EVEN')} (SCI={metrics.attrs.get('SCI',1.0):.2f}; FRA={'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'})."
-)
+# Now (optionally) backfill RSI/exposure cue columns from attrs if they were missing
+if "RSI" in metrics.attrs and display_df["RSI"].isna().all():
+    display_df["RSI"] = float(metrics.attrs["RSI"])
+if "RS_Component" in metrics.columns and display_df["RS_Component"].isna().all():
+    display_df["RS_Component"] = metrics["RS_Component"]
+if "RSI_Cue" in metrics.columns and display_df["RSI_Cue"].isna().all():
+    display_df["RSI_Cue"] = metrics["RSI_Cue"]
 # ----- Add RSI & exposure columns to the Sectional Metrics view -----
 display_df["RSI"]          = metrics.attrs.get("RSI", np.nan)
 display_df["RS_Component"] = metrics.get("RS_Component", np.nan)
