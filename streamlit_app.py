@@ -791,26 +791,31 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         PI_W["Accel"] += shift*0.5
         PI_W["tsSPI"] += shift*0.5
 
-        def _pi_pts_row(r):
-        acc = r.get("Accel"); mid = r.get("tsSPI"); f  = r.get("F200_idx"); gr = r.get(GR_COL)
+            # --- Mass-aware PI points calculation ----------------------------------
+    def _pi_pts_row(r):
+        acc = r.get("Accel")
+        mid = r.get("tsSPI")
+        f   = r.get("F200_idx")
+        gr  = r.get(GR_COL)
+
         parts = []
-        if pd.notna(f):   parts.append(PI_W["F200_idx"]*(f-100.0))
-        if pd.notna(mid): parts.append(PI_W["tsSPI"]   *(mid-100.0))
-        if pd.notna(acc): parts.append(PI_W["Accel"]   *(acc-100.0))
-        if pd.notna(gr):  parts.append(PI_W["Grind"]   *(gr-100.0))
-        base = (np.nan if not parts else sum(parts) / sum(PI_W.values()))
+        if pd.notna(f):
+            parts.append(PI_W["F200_idx"] * (f - 100.0))
+        if pd.notna(mid):
+            parts.append(PI_W["tsSPI"] * (mid - 100.0))
+        if pd.notna(acc):
+            parts.append(PI_W["Accel"] * (acc - 100.0))
+        if pd.notna(gr):
+            parts.append(PI_W["Grind"] * (gr - 100.0))
+
+        base = np.nan if not parts else sum(parts) / sum(PI_W.values())
         if not np.isfinite(base):
             return np.nan
+
         # mass penalty in PI_pts (kg heavier than ref lowers PI_pts)
-        # use the mass_kg Series aligned to w.index
         idx = r.name
         md = float(mass_delta.loc[idx]) if idx in mass_delta.index else 0.0
         return base - perkg * md
-
-    pts = pd.to_numeric(w["PI_pts"], errors="coerce")
-    med = float(np.nanmedian(pts)) if np.isfinite(np.nanmedian(pts)) else 0.0
-    centered = pts - med
-    sigma = mad_std(centered);  sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else sigma
     w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
 
     # ----- GCI (time + shape + efficiency) -----
