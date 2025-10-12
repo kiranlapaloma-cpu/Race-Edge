@@ -1942,9 +1942,20 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     rsi = float(df.attrs.get("RSI", np.nan))
     sci = float(df.attrs.get("SCI", 0.0))
 
-    # Pillar 1 — Engine (CDF)
-    eng_raw = _engine_vector(df, gr_col)
-    eng01   = _cdf01(eng_raw); P1 = 10.0*eng01*_alpha(eng01.notna().sum())
+    # --- Ability (prefer RIE's P1_Engine; else IAI; else PI/PI_RS) ---
+    eng10 = pd.to_numeric(df.get("P1_Engine"), errors="coerce")  # already on 0–10
+    if eng10.notna().any():
+        A       = eng10.fillna(0.0)                # 0–10 scale
+        A01     = (A / 10.0).clip(0.0, 1.0)        # 0–1 for coherence
+    else:
+        iai = pd.to_numeric(df.get("IAI"), errors="coerce")
+        if iai.notna().any():
+            A01 = _cdf01(iai)
+            A   = 10.0 * A01 * _alpha(A01.notna().sum())
+        else:
+            pi  = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
+            A01 = _cdf01(pi)
+            A   = 10.0 * A01 * _alpha(A01.notna().sum())
 
     # Pillar 2 — Efficiency (balance & comp around per-race medians)
     if "BAL" not in df.columns:
