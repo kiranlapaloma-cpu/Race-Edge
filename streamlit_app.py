@@ -1753,18 +1753,32 @@ hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
 
 # --- Tier logic (race-shape-aware) ---
 def hh_tier_row(r):
-    pi_val = as_num(r.get("PI"))
-    ...
-    if np.isfinite(pi_val) and np.isfinite(gci_rs):
-        if pi_val >= 7.2 and gci_rs >= 6.0: ...
-        if pi_val >= 6.2 and gci_rs >= 5.0: ...
-    ...
-    if np.isfinite(pi_val) and np.isfinite(gci_rs):
-        bits.append(f"PI {pi_val:.2f}, GCI_RS {gci_rs:.2f}")
+    """Return a tier label for Hidden Horses v2."""
     hs = as_num(r.get("HiddenScore"))
-    if not np.isfinite(hs): return ""
-    if hs >= 1.8: return "🔥 Top Hidden"
-    if hs >= 1.2: return "🟡 Notable Hidden"
+    if not np.isfinite(hs):
+        return ""
+
+    # Baseline performance gates (robust to missing GCI_RS)
+    pi_val = as_num(r.get("PI"))
+    gci_rs = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
+
+    # Mild gates so we don't crown complete outliers with zero baseline
+    def baseline_ok_for(top: bool) -> bool:
+        if top:
+            return (
+                (np.isfinite(pi_val)  and pi_val  >= 5.4) or
+                (np.isfinite(gci_rs) and gci_rs >= 4.8)
+            )
+        else:
+            return (
+                (np.isfinite(pi_val)  and pi_val  >= 4.8) or
+                (np.isfinite(gci_rs) and gci_rs >= 4.2)
+            )
+
+    if hs >= 1.8 and baseline_ok_for(top=True):
+        return "🔥 Top Hidden"
+    if hs >= 1.2 and baseline_ok_for(top=False):
+        return "🟡 Notable Hidden"
     return ""
 hh["Tier"] = hh.apply(hh_tier_row, axis=1)
 
