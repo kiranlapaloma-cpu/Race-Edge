@@ -793,7 +793,6 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
 
     # ---------- Mass-aware PI points (drop-in) ----------
     # 1) Pull carried mass (kg) from the file, robustly
-    import re
 
     def _mass_kg_series(df: pd.DataFrame) -> tuple[pd.Series, str]:
         """
