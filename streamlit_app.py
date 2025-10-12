@@ -1934,12 +1934,12 @@ def _adaptive_verdicts(scores: pd.Series, labels: tuple[str, str, str, str]):
         else: out.append(labels[0])
     return out
 
-# ======================= Race Intelligence Suite (RIE narrative + NRCI table; NRCI fixed) =======================
+# ======================= Race Intelligence Suite — RIE narrative + NRCI (1–5, fused peaks) =======================
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- RIE v1.1 (Trainer) — keep as in your working version ----------
+# ---------- RIE v1.1 (Trainer) ----------
 def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     df = metrics.copy()
     if "Horse" not in df.columns:
@@ -1949,12 +1949,12 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     rsi = float(df.attrs.get("RSI", np.nan))
     sci = float(df.attrs.get("SCI", 0.0))
 
-    # P1 — Engine
-    eng_vec = _engine_vector(df, gr_col)
-    eng01   = _cdf01(eng_vec)
+    # P1 — ENGINE (IAI preferred; else composite)
+    eng_vec = _engine_vector(df, gr_col)                # arbitrary scale
+    eng01   = _cdf01(eng_vec)                           # 0..1
     P1 = (10.0 * eng01 * _alpha(eng01.notna().sum())).clip(0.0, 10.0)
 
-    # P2 — Efficiency
+    # P2 — EFFICIENCY (BAL vs med + COMP vs med)
     if "BAL" not in df.columns:
         df["BAL"] = 100.0 - (pd.to_numeric(df.get("Accel"), errors="coerce")
                               - pd.to_numeric(df.get(gr_col), errors="coerce")).abs()/2.0
@@ -1967,7 +1967,7 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     eff01 = pd.to_numeric(eff01_raw, errors="coerce").clip(0.0, 1.0)
     P2 = 10.0 * eff01 * _alpha(np.isfinite(eff01).sum())
 
-    # P3 — ShapeFit
+    # P3 — SHAPE FIT (base × evidence)
     accel = pd.to_numeric(df.get("Accel"),  errors="coerce")
     mid   = pd.to_numeric(df.get("tsSPI"),  errors="coerce")
     grind = pd.to_numeric(df.get(gr_col),   errors="coerce")
@@ -1976,25 +1976,37 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
          for a, m, g in zip(accel.fillna(100), mid.fillna(100), grind.fillna(100))],
         index=df.index
     )
-    strength = _shape_strength(rsi, sci)
+    strength = _shape_strength(rsi, sci)                # 0..1
     P3 = (base_shape * strength).clip(0.0, 10.0)
 
-    # P4 — Tenacity
+    # P4 — TENACITY (late hold + ΔG)
     dG     = pd.to_numeric(df.get("DeltaG"), errors="coerce")
     ten_core = 0.70 * (grind - 100.0).clip(lower=0.0) + 0.30 * (dG - 98.0).clip(lower=0.0)
     ten01 = _cdf01(ten_core)
     P4 = 10.0 * ten01 * _alpha(np.isfinite(ten_core).sum())
 
-    # P5 — BigMoment
-    if gci.isna().all() or gci.nunique(dropna=True) <= 1:
-    # fall back to Engine as proxy for Big Moment
-        gci = pd.to_numeric(df.get("P1_Engine"), errors="coerce")
-        gci01 = _cdf01(gci)
-        P5 = 10.0 * gci01 * _alpha(gci.notna().sum())
+    # P5 — BIG MOMENT (GCI). SAFE DEFINITION + FALLBACK
+    # 1) choose the best-available GCI column (Series guaranteed)
+    if "GCI_RS" in df.columns:
+        gci = pd.to_numeric(df["GCI_RS"], errors="coerce")
+    elif "GCI" in df.columns:
+        gci = pd.to_numeric(df["GCI"], errors="coerce")
+    elif "CGI" in df.columns:   # common misname
+        gci = pd.to_numeric(df["CGI"], errors="coerce")
+    else:
+        gci = pd.Series(np.nan, index=df.index)
 
-    # P6 — Reliability
+    # 2) if entirely missing or flat, fall back to engine vector (keeps variance)
+    if gci.isna().all() or gci.nunique(dropna=True) <= 1:
+        gci = pd.to_numeric(eng_vec, errors="coerce")
+
+    gci01 = _cdf01(gci)
+    P5 = 10.0 * gci01 * _alpha(gci.notna().sum())
+
+    # P6 — RELIABILITY (integrity + late stability − TFS)
     valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
     completeness = df[valid_cols].notna().sum(axis=1) / len(valid_cols)
+
     tfs = _as_series(df.get("TFS"), len(df)).where(lambda x: x>=0)
     vt = tfs.dropna()
     if len(vt) >= 3:
@@ -2002,20 +2014,23 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
         tfs_pen = (tfs / spread).clip(0.0, 1.0).fillna(0.0)
     else:
         tfs_pen = pd.Series(0.0, index=df.index)
+
     late_stab = 1.0 - (abs(accel - grind)/6.0).clip(0.0, 1.0)
     R01 = (0.55*completeness + 0.20*(1.0 - tfs_pen) + 0.25*late_stab).clip(0.0, 1.0)
     P6 = 10.0 * R01
 
-    # Headline + moderation
+    # Headline + coherence/reliability moderation
     w1,w2,w3,w4,w5,w6 = 0.26,0.12,0.18,0.20,0.14,0.10
-    coh = _coherence(eng01.fillna(0.0), ten01.fillna(0.0), eff01.fillna(0.0))
+    coh = _coherence(eng01.fillna(0.0), ten01.fillna(0.0), eff01.fillna(0.0))  # 0.5–1.0
     headline = (w1*P1 + w2*P2 + w3*P3 + w4*P4 + w5*P5 + w6*P6)
     RIE = (headline * coh * _reliability_multiplier(P6)).round(2)
 
+    # Race-relative verdicts
     verdicts = _adaptive_verdicts(RIE, (
         "Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"
     ))
 
+    # Trainer paragraph
     def _brief(i):
         horse = str(df.loc[i, "Horse"])
         cues = []
@@ -2051,8 +2066,8 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     out = out.assign(_k=cat).sort_values(["_k","RIE_Score"], ascending=[True, False]).drop(columns=["_k"]).reset_index(drop=True)
     return out
 
-# ---------- NRCI v2.2 (Punter; SCALE 1–5) — Ability fuse + BigMoment + Peak safeguard ----------
-def build_NRCI_v22(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
+# ---------- NRCI v2.3 (Punter, 1–5; fused peaks + dominance) ----------
+def build_NRCI_v23(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
     df = rie_df.copy()
     if "Horse" not in df.columns:
         df["Horse"] = "(Unnamed)"
@@ -2065,42 +2080,48 @@ def build_NRCI_v22(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
     R    = pd.to_numeric(df.get("P6_Reliability"),errors="coerce")
     M_p5 = pd.to_numeric(df.get("P5_BigMoment"),  errors="coerce")
 
-    # --- ensure Series before concat ---
-    PI_raw  = df["PI_RS"] if "PI_RS" in df.columns else df.get("PI", pd.Series(np.nan, index=df.index))
-    PI_raw  = pd.to_numeric(PI_raw, errors="coerce")
+    # Ensure Series for PI/GCI
+    PI_raw  = pd.to_numeric(df["PI_RS"] if "PI_RS" in df.columns else df.get("PI",  pd.Series(np.nan, index=df.index)), errors="coerce")
+    GCI_raw = pd.to_numeric(df["GCI_RS"] if "GCI_RS" in df.columns else df.get("GCI", pd.Series(np.nan, index=df.index)), errors="coerce")
 
-    GCI_raw = df["GCI_RS"] if "GCI_RS" in df.columns else df.get("GCI", pd.Series(np.nan, index=df.index))
-    GCI_raw = pd.to_numeric(GCI_raw, errors="coerce")
-
-    # Fuse ability: use stronger of Engine vs PI (if PI exists)
+    # Ability fuse
     A = pd.concat([A_p1, PI_raw], axis=1).max(axis=1, skipna=True)
 
-    # Big moment: prefer P5_BigMoment; else direct GCI if P5 missing
-    M = M_p5
-    if M.isna().all() and GCI_raw.notna().any():
-        M = GCI_raw
+    # Big moment source (prefer P5; else raw GCI)
+    M = M_p5 if not M_p5.isna().all() else GCI_raw
 
-    # Normalize each pillar within-race (0..1) via CDF
+    # Normalize to 0..1
     A01, S01, P01, E01, R01, M01 = map(_cdf01, [A, S, P, E, R, M])
 
-    # Gentle moderators
-    coh = _coherence(A01, P01, E01)                          # 0.5..1.0
-    coh_factor = 0.7 + 0.3 * coh.clip(0.5, 1.0)              # 0.85..1.0
-    rel_factor = _reliability_multiplier(R)                  # 0.85..1.0
+    # Moderators
+    coh = _coherence(A01, P01, E01)                         # 0.5..1.0
+    coh_factor = 0.7 + 0.3 * coh.clip(0.5, 1.0)             # 0.85..1.0
+    rel_factor = _reliability_multiplier(R)                 # 0.85..1.0
 
-    # Weighted core (sum=1.0), now including BigMoment (M)
-    wA, wS, wP, wE, wR, wM = 0.28, 0.14, 0.14, 0.22, 0.12, 0.10
+    # Weights (peaks valued)
+    wA, wS, wP, wE, wR, wM = 0.32, 0.12, 0.12, 0.20, 0.08, 0.16
     core = (wA*A01 + wS*S01 + wP*P01 + wE*E01 + wR*R01 + wM*M01).clip(0.0, 1.0)
 
-    # Peak safeguard: if either PI or GCI >= 9.0/9.5 (on a 0–10 scale), apply a mild uplift
+    # Dominance uplift (bounded)
+    def pct80(s: pd.Series) -> float:
+        try:
+            return float(np.nanpercentile(pd.to_numeric(s, errors="coerce"), 80))
+        except Exception:
+            return np.nan
+
+    a80 = pct80(A); m80 = pct80(M)
+    a_ex = np.maximum(0.0, (A - a80) / 10.0) if np.isfinite(a80) else np.zeros(len(df))
+    m_ex = np.maximum(0.0, (M - m80) / 10.0) if np.isfinite(m80) else np.zeros(len(df))
     peak10 = pd.concat([PI_raw.fillna(0.0), GCI_raw.fillna(0.0)], axis=1).max(axis=1)
-    boost = np.where(peak10 >= 9.5, 1.08,
-             np.where(peak10 >= 9.0, 1.05, 1.00))           # +8% or +5% to core_mod
-    # Final mod and 1–5 scaling
-    core_mod = (core * coh_factor * rel_factor * boost).clip(0.0, 1.0)
+    hard_peak = np.where(peak10 >= 9.5, 0.06, np.where(peak10 >= 9.0, 0.03, 0.0))
+    dom_uplift = 0.12*(0.6*a_ex + 0.4*m_ex) + hard_peak
+    dom_factor = (1.0 + dom_uplift).clip(1.0, 1.18)
+
+    # Final 1–5 scale
+    core_mod = (core * coh_factor * rel_factor * dom_factor).clip(0.0, 1.0)
     NRCI = (1.0 + 4.0 * core_mod).clip(1.0, 5.0)
 
-    # Adaptive verdicts on 1–5
+    # Verdicts (adaptive)
     verdicts = _adaptive_verdicts(NRCI, ("Speculative","Each-way","Solid chance","High confidence"))
 
     out = pd.DataFrame({
@@ -2120,13 +2141,12 @@ def build_NRCI_v22(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
             "Horse": df["Horse"],
             "A01": A01.round(3), "S01": S01.round(3), "P01": P01.round(3),
             "E01": E01.round(3), "R01": R01.round(3), "M01": M01.round(3),
-            "coh": coh.round(3), "coh_factor": coh_factor.round(3),
-            "rel_factor": rel_factor.round(3),
+            "coh_factor": coh_factor.round(3), "rel_factor": rel_factor.round(3),
+            "dom_factor": dom_factor.round(3),
             "core": core.round(3), "core_mod": core_mod.round(3),
-            "PI": PI_raw.round(2), "GCI": GCI_raw.round(2), "peak10": peak10.round(2),
-            "NRCI": NRCI.round(2)
+            "PI": PI_raw.round(2), "GCI": GCI_raw.round(2), "NRCI": NRCI.round(2)
         }).sort_values("NRCI", ascending=False).reset_index(drop=True)
-        with st.expander("NRCI debug (pillars, factors, peaks)"):
+        with st.expander("NRCI debug (pillars, factors, dominance)"):
             st.dataframe(dbg, use_container_width=True, hide_index=True)
 
     return out
@@ -2135,7 +2155,8 @@ def build_NRCI_v22(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
 st.markdown("---")
 st.markdown("## Race Intelligence Suite")
 
-# RIE narrative
+# RIE narrative first
+rie_view = None
 try:
     rie_view = build_RIE_v11(metrics)
     st.markdown("### RIE v1.1 — Six-Pillar Intelligence (Trainer)")
@@ -2143,20 +2164,23 @@ try:
         st.markdown(line)
     with st.expander("Show RIE pillars table"):
         st.dataframe(rie_view.drop(columns=["TrainerNote"]), use_container_width=True, hide_index=True)
-    st.caption("RIE metrics: Engine · Efficiency · ShapeFit · Tenacity · Big-Moment · Reliability. Verdicts adapt to the race.")
+    st.caption("RIE metrics: Engine · Efficiency · ShapeFit · Tenacity · Big-Moment · Reliability.")
 except Exception as e:
     st.error("RIE v1.1 failed.")
     st.exception(e)
 
-# NRCI table (1–5)
-try:
-    nrci_view = build_NRCI_v22(rie_view, debug=False)  # set debug=True to inspect
-    st.markdown("### NRCI v2.2 — Punter Confidence (1–5, fused peaks)")
-    st.dataframe(nrci_view, use_container_width=True, hide_index=True)
-    st.caption("NRCI fuses Engine with PI (Ability), includes Big-Moment, applies gentle coherence & reliability, and safeguards true peaks. Scale 1–5.")
-except Exception as e:
-    st.error("NRCI v2.2 failed.")
-    st.exception(e)
+# NRCI table only if RIE succeeded
+if isinstance(rie_view, pd.DataFrame) and not rie_view.empty:
+    try:
+        nrci_view = build_NRCI_v23(rie_view, debug=False)
+        st.markdown("### NRCI v2.3 — Punter Confidence (1–5, fused peaks + dominance)")
+        st.dataframe(nrci_view, use_container_width=True, hide_index=True)
+        st.caption("NRCI fuses Engine with PI, includes Big-Moment, adds a bounded dominance uplift, and applies gentle coherence & reliability.")
+    except Exception as e:
+        st.error("NRCI v2.3 failed.")
+        st.exception(e)
+else:
+    st.warning("NRCI skipped because RIE did not produce a table.")
 # ======================= /END =======================
 # ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
 import sqlite3
