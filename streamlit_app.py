@@ -2116,54 +2116,54 @@ def build_CeilingCore(metrics: pd.DataFrame) -> pd.DataFrame:
     ProjectedBand = [_gci_to_class( idx if isinstance(idx, (int,float)) else float(idx) )[0] for idx in ProjectedIndex]
 
     # Confidence buckets
-ConfLevel = np.where(Conf >= CONFIG["CONF_HIGH"], "High",
-              np.where(Conf >= CONFIG["CONF_MED"], "Medium", "Low"))
+    ConfLevel = np.where(Conf >= CONFIG["CONF_HIGH"], "High",
+                  np.where(Conf >= CONFIG["CONF_MED"], "Medium", "Low"))
 
-# --- ensure vectors are Series aligned to df.index (avoid scalar collapse) ---
-def _ensure_series(x):
-    if isinstance(x, pd.Series):
-        return x.reindex(df.index)
-    if isinstance(x, (np.ndarray, list, tuple)):
-        return pd.Series(x, index=df.index)
-    try:
-        v = float(x)
-        return pd.Series([v] * len(df), index=df.index)
-    except Exception:
-        return pd.Series([np.nan] * len(df), index=df.index)
+    # --- ensure vectors are Series aligned to df.index (avoid scalar collapse) ---
+    def _ensure_series(x):
+        if isinstance(x, pd.Series):
+            return x.reindex(df.index)
+        if isinstance(x, (np.ndarray, list, tuple)):
+            return pd.Series(x, index=df.index)
+        try:
+            v = float(x)
+            return pd.Series([v] * len(df), index=df.index)
+        except Exception:
+            return pd.Series([np.nan] * len(df), index=df.index)
 
-AgainstShape = _ensure_series(AgainstShape)
-WithShape    = _ensure_series(WithShape)
-Eff          = _ensure_series(Eff)
-Ten          = _ensure_series(Ten)
-DomAdj       = _ensure_series(DomAdj)
-FragilityAdj = _ensure_series(FragilityAdj)
-TotalAdj     = _ensure_series(TotalAdj)
-DOM_OK       = _ensure_series(DOM_OK).astype(bool)
+    AgainstShape = _ensure_series(AgainstShape)
+    WithShape    = _ensure_series(WithShape)
+    Eff          = _ensure_series(Eff)
+    Ten          = _ensure_series(Ten)
+    DomAdj       = _ensure_series(DomAdj)
+    FragilityAdj = _ensure_series(FragilityAdj)
+    TotalAdj     = _ensure_series(TotalAdj)
+    DOM_OK       = _ensure_series(DOM_OK).astype(bool)
 
-# Why line (concise, consistent)
-def _why(i):
-    bits = []
-    if AgainstShape.iloc[i] > 0.35:
-        bits.append("ran against race shape")
-    elif WithShape.iloc[i] > 0.35:
-        bits.append("performance aligned with shape")
-    if Eff.iloc[i] >= 6.3 and Ten.iloc[i] >= 6.3:
-        bits.append("profile travels")
-    elif Eff.iloc[i] < 5.5 or Ten.iloc[i] < 5.5:
-        bits.append("set-up sensitive")
-    if DOM_OK.iloc[i]:
-        bits.append("dominant vs field mass")
-    if FragilityAdj.iloc[i] < 0:
-        bits.append("single-run spike (fragility cap)")
-    if not bits:
-        bits = ["solid single-run read"]
-    tone = (
-        "projects ½–1 up" if TotalAdj.iloc[i] >= 0.6
-        else ("right level / ½-step" if TotalAdj.iloc[i] >= 0.2 else "right level")
-    )
-    return f"{'; '.join(bits)}; {tone}."
+    # Why line (concise, consistent)
+    def _why(i):
+        bits = []
+        if AgainstShape.iloc[i] > 0.35:
+            bits.append("ran against race shape")
+        elif WithShape.iloc[i] > 0.35:
+            bits.append("performance aligned with shape")
+        if Eff.iloc[i] >= 6.3 and Ten.iloc[i] >= 6.3:
+            bits.append("profile travels")
+        elif Eff.iloc[i] < 5.5 or Ten.iloc[i] < 5.5:
+            bits.append("set-up sensitive")
+        if DOM_OK.iloc[i]:
+            bits.append("dominant vs field mass")
+        if FragilityAdj.iloc[i] < 0:
+            bits.append("single-run spike (fragility cap)")
+        if not bits:
+            bits = ["solid single-run read"]
+        tone = (
+            "projects ½–1 up" if TotalAdj.iloc[i] >= 0.6
+            else ("right level / ½-step" if TotalAdj.iloc[i] >= 0.2 else "right level")
+        )
+        return f"{'; '.join(bits)}; {tone}."
 
-Why = [_why(i) for i in df.index]
+    Why = [_why(i) for i in df.index]
 
     out = pd.DataFrame({
         "Horse": df["Horse"].astype(str),
