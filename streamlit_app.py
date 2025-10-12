@@ -2126,7 +2126,15 @@ def build_CeilingCore(metrics: pd.DataFrame) -> pd.DataFrame:
     Conf = 0.5*coherence + 0.5*(Reliability/10.0)
     ConfLevel = np.where(Conf >= CONFIG["CONF_HIGH"], "High",
                   np.where(Conf >= CONFIG["CONF_MED"], "Medium", "Low"))
-
+    def _why(i):
+    # --- ensure all key vars are pandas Series (not scalars) ---
+    for _v in ["AgainstShape", "WithShape", "Eff", "Ten", "DomAdj", "FragilityAdj", "TotalAdj"]:
+        v = locals().get(_v)
+        if isinstance(v, (float, int)):
+            v = pd.Series([v] * len(df), index=df.index)
+        elif isinstance(v, np.ndarray):
+            v = pd.Series(v, index=df.index)
+        locals()[_v] = v
     # Why line (concise, consistent)
     def _why(i):
         bits = []
