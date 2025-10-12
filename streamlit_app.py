@@ -1934,8 +1934,8 @@ def _adaptive_verdicts(scores: pd.Series, labels: tuple[str, str, str, str]):
         else: out.append(labels[0])
     return out
 
-# ===================== GCI Class Calibrator (v2.2) =====================
-# Auto-detects GCI, robust to outliers, zero user inputs.
+# ================== GCI Class Calibrator (v2.3 — GCI RS → GCI → P5, by Horse) ==================
+# Zero user inputs. Robust to column naming, aligns by Horse, outlier-aware.
 
 def gci_to_classband(gci_value: float):
     g = float(gci_value or 0.0)
@@ -1947,72 +1947,133 @@ def gci_to_classband(gci_value: float):
     if g >= 5.3:   return "💠 Strong Handicapper",    2
     return "🔹 Low Handicapper",                      1
 
-# ---- 1) Robust RAW GCI picker (joins by Horse; wide name coverage; provenance) ----
+# ---------- small helpers for robust column matching ----------
+def _norm_names(cols):
+    def norm(s):
+        return str(s).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+    return {norm(c): c for c in cols}
+
+def _find_col(df: pd.DataFrame, targets: list[str]) -> str | None:
+    if df is None:
+        return None
+    nm = _norm_names(df.columns)
+    for t in targets:
+        key = t.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+        if key in nm:
+            return nm[key]
+    return None
+
+# ---------- robust race class estimator (MAD-capped, top-3 median) ----------
+def _robust_race_class_index(gci_series: pd.Series) -> int:
+    s = pd.to_numeric(gci_series, errors="coerce").dropna()
+    if len(s) == 0:
+        return 1
+    med = float(np.median(s))
+    mad = float(np.median(np.abs(s - med))) or 0.0
+    if mad > 0:
+        s = s.clip(upper=med + 3.0 * 1.4826 * mad)  # upper cap only
+    s_sorted = s.sort_values(ascending=False)
+    top3 = s_sorted.head(3)
+    race_gci = float(np.median(top3)) if len(top3) else float(s_sorted.iloc[0])
+    return gci_to_classband(race_gci)[1]
+
+# ---------- advice ladder ----------
+def _class_advice_core(delta_idx: float) -> str:
+    if delta_idx >= 2.0:  return "Ran above the race — step up ~1 class"
+    if delta_idx >= 1.0:  return "Progressive — try ½-step up or very strong same grade"
+    if delta_idx > -0.5:  return "Right level — repeat chance"
+    if delta_idx >= -1.0: return "Needs slight ease"
+    return "Needs easier company"
+
+def _downgrade(text: str) -> str:
+    ladder = [
+        "Ran above the race — step up ~1 class",
+        "Progressive — try ½-step up or very strong same grade",
+        "Right level — repeat chance",
+        "Needs slight ease",
+        "Needs easier company",
+    ]
+    try:
+        i = ladder.index(text)
+        return ladder[min(i+1, len(ladder)-1)]
+    except ValueError:
+        return text
+
+# ---------- strict GCI picker (PRIORITY: GCI RS → GCI → P5_BigMoment), ALIGNED BY HORSE ----------
 def _pick_raw_gci_by_horse(rie_df: pd.DataFrame,
                            metrics_df: pd.DataFrame | None,
                            return_source: bool = False):
     """
-    Returns a Series of raw GCI aligned to rie_df rows by Horse, plus a source tag.
-    Prefers metrics_df (raw), then rie_df (raw), then rie_df['P5_BigMoment'] as last resort.
+    Returns (Series aligned to rie_df by Horse, source_tag).
+    Priority: metrics['GCI RS'] → metrics['GCI'] → rie['GCI RS'] → rie['GCI'] → rie['P5_BigMoment'].
+    Case/space/underscore/dash-insensitive. No user inputs.
     """
-    # candidates you might have used
-    raw_names = [
-        "GCI_Value","GCI Value","GCI_RS","GCI RS","GCI (raw)","GCI_raw",
-        "GCI","CGI","GCI_v3","GCI_RS_v3","GCI_RS (v3.3)"
-    ]
+
+    # Ensure a 'Horse' column exists (rename if needed)
+    if "Horse" not in rie_df.columns:
+        horse_col = _find_col(rie_df, ["horse"])
+        if horse_col and horse_col != "Horse":
+            rie_df = rie_df.rename(columns={horse_col: "Horse"})
+        else:
+            s = pd.Series(np.nan, index=rie_df.index)
+            return (s, "none") if return_source else s
 
     def _extract(df, tag):
-        if df is None or "Horse" not in df.columns:
+        if df is None:
             return None, None
-        for col in raw_names:
-            if col in df.columns:
-                s = pd.to_numeric(df[col], errors="coerce")
-                # align by Horse
-                tmp = df[["Horse"]].copy()
-                tmp["__gci__"] = s
-                aligned = rie_df[["Horse"]].merge(tmp, on="Horse", how="left")["__gci__"]
-                return aligned, f"{tag}:{col}"
-        return None, None
+        if "Horse" not in df.columns:
+            hc = _find_col(df, ["horse"])
+            if hc and hc != "Horse":
+                df = df.rename(columns={hc: "Horse"})
+            else:
+                return None, None
+        col = _find_col(df, ["GCI RS", "GCI"])
+        if not col:
+            return None, None
+        ser = pd.to_numeric(df[col], errors="coerce")
+        aligned = rie_df[["Horse"]].merge(df[["Horse", col]], on="Horse", how="left")[col]
+        return aligned, f"{tag}:{col}"
 
-    # 1) try metrics (preferred)
+    # 1) metrics first
     s, src = _extract(metrics_df, "metrics")
     if s is not None and not s.isna().all():
-        return s, src if return_source else s
+        return (s, src) if return_source else s
 
-    # 2) try rie_df (raw inside RIE frame)
+    # 2) then RIE view itself
     s, src = _extract(rie_df, "rie")
     if s is not None and not s.isna().all():
         return (s, src) if return_source else s
 
-    # 3) last resort: P5_BigMoment (note: ranked/shrunk)
-    if "P5_BigMoment" in rie_df.columns:
-        s = pd.to_numeric(rie_df["P5_BigMoment"], errors="coerce")
-        return (s, "rie:P5_BigMoment") if return_source else s
+    # 3) last resort: P5_BigMoment in rie_df
+    p5 = _find_col(rie_df, ["P5_BigMoment", "BigMoment", "P5BigMoment"])
+    if p5:
+        ser = pd.to_numeric(rie_df[p5], errors="coerce")
+        return (ser, f"rie:{p5}") if return_source else ser
 
-    # nothing available
+    # 4) nothing
     s = pd.Series(np.nan, index=rie_df.index)
     return (s, "none") if return_source else s
 
-
-# ---- 2) Add class columns using the raw GCI (with warnings & notes) ----
+# ---------- public: add class columns to RIE table ----------
 def add_gci_class_columns(rie_df: pd.DataFrame, metrics_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    # pick raw GCI (GCI RS → GCI → P5) and note its source
     gci, gci_src = _pick_raw_gci_by_horse(rie_df, metrics_df, return_source=True)
 
-    # light on-screen note if we had to fall back or found nothing
+    # optional streamlit notice
     try:
         if gci_src == "none":
-            st.warning("No raw GCI column found in metrics or RIE; class bands will be blank.")
-        elif "P5_BigMoment" in gci_src:
-            st.info(f"GCI bands using fallback {gci_src}. For true class, supply a raw GCI column (e.g., 'GCI_Value').")
+            st.warning("No 'GCI RS' or 'GCI' found; class bands may be blank.")
+        elif "p5" in gci_src.lower() or "bigmoment" in gci_src.lower():
+            st.info(f"GCI bands using fallback {gci_src}. Supply 'GCI RS' or 'GCI' for true class.")
         else:
             st.caption(f"GCI bands source: {gci_src}")
     except Exception:
         pass
 
-    # robust race class index from the aligned GCI
+    # compute bands and advice
     race_idx = _robust_race_class_index(gci)
+    labels, idxs = zip(*[gci_to_classband(v) for v in pd.to_numeric(gci, errors="coerce")])
 
-    labels, idxs = zip(*[gci_to_classband(v) for v in gci.fillna(np.nan)])
     out = rie_df.copy()
     out["GCI_Value"]  = pd.to_numeric(gci, errors="coerce").round(2)
     out["GCI_Source"] = gci_src
@@ -2021,17 +2082,17 @@ def add_gci_class_columns(rie_df: pd.DataFrame, metrics_df: pd.DataFrame | None 
     out["RaceClassIndex"] = race_idx
     out["DeltaClass"] = (pd.to_numeric(out["ClassIndex"], errors="coerce") - race_idx).clip(-3, 3).round(1)
 
-    # portability/downside guards (same as before)
+    # portability / fragility guards
     E = pd.to_numeric(out.get("P2_Efficiency"), errors="coerce")
     R = pd.to_numeric(out.get("P6_Reliability"), errors="coerce")
-    E01 = (E / 10.0).clip(0.0, 1.0) if E is not None else pd.Series(0.5, index=out.index)
-    R01 = (R / 10.0).clip(0.0, 1.0) if R is not None else pd.Series(0.5, index=out.index)
+    E01 = (E/10.0).clip(0,1) if E is not None else pd.Series(0.5, index=out.index)
+    R01 = (R/10.0).clip(0,1) if R is not None else pd.Series(0.5, index=out.index)
 
-    med = float(np.nanmedian(gci))
-    mad = float(np.nanmedian(np.abs(gci - med))) or 0.0
+    med = float(np.nanmedian(out["GCI_Value"]))
+    mad = float(np.nanmedian(np.abs(out["GCI_Value"] - med))) or 0.0
     hi = med + 3.0 * 1.4826 * mad if mad > 0 else np.inf
 
-    adv, notes = [], []
+    advice, notes = [], []
     for i in out.index:
         d = float(out.loc[i, "DeltaClass"])
         base = _class_advice_core(d)
@@ -2042,17 +2103,17 @@ def add_gci_class_columns(rie_df: pd.DataFrame, metrics_df: pd.DataFrame | None 
         if portable_soft: msg = _downgrade(msg)
         if fragile_peak:  msg = _downgrade(msg)
 
-        note_bits = []
-        if fragile_peak:    note_bits.append("fragile peak")
-        elif portable_soft: note_bits.append("portability a query")
-        adv.append(msg)
-        notes.append(", ".join(note_bits) if note_bits else "")
+        nb = []
+        if fragile_peak: nb.append("fragile peak")
+        elif portable_soft: nb.append("portability a query")
 
-    out["ClassAdvice"] = adv
+        advice.append(msg)
+        notes.append(", ".join(nb) if nb else "")
+
+    out["ClassAdvice"] = advice
     out["ClassNote"]   = notes
     return out
-
-# ================== /GCI Class Calibrator ==================
+# ================== /GCI Class Calibrator (v2.3) ==================
 # ======================= Race Intelligence Suite — RIE narrative + NRCI (1–5, fused peaks) =======================
 import numpy as np
 import pandas as pd
