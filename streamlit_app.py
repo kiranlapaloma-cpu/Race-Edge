@@ -791,32 +791,92 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         PI_W["Accel"] += shift*0.5
         PI_W["tsSPI"] += shift*0.5
 
-            # --- Mass-aware PI points calculation ----------------------------------
+    # ---------- Mass-aware PI points (drop-in) ----------
+    # 1) Pull carried mass (kg) from the file, robustly
+    import re
+
+    def _mass_kg_series(df: pd.DataFrame) -> tuple[pd.Series, str]:
+        """
+        Returns (mass_kg, source_name).
+        Accepts any of these columns if present (first match wins):
+          Carried_kg, Weight, Wt, Carried, WeightCarried
+        Parses:
+          • pure kg: 57.0, "57", "57kg"
+          • pounds: 126, "126lb"
+          • stones-lbs: "9-4", "9st4lb", "9 st 4"
+        """
+        candidates = ["Carried_kg", "Weight", "Wt", "Carried", "WeightCarried"]
+        src = next((c for c in candidates if c in df.columns), None)
+        if src is None:
+            return pd.Series(np.nan, index=df.index, dtype=float), "none"
+
+        def _to_kg(v):
+            if v is None:
+                return np.nan
+            s = str(v).strip().lower()
+            if s == "" or s == "nan":
+                return np.nan
+
+            # stones-lbs: "9-4", "9 st 4", "9st4lb"
+            m = re.match(r"^\s*(\d+)\s*(?:st|stone|)\s*[-\s]?\s*(\d+)\s*(?:lb|lbs|)\s*$", s)
+            if m:
+                st = float(m.group(1)); lb = float(m.group(2))
+                return (st * 14.0 + lb) * 0.45359237
+
+            # any number in the string
+            m = re.search(r"([-+]?\d+(?:\.\d+)?)", s)
+            if not m:
+                return np.nan
+            val = float(m.group(1))
+
+            # unit hint
+            if "lb" in s or "lbs" in s or val > 130:   # 130+ → almost surely pounds
+                return val * 0.45359237
+            # default kg
+            return val
+
+        mass_kg = pd.to_numeric(pd.Series(df[src]).map(_to_kg), errors="coerce")
+        return mass_kg, src
+
+    mass_kg, mass_src = _mass_kg_series(w)
+    w.attrs["MASS_SRC"] = mass_src
+
+    # Reference mass = median of available masses in this race
+    mass_ref = float(np.nanmedian(mass_kg)) if np.isfinite(np.nanmedian(mass_kg)) else np.nan
+    mass_delta = (mass_kg - mass_ref) if np.isfinite(mass_ref) else pd.Series(0.0, index=w.index, dtype=float)
+    # Positive mass_delta = carried HEAVIER than reference → penalty
+
+    # 2) Per-kg impact in PI points (tweakable)
+    PER_KG_PTS = 0.14  # subtract 0.14 PI_pts per extra kg carried vs race median
+
+    # 3) Base (sectional) PI points as you already do, then apply mass adjustment
     def _pi_pts_row(r):
-        acc = r.get("Accel")
-        mid = r.get("tsSPI")
-        f   = r.get("F200_idx")
-        gr  = r.get(GR_COL)
-
+        acc = r.get("Accel"); mid = r.get("tsSPI"); f = r.get("F200_idx"); gr = r.get(GR_COL)
         parts = []
-        if pd.notna(f):
-            parts.append(PI_W["F200_idx"] * (f - 100.0))
-        if pd.notna(mid):
-            parts.append(PI_W["tsSPI"] * (mid - 100.0))
-        if pd.notna(acc):
-            parts.append(PI_W["Accel"] * (acc - 100.0))
-        if pd.notna(gr):
-            parts.append(PI_W["Grind"] * (gr - 100.0))
+        if pd.notna(f):   parts.append(PI_W["F200_idx"] * (f   - 100.0))
+        if pd.notna(mid): parts.append(PI_W["tsSPI"]    * (mid - 100.0))
+        if pd.notna(acc): parts.append(PI_W["Accel"]    * (acc - 100.0))
+        if pd.notna(gr):  parts.append(PI_W["Grind"]    * (gr  - 100.0))
 
-        base = np.nan if not parts else sum(parts) / sum(PI_W.values())
-        if not np.isfinite(base):
+        if not parts:
             return np.nan
+        base = sum(parts) / (sum(PI_W.values()) or 1.0)
 
         # mass penalty in PI_pts (kg heavier than ref lowers PI_pts)
         idx = r.name
         md = float(mass_delta.loc[idx]) if idx in mass_delta.index else 0.0
-        return base - perkg * md
+        return base - (PER_KG_PTS * md)
+
+    w["PI_pts"] = w.apply(_pi_pts_row, axis=1)
+
+    # 4) Convert PI_pts → PI 0..10 (same centering/scaling you use)
+    pts = pd.to_numeric(w["PI_pts"], errors="coerce")
+    med = float(np.nanmedian(pts)) if np.isfinite(np.nanmedian(pts)) else 0.0
+    centered = pts - med
+    sigma = mad_std(centered)
+    sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else sigma
     w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
+# ---------- /Mass-aware PI points ----------
 
     # ----- GCI (time + shape + efficiency) -----
     winner_time = None
