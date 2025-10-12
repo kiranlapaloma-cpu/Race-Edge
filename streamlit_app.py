@@ -1934,6 +1934,109 @@ def _adaptive_verdicts(scores: pd.Series, labels: tuple[str, str, str, str]):
         else: out.append(labels[0])
     return out
 
+# ===================== GCI Class Calibrator (v2.2) =====================
+# Auto-detects GCI, robust to outliers, zero user inputs.
+
+def gci_to_classband(gci_value: float):
+    g = float(gci_value or 0.0)
+    if g >= 9.3:   return "🏆 Elite Group 1 calibre", 7
+    if g >= 8.5:   return "🥇 Group 1 calibre",       6
+    if g >= 7.8:   return "🥈 Group 2 calibre",       5
+    if g >= 7.0:   return "🥉 Group 3 calibre",       4
+    if g >= 6.3:   return "⚜️ Listed / Premier Handicap", 3
+    if g >= 5.3:   return "💠 Strong Handicapper",    2
+    return "🔹 Low Handicapper",                      1
+
+def _pick_gci_series(primary_df: pd.DataFrame, fallback_df: pd.DataFrame | None = None) -> pd.Series:
+    s = None
+    for col in ["GCI_RS", "GCI", "CGI"]:
+        if col in primary_df.columns:
+            s = pd.to_numeric(primary_df[col], errors="coerce")
+            break
+    if s is None and fallback_df is not None and "P5_BigMoment" in fallback_df.columns:
+        s = pd.to_numeric(fallback_df["P5_BigMoment"], errors="coerce")
+    if s is None:
+        s = pd.Series(np.nan, index=primary_df.index)
+    return s
+
+def _robust_race_class_index(gci_series: pd.Series) -> int:
+    s = pd.to_numeric(gci_series, errors="coerce").dropna()
+    if len(s) == 0:
+        return 1
+    med = float(np.median(s))
+    mad = float(np.median(np.abs(s - med))) or 0.0
+    if mad > 0:
+        hi = med + 3.0 * 1.4826 * mad
+        s = s.clip(upper=hi)
+    s_sorted = s.sort_values(ascending=False)
+    top3 = s_sorted.head(3)
+    race_gci = float(np.median(top3)) if len(top3) else float(s_sorted.iloc[0])
+    return gci_to_classband(race_gci)[1]
+
+def _class_advice_core(delta_idx: float) -> str:
+    if delta_idx >= 2.0:  return "Ran above the race — step up ~1 class"
+    if delta_idx >= 1.0:  return "Progressive — try ½-step up or very strong same grade"
+    if delta_idx > -0.5:  return "Right level — repeat chance"
+    if delta_idx >= -1.0: return "Needs slight ease"
+    return "Needs easier company"
+
+def _downgrade(text: str) -> str:
+    ladder = [
+        "Ran above the race — step up ~1 class",
+        "Progressive — try ½-step up or very strong same grade",
+        "Right level — repeat chance",
+        "Needs slight ease",
+        "Needs easier company"
+    ]
+    try:
+        i = ladder.index(text)
+        return ladder[min(i+1, len(ladder)-1)]
+    except ValueError:
+        return text
+
+def add_gci_class_columns(rie_df: pd.DataFrame, metrics_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    gci = _pick_gci_series(primary_df=metrics_df if metrics_df is not None else rie_df,
+                           fallback_df=rie_df)
+    race_idx = _robust_race_class_index(gci)
+
+    labels, idxs = zip(*[gci_to_classband(x) for x in gci.fillna(0.0)])
+    out = rie_df.copy()
+    out["GCI_Value"] = gci.round(2)
+    out["ClassBand"] = labels
+    out["ClassIndex"] = idxs
+    out["RaceClassIndex"] = race_idx
+    out["DeltaClass"] = (pd.to_numeric(out["ClassIndex"], errors="coerce") - race_idx).clip(-3, 3).round(1)
+
+    E = pd.to_numeric(out.get("P2_Efficiency"), errors="coerce")
+    R = pd.to_numeric(out.get("P6_Reliability"), errors="coerce")
+    E01 = (E / 10.0).clip(0.0, 1.0) if E is not None else pd.Series(0.5, index=out.index)
+    R01 = (R / 10.0).clip(0.0, 1.0) if R is not None else pd.Series(0.5, index=out.index)
+
+    med = float(np.nanmedian(gci))
+    mad = float(np.nanmedian(np.abs(gci - med))) or 0.0
+    hi = med + 3.0 * 1.4826 * mad if mad > 0 else np.inf
+
+    adv, notes = [], []
+    for i in out.index:
+        d = float(out.loc[i, "DeltaClass"])
+        base = _class_advice_core(d)
+        portable_soft = (E01.iloc[i] < 0.45) or (R01.iloc[i] < 0.45)
+        fragile_peak = (float(out.loc[i, "GCI_Value"]) > hi) and (R01.iloc[i] < 0.55)
+
+        msg = base
+        if portable_soft: msg = _downgrade(msg)
+        if fragile_peak:  msg = _downgrade(msg)
+
+        note_bits = []
+        if fragile_peak: note_bits.append("fragile peak")
+        elif portable_soft: note_bits.append("portability a query")
+        notes.append(", ".join(note_bits) if note_bits else "")
+        adv.append(msg)
+
+    out["ClassAdvice"] = adv
+    out["ClassNote"] = notes
+    return out
+# ================== /GCI Class Calibrator ==================
 # ======================= Race Intelligence Suite — RIE narrative + NRCI (1–5, fused peaks) =======================
 import numpy as np
 import pandas as pd
@@ -2189,7 +2292,17 @@ st.markdown("## Race Intelligence Suite")
 rie_view = None
 try:
     rie_view = build_RIE_v11(metrics)
+    # Add GCI class columns using metrics as primary source; falls back to RIE P5 if needed
+    rie_view = add_gci_class_columns(rie_view, metrics_df=metrics)
     st.markdown("### RIE v1.1 — Six-Pillar Intelligence (Trainer)")
+    for i, line in enumerate(rie_view["TrainerNote"]):
+        cls  = rie_view.loc[i, "ClassBand"]
+        adv  = rie_view.loc[i, "ClassAdvice"]
+        note = rie_view.loc[i, "ClassNote"]
+        extra = f" Class read: {cls}. {adv}."
+        if note:
+            extra += f" ({note})"
+        st.markdown(line + extra)
     for line in rie_view["TrainerNote"]:
         st.markdown(line)
     with st.expander("Show RIE pillars table"):
@@ -2202,7 +2315,19 @@ except Exception as e:
 # NRCI table only if RIE succeeded
 if isinstance(rie_view, pd.DataFrame) and not rie_view.empty:
     try:
-        nrci_view = build_NRCI_v24(rie_view, debug=False)
+        nrci_view = build_NRCI_v24(rie_view, debug=False)  # or your current NRCI builder
+
+        display_df = nrci_view.merge(
+            rie_view[["Horse","GCI_Value","ClassBand","DeltaClass","ClassAdvice"]],
+            on="Horse", how="left"
+        )
+
+        cols_to_show = [
+            "Horse","NRCI","PunterVerdict",
+            "A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability",
+            "GCI_Value","ClassBand","DeltaClass","ClassAdvice"
+        ]
+        st.dataframe(display_df[cols_to_show], use_container_width=True, hide_index=True)
         st.markdown("### NRCI v2.4 — Punter Confidence (1–5, fused peaks + dominance)")
         st.dataframe(nrci_view, use_container_width=True, hide_index=True)
         st.caption("NRCI fuses Engine with PI, includes Big-Moment, adds a bounded dominance uplift, and applies gentle coherence & reliability.")
