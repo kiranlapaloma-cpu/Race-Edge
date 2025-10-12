@@ -1829,16 +1829,63 @@ st.dataframe(AM_view, use_container_width=True)
 
 # ... end of Ability Matrix render (plot + AM_view table) ...
 
-# ======================= RIE v1.1 + NRCI v2.1 — ACCURACY PATCH (DROP-IN) =======================
-# Trainer-facing RIE (six pillars) + Punter-facing NRCI (run-only)
-# Enhancements: rank-CDF normalization, alpha shrink, shape evidence gate, coherence multiplier,
-# reliability moderation, adaptive verdict thresholds, precise trainer narratives.
+# ===================== CeilingCore v1.0 — One-Run Class Ceiling Engine =====================
+# Replaces RIE/NRCI. Uses only single-race data: GCI (or GCI RS), RSI/SCI, sectionals, and within-race medians.
+# No database. No wind. Shape-aware. Mass-based race class anchor.
 
+import re, unicodedata
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- Tiny safe helpers ----------
+# --------------------------- CONFIG (tweak here) ---------------------------
+CONFIG = {
+    # Class band thresholds (GCI -> band)
+    "CLASS_BANDS": [
+        (9.30, "🏆 Elite Group 1 calibre", 7),
+        (8.50, "🥇 Group 1 calibre",       6),
+        (7.80, "🥈 Group 2 calibre",       5),
+        (7.00, "🥉 Group 3 calibre",       4),
+        (6.30, "⚜️ Listed / Premier Handicap", 3),
+        (5.30, "💠 Strong Handicapper",    2),
+        (-1.0, "🔹 Low Handicapper",       1),
+    ],
+    # Shape adjustment weights (AgainstShape rewarded > WithShape penalised)
+    "SHAPE_ALPHA": 0.60,
+    "SHAPE_BETA":  0.40,
+    "SHAPE_WEAKEN_IF_SCI_LT": 0.40,  # if SCI < this, halve ShapeAdj
+    # Portability nudges (each capped to ±0.5 class)
+    "EFF_GAMMA": 0.40,
+    "TEN_DELTA": 0.30,
+    "PORT_CAP":  0.50,
+    "HALVE_SHAPE_IF_E_AND_T_LOW": 5.5,  # if Eff < and Ten < this, halve positive ShapeAdj
+    # Dominance bonus (mass aware)
+    "DOM_DELTA_CLASS_MIN": 1.0,
+    "DOM_INDEX_MIN": 1.10,
+    "DOM_WITHSHAPE_MAX": 0.25,
+    "DOM_BONUS": 0.50,
+    # Density taper: bonus *= clip(1 - 0.5*(IQR_width / 1.5), 0.6, 1.0)
+    "DENSITY_TAPER_BASE": 0.5,
+    "DENSITY_TAPER_MIN":  0.6,
+    "DENSITY_TAPER_DEN":  1.5,
+    # Reliability caps & fragility
+    "UPSIDE_CAP_SOFT": 1.5,  # Reliability < 8.0
+    "UPSIDE_CAP_HARD": 2.0,  # Reliability >= 8.0
+    "FRAGILITY_K":     3.0,  # MAD multiple
+    "FRAGILITY_R_GATE": 8.5,
+    "FRAGILITY_HIT":   -0.3,
+    # Confidence cutoffs
+    "CONF_HIGH": 0.75,
+    "CONF_MED":  0.60,
+}
+
+# --------------------------- Tiny helpers ---------------------------
+def _clip01(x): 
+    try: 
+        return max(0.0, min(1.0, float(x)))
+    except: 
+        return 0.0
+
 def _nz(x, alt=0.0):
     try:
         v = float(x)
@@ -1846,115 +1893,7 @@ def _nz(x, alt=0.0):
     except Exception:
         return alt
 
-def _as_series(x, n, fill=np.nan):
-    if isinstance(x, pd.Series):
-        return pd.to_numeric(x, errors="coerce")
-    try:
-        return pd.Series(pd.to_numeric(x, errors="coerce"))
-    except Exception:
-        return pd.Series([fill]*n)
-
-def _cdf01(s: pd.Series) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce")
-    return s.rank(pct=True, method="average").fillna(0.0).clip(0.0, 1.0)
-
-def _alpha(n_valid: int) -> float:
-    n = max(0, int(n_valid))
-    return n / (n + 6.0)
-
-def _shape_strength(RSI: float, SCI: float) -> float:
-    r = 0.0 if not np.isfinite(RSI) else min(1.0, abs(float(RSI))/6.0)
-    s = 0.0 if not np.isfinite(SCI) else float(SCI)
-    return r * (0.5 + 0.5*s)  # 0..1
-
-def _coherence(a01, p01, e01):
-    """
-    Vectorized coherence multiplier (0.5–1.0)
-    Requires ability + (pressure OR efficiency).
-    Handles Series or scalars safely.
-    """
-    a = pd.to_numeric(a01, errors="coerce").fillna(0.0)
-    p = pd.to_numeric(p01, errors="coerce").fillna(0.0)
-    e = pd.to_numeric(e01, errors="coerce").fillna(0.0)
-    # Element-wise core: min(ability, max(pressure, efficiency))
-    core = np.minimum(a, np.maximum(p, e))
-    # Clip range and map 0-1 → 0.5-1.0
-    return (0.5 + 0.5 * core.clip(0.0, 1.0)).fillna(0.5)
-
-def _reliability_multiplier(R10):
-    """
-    Vectorized reliability moderation (0.85–1.0 range)
-    Accepts Series or scalar, clips within 0–10, rescales to 0.85–1.0
-    """
-    r = pd.to_numeric(R10, errors="coerce").fillna(0.0)
-    return 0.85 + 0.15 * r.clip(0.0, 10.0) / 10.0
-
-def _absdiff_tri(x, target) -> float:
-    if not np.isfinite(x): return 0.0
-    d = abs(float(x) - float(target))
-    # peak 1 at d=0, →0 at d≈12 (broad tolerance for late balance)
-    span = 12.0
-    return max(0.0, 1.0 - d/span)
-
-# ---------- Common primitives ----------
-def _pick_gr_col(df):
-    gr_col = getattr(df, "attrs", {}).get("GR_COL", "Grind")
-    if gr_col not in df.columns and "Grind" in df.columns:
-        gr_col = "Grind"
-    return gr_col
-
-def _engine_vector(df, gr_col):
-    if "IAI" in df.columns:
-        return pd.to_numeric(df["IAI"], errors="coerce")
-    return (0.35*pd.to_numeric(df.get("tsSPI"), errors="coerce") +
-            0.25*pd.to_numeric(df.get("Accel"), errors="coerce") +
-            0.25*pd.to_numeric(df.get(gr_col), errors="coerce") +
-            0.15*pd.to_numeric(df.get("F200_idx"), errors="coerce"))
-
-def _shape_alignment_base(rsi, sci, accel, mid, grind):
-    if not np.isfinite(rsi): return 5.0  # neutral 5/10
-    a = _nz(accel, 100.0); m = _nz(mid, 100.0); g = _nz(grind, 100.0)
-    dLM = a - m               # + late vs mid
-    dLG = g - a               # + attritional finish
-    core = np.tanh(dLM/2.0) * (1.0 if rsi >= 0 else -1.0)
-    flav = np.tanh(dLG/3.0)
-    gate = 0.60 + 0.40 * (0.0 if not np.isfinite(sci) else float(sci))  # 0.6..1.0
-    score = (0.85*core + 0.15*flav) * gate     # -1..1
-    return float(5.0 + 5.0*score)              # 0..10
-
-def _adaptive_verdicts(scores: pd.Series, labels: tuple[str, str, str, str]):
-    # Labels ordered weakest→strongest
-    s = pd.to_numeric(scores, errors="coerce").fillna(0.0)
-    p50, p65, p80 = np.percentile(s, [50, 65, 80]) if len(s) else (6.0, 7.0, 8.0)
-    out = []
-    for v in s:
-        if v >= p80: out.append(labels[3])
-        elif v >= p65: out.append(labels[2])
-        elif v >= p50: out.append(labels[1])
-        else: out.append(labels[0])
-    return out
-
-# ================== GCI Class Calibrator (v2.5 — HorseKey + FinishPos) ==================
-# Priority: GCI RS -> GCI -> P5_BigMoment. Aligns by normalized HorseKey and FINISH position (not grid).
-# Robust to Unicode/spacing/punctuation; guards against outliers; emits diagnostics.
-
-import re, unicodedata
-import numpy as np
-import pandas as pd
-import streamlit as st
-
-# ---------- class bands ----------
-def gci_to_classband(gci_value: float):
-    g = float(gci_value or 0.0)
-    if g >= 9.3:   return "🏆 Elite Group 1 calibre", 7
-    if g >= 8.5:   return "🥇 Group 1 calibre",       6
-    if g >= 7.8:   return "🥈 Group 2 calibre",       5
-    if g >= 7.0:   return "🥉 Group 3 calibre",       4
-    if g >= 6.3:   return "⚜️ Listed / Premier Handicap", 3
-    if g >= 5.3:   return "💠 Strong Handicapper",    2
-    return "🔹 Low Handicapper",                      1
-
-# ---------- name + column helpers ----------
+# Normalize string → slug for robust joins (handles spaces, punctuation, unicode)
 _ws = re.compile(r"\s+")
 _nonword = re.compile(r"[^a-z0-9]+")
 
@@ -1965,503 +1904,301 @@ def _slug(s: str) -> str:
     return _nonword.sub("", s)
 
 def _ensure_horsekey(df: pd.DataFrame) -> pd.DataFrame:
-    if "HorseKey" not in df.columns:
-        src = df
-        if "Horse" not in src.columns:
-            # try to find a column that means Horse
-            cand = next((c for c in src.columns if _slug(c) == "horse"), None)
-            if cand: src = src.rename(columns={cand: "Horse"})
-            else:
-                df = df.copy(); df["HorseKey"] = ""; return df
-        df = src.copy()
-        df["HorseKey"] = df["Horse"].map(_slug)
-    return df
+    if df is None: return df
+    out = df.copy()
+    if "Horse" not in out.columns:
+        # try to find a column that looks like 'Horse'
+        cand = next((c for c in out.columns if _slug(c) == "horse"), None)
+        if cand: out = out.rename(columns={cand: "Horse"})
+        else:
+            out["Horse"] = ""
+    if "HorseKey" not in out.columns:
+        out["HorseKey"] = out["Horse"].map(_slug)
+    return out
 
 def _find_finish_col(df: pd.DataFrame) -> str | None:
-    """
-    Prefer true finishing position, explicitly excluding grid/draw/gate/stall/700 columns.
-    """
     if df is None: return None
-    cols = [c for c in df.columns]
-    # hard excludes (grid/draw/etc.)
     bad_tokens = ("grid", "gate", "stall", "box", "barrier", "draw", "700")
     def is_bad(name): 
         n = _slug(name)
         return any(tok in n for tok in bad_tokens)
-
-    # finish candidates (ordered)
-    prefer = [
-        "finish_pos", "finishpos", "finish", "placing", "position", "pos", "finish_posn"
-    ]
-    nm = { _slug(c): c for c in cols if not is_bad(c) }
+    prefer = ["finish_pos","finishpos","finish","placing","position","pos","finish_posn"]
+    nm = { _slug(c): c for c in df.columns if not is_bad(c) }
     for want in prefer:
         if want in nm: return nm[want]
     return None
 
 def _finish_key(series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
-    # normalize to positive ints where possible
     return s.round().astype("Int64")
 
-def _robust_race_class_index(gci_series: pd.Series) -> int:
-    s = pd.to_numeric(gci_series, errors="coerce").dropna()
-    if len(s) == 0: return 1
-    med = float(np.median(s))
-    mad = float(np.median(np.abs(s - med))) or 0.0
-    if mad > 0: s = s.clip(upper=med + 3.0 * 1.4826 * mad)
-    race_gci = float(np.median(s.sort_values(ascending=False).head(3)))
-    return gci_to_classband(race_gci)[1]
+def _gci_to_class(gci_value: float):
+    g = _nz(gci_value, 0.0)
+    for thr, label, idx in CONFIG["CLASS_BANDS"]:
+        if g >= thr:
+            return label, idx
+    return "🔹 Low Handicapper", 1
 
-def _class_advice_core(delta_idx: float) -> str:
-    if delta_idx >= 2.0:  return "Ran above the race — step up ~1 class"
-    if delta_idx >= 1.0:  return "Progressive — try ½-step up or very strong same grade"
-    if delta_idx > -0.5:  return "Right level — repeat chance"
-    if delta_idx >= -1.0: return "Needs slight ease"
-    return "Needs easier company"
+def _map_series_to_class(s: pd.Series):
+    labels, idxs = zip(*[_gci_to_class(v) for v in s.fillna(np.nan)])
+    return list(labels), list(idxs)
 
-def _downgrade(text: str) -> str:
-    ladder = [
-        "Ran above the race — step up ~1 class",
-        "Progressive — try ½-step up or very strong same grade",
-        "Right level — repeat chance",
-        "Needs slight ease",
-        "Needs easier company",
-    ]
-    try:
-        i = ladder.index(text)
-        return ladder[min(i+1, len(ladder)-1)]
-    except ValueError:
-        return text
-
-# ---------- core picker: GCI RS -> GCI -> P5 (merge on HorseKey + FinishPos when available) ----------
-def _pick_raw_gci_by_horsepos(rie_df: pd.DataFrame,
-                              metrics_df: pd.DataFrame | None,
-                              return_source: bool = False):
+# --------------------------- Robust GCI picker (GCI RS → GCI) ---------------------------
+def _pick_gci_series(metrics_df: pd.DataFrame, view_df: pd.DataFrame) -> tuple[pd.Series, str]:
     """
-    Aligns by:
-      1) (HorseKey, FinishPos) when BOTH frames have a finish column
-      2) else HorseKey only
-      3) else fallback P5_BigMoment from rie_df
-    Priority of columns: 'GCI RS' -> 'GCI'
+    Aligns by (HorseKey, Finish) if available; else HorseKey. 
+    Priority: metrics['GCI RS'] → metrics['GCI'] → view['GCI RS'] → view['GCI'].
+    Returns (Series aligned to view_df.index, source_tag)
     """
-    # prepare keys
-    rie = _ensure_horsekey(rie_df)
+    rie = _ensure_horsekey(view_df)
     mdf = _ensure_horsekey(metrics_df) if metrics_df is not None else None
 
     rie_fin_col = _find_finish_col(rie)
     mdf_fin_col = _find_finish_col(mdf) if mdf is not None else None
     rie_has_fin = rie_fin_col is not None
-    mdf_has_fin = mdf is not None and mdf_fin_col is not None
+    mdf_has_fin = (mdf is not None) and (mdf_fin_col is not None)
 
-    # build a small right-hand table picker
-    def _pick_from(df, tag):
+    def _pick(df, tag):
         if df is None: return None, None
-        # choose GCI column
-        gci_col = None
-        if "GCI RS" in df.columns: gci_col = "GCI RS"
-        elif "GCI" in df.columns:  gci_col = "GCI"
+        # choose column
+        col = None
+        if "GCI RS" in df.columns: col = "GCI RS"
+        elif "GCI" in df.columns:  col = "GCI"
         else:
-            # try insensitive
             lowmap = {c.lower(): c for c in df.columns}
-            gci_col = lowmap.get("gci rs") or lowmap.get("gcirs") or lowmap.get("gci")
-        if not gci_col: return None, None
-
-        rhs = df[["HorseKey", gci_col]].copy()
-        rhs[gci_col] = pd.to_numeric(rhs[gci_col], errors="coerce")
-
-        # if both have finish, merge on both keys
-        if mdf_has_fin and rie_has_fin and df is mdf:
+            col = lowmap.get("gci rs") or lowmap.get("gcirs") or lowmap.get("gci")
+        if not col: return None, None
+        rhs = df[["HorseKey", col]].copy()
+        rhs[col] = pd.to_numeric(rhs[col], errors="coerce")
+        if tag == "metrics" and mdf_has_fin and rie_has_fin:
             rhs["FinishKey"] = _finish_key(df[mdf_fin_col])
             lhs = rie[["HorseKey"]].copy()
             lhs["FinishKey"] = _finish_key(rie[rie_fin_col])
-            aligned = lhs.merge(rhs, on=["HorseKey","FinishKey"], how="left")[gci_col]
-            return aligned, f"{tag}:{gci_col} (by Horse+Finish)"
+            aligned = lhs.merge(rhs, on=["HorseKey","FinishKey"], how="left")[col]
+            return aligned, f"{tag}:{col} (Horse+Finish)"
         else:
-            # merge on HorseKey only
-            aligned = rie[["HorseKey"]].merge(rhs, on="HorseKey", how="left")[gci_col]
-            return aligned, f"{tag}:{gci_col} (by Horse)"
+            aligned = rie[["HorseKey"]].merge(rhs, on="HorseKey", how="left")[col]
+            return aligned, f"{tag}:{col} (Horse)"
 
-    # 1) metrics preferred
-    s, src = _pick_from(mdf, "metrics")
+    # Try metrics first
+    s, src = _pick(mdf, "metrics")
     if s is not None and s.notna().any():
-        return (s, src) if return_source else s
+        return s, src
 
-    # 2) RIE frame as fallback
-    s, src = _pick_from(rie, "rie")
+    # Then the view itself
+    s, src = _pick(rie, "rie")
     if s is not None and s.notna().any():
-        return (s, src) if return_source else s
+        return s, src
 
-    # 3) last resort: P5 in RIE
-    p5 = None
-    for c in ("P5_BigMoment", "BigMoment", "P5BigMoment"):
-        if c in rie.columns: p5 = c; break
-    if p5:
-        ser = pd.to_numeric(rie[p5], errors="coerce")
-        return (ser, f"rie:{p5}") if return_source else ser
+    # Nothing — return NaNs
+    return pd.Series(np.nan, index=view_df.index), "none"
 
-    # nothing
-    ser = pd.Series(np.nan, index=rie.index)
-    return (ser, "none") if return_source else ser
+# --------------------------- Race mass anchor (IQR-core median) ---------------------------
+def _race_gci_mass(gci_all: pd.Series) -> tuple[float, float, int]:
+    """
+    Returns (RaceGCI_mass, IQR_width, n_used). 
+    Primary: median on IQR core [Q25,Q75]. 
+    Fallbacks: trimmed median for n<=5 (drop min & max), else Q20–Q80 trimmed median.
+    """
+    s = pd.to_numeric(gci_all, errors="coerce").dropna()
+    n = len(s)
+    if n == 0: return np.nan, 0.0, 0
+    s_sorted = s.sort_values()
+    q25, q75 = np.percentile(s_sorted, [25, 75])
+    core = s_sorted[(s_sorted >= q25) & (s_sorted <= q75)]
+    if len(core) >= 3:
+        return float(np.median(core)), float(q75 - q25), int(len(core))
+    # small-field fallback
+    if n <= 5:
+        s_trim = s_sorted.iloc[1:-1] if n >= 3 else s_sorted
+        return float(np.median(s_trim)), float(q75 - q25), int(len(s_trim))
+    # Q20–Q80 trimmed median
+    q20, q80 = np.percentile(s_sorted, [20, 80])
+    mid = s_sorted[(s_sorted >= q20) & (s_sorted <= q80)]
+    return float(np.median(mid)), float(q75 - q25), int(len(mid))
 
-# ---------- public: add class columns ----------
-def add_gci_class_columns(rie_df: pd.DataFrame, metrics_df: pd.DataFrame | None = None) -> pd.DataFrame:
-    gci, gci_src = _pick_raw_gci_by_horsepos(rie_df, metrics_df, return_source=True)
+# --------------------------- Reliability proxy (single run) ---------------------------
+def _reliability_single(metrics_like: pd.DataFrame) -> pd.Series:
+    # Completeness over core columns
+    core_cols = ["F200_idx","tsSPI","Accel","Grind","Finish_Time"]
+    present = metrics_like[core_cols].notna().sum(axis=1) / len(core_cols)
+    # Late stability: small gap Accel vs Grind
+    accel = pd.to_numeric(metrics_like.get("Accel"), errors="coerce")
+    grind = pd.to_numeric(metrics_like.get("Grind"), errors="coerce")
+    late_stab = 1.0 - (abs(accel - grind)/6.0).clip(0.0, 1.0)
+    rel01 = (0.65*present + 0.35*late_stab).clip(0.0, 1.0)
+    return 10.0*rel01
 
-    # diagnostics
+# --------------------------- CeilingCore main ---------------------------
+def build_CeilingCore(metrics: pd.DataFrame) -> pd.DataFrame:
+    df = metrics.copy()
+    # Ensure minimal columns
+    if "Horse" not in df.columns: df["Horse"] = "(Unnamed)"
+    # Sectionals & shape inputs
+    tsSPI = pd.to_numeric(df.get("tsSPI"), errors="coerce")
+    Accel = pd.to_numeric(df.get("Accel"), errors="coerce")
+    Grind = pd.to_numeric(df.get("Grind", df.get("GRIND")), errors="coerce")
+    DeltaG = pd.to_numeric(df.get("DeltaG"), errors="coerce")
+    RSI   = _nz(df.attrs.get("RSI", df.get("RSI").iloc[0] if "RSI" in df.columns else np.nan), np.nan)
+    SCI   = _nz(df.attrs.get("SCI", df.get("SCI").iloc[0] if "SCI" in df.columns else 0.5), 0.5)
+    # Align GCI (GCI RS -> GCI)
+    gci_series, gci_src = _pick_gci_series(metrics_df=df, view_df=df)
+
+    # Race mass anchor
+    race_gci_mass, iqr_width, n_core = _race_gci_mass(gci_series)
+    race_label, race_idx = _gci_to_class(race_gci_mass)
+
+    # Current class per horse
+    labels_now, idxs_now = _map_series_to_class(gci_series)
+    ClassBand_now = pd.Series(labels_now, index=df.index)
+    ClassIndex_now = pd.Series(idxs_now, index=df.index)
+
+    # Shape alignment (RSI direction vs late vs mid)
+    dLM = (Accel - tsSPI)
+    Align = np.tanh((np.sign(RSI) * (dLM/6.0)).fillna(0.0))  # keep in [-1,1] smoothly
+    AgainstShape = (_clip01(-Align) * (0.6 + 0.4*_clip01(SCI)))
+    WithShape    = (_clip01(+Align) * (0.6 + 0.4*_clip01(SCI)))
+    # ShapeAdj (halve if low SCI)
+    shape_alpha = CONFIG["SHAPE_ALPHA"]; shape_beta = CONFIG["SHAPE_BETA"]
+    ShapeAdj = shape_alpha*AgainstShape - shape_beta*WithShape
+    if SCI < CONFIG["SHAPE_WEAKEN_IF_SCI_LT"]:
+        ShapeAdj = 0.5*ShapeAdj
+
+    # Portability: Efficiency & Tenacity single-run proxies (0–10 → centered at 6)
+    BAL  = 100.0 - (Accel - Grind).abs()/2.0
+    COMP = 100.0 - (tsSPI - 100.0).abs()
+    # center to medians inside the race
+    bal_med  = float(pd.to_numeric(BAL, errors="coerce").median(skipna=True))
+    comp_med = float(pd.to_numeric(COMP, errors="coerce").median(skipna=True))
+    Eff01 = pd.to_numeric(BAL.map(lambda v: max(0.0, 1.0 - abs(v - bal_med)/12.0)), errors="coerce").fillna(0.0)
+    Comp01= pd.to_numeric(COMP.map(lambda v: max(0.0, 1.0 - abs(v - comp_med)/12.0)), errors="coerce").fillna(0.0)
+    Eff = 10.0*(0.6*Eff01 + 0.4*Comp01)  # 0..10
+    press_core = 0.70*(Grind - 100.0).clip(lower=0.0) + 0.30*(DeltaG - 98.0).clip(lower=0.0)
+    # rank-CDF-like within race for Tenacity
+    Ten = 10.0 * press_core.rank(pct=True, method="average").fillna(0.0)
+
+    EFF_GAMMA = CONFIG["EFF_GAMMA"]; TEN_DELTA = CONFIG["TEN_DELTA"]; PORT_CAP = CONFIG["PORT_CAP"]
+    EffAdj = (EFF_GAMMA * ((Eff - 6.0)/4.0)).clip(-PORT_CAP, PORT_CAP)
+    TenAdj = (TEN_DELTA * ((Ten - 6.0)/4.0)).clip(-PORT_CAP, PORT_CAP)
+    # If both E and T are low, halve positive ShapeAdj
+    mask_low_ET = (Eff < CONFIG["HALVE_SHAPE_IF_E_AND_T_LOW"]) & (Ten < CONFIG["HALVE_SHAPE_IF_E_AND_T_LOW"])
+    ShapeAdj = np.where((mask_low_ET) & (ShapeAdj > 0), 0.5*ShapeAdj, ShapeAdj)
+
+    # Dominance vs mass anchor (with density taper)
+    DeltaClass_now = ClassIndex_now - race_idx
+    DominanceIndex = pd.to_numeric(gci_series, errors="coerce") / _nz(race_gci_mass, np.nan)
+    DOM_OK = (DeltaClass_now >= CONFIG["DOM_DELTA_CLASS_MIN"]) & (DominanceIndex >= CONFIG["DOM_INDEX_MIN"]) & (WithShape < CONFIG["DOM_WITHSHAPE_MAX"])
+    taper = np.clip(1.0 - CONFIG["DENSITY_TAPER_BASE"] * (iqr_width / CONFIG["DENSITY_TAPER_DEN"]), CONFIG["DENSITY_TAPER_MIN"], 1.0)
+    DomAdj = np.where(DOM_OK, CONFIG["DOM_BONUS"] * taper, 0.0)
+
+    # Reliability (single run) & fragility
+    tmp = pd.DataFrame({"F200_idx": df.get("F200_idx"), "tsSPI": tsSPI, "Accel": Accel, "Grind": Grind, "Finish_Time": df.get("Finish_Time")})
+    Reliability = _reliability_single(tmp)
+    is_outlier_high = False
     try:
-        n_total = len(rie_df)
-        n_have = int(pd.to_numeric(gci, errors="coerce").notna().sum())
-        st.caption(f"GCI bands source: {gci_src} (matched {n_have}/{n_total})")
-        if "p5" in gci_src.lower():  # clear fallback message
-            st.info("Using P5_BigMoment only because neither 'GCI RS' nor 'GCI' aligned. "
-                    "Check Horse names/finish positions in metrics.")
+        m = float(np.nanmedian(gci_series))
+        mad = float(np.nanmedian(np.abs(gci_series - m))) or 0.0
+        is_outlier_high = (pd.to_numeric(gci_series, errors="coerce") > (m + CONFIG["FRAGILITY_K"] * 1.4826 * mad))
+    except Exception:
+        is_outlier_high = False
+    FragilityAdj = np.where(is_outlier_high & (Reliability < CONFIG["FRAGILITY_R_GATE"]), CONFIG["FRAGILITY_HIT"], 0.0)
+
+    # Upside caps (apply to positive side of total adj)
+    total_pos_adj = (ShapeAdj + EffAdj + TenAdj + DomAdj).clip(lower=0.0)
+    cap = np.where(Reliability < 8.0, CONFIG["UPSIDE_CAP_SOFT"], CONFIG["UPSIDE_CAP_HARD"])
+    capped_pos_adj = np.minimum(total_pos_adj, cap)
+    # keep negative parts untouched
+    total_neg_adj = (ShapeAdj + EffAdj + TenAdj + DomAdj).clip(upper=0.0)
+    TotalAdj = capped_pos_adj + total_neg_adj + FragilityAdj
+
+    # Final projection
+    ProjectedIndex = (ClassIndex_now + TotalAdj).clip(1, 7)
+    ProjectedBand = [_gci_to_class( idx if isinstance(idx, (int,float)) else float(idx) )[0] for idx in ProjectedIndex]
+
+    # Confidence
+    # Coherence proxy: ability + (pressure or efficiency), re-using 0..1 components
+    # Ability01 from GCI within race rank
+    Ability01 = pd.to_numeric(gci_series, errors="coerce").rank(pct=True, method="average").fillna(0.0)
+    Pressure01= press_core.rank(pct=True, method="average").fillna(0.0)
+    Eff01_coh = (Eff/10.0).clip(0.0, 1.0)
+    core = np.minimum(Ability01, np.maximum(Pressure01, Eff01_coh))
+    coherence = 0.5 + 0.5*core  # 0.5..1.0
+    Conf = 0.5*coherence + 0.5*(Reliability/10.0)
+    ConfLevel = np.where(Conf >= CONFIG["CONF_HIGH"], "High",
+                  np.where(Conf >= CONFIG["CONF_MED"], "Medium", "Low"))
+
+    # Why line (concise, consistent)
+    def _why(i):
+        bits = []
+        if AgainstShape.iloc[i] > 0.35: bits.append("ran against race shape")
+        elif WithShape.iloc[i] > 0.35:  bits.append("performance aligned with shape")
+        if Eff.iloc[i] >= 6.3 and Ten.iloc[i] >= 6.3: bits.append("profile travels")
+        elif Eff.iloc[i] < 5.5 or Ten.iloc[i] < 5.5:  bits.append("set-up sensitive")
+        if DOM_OK.iloc[i]: bits.append("dominant vs field mass")
+        if FragilityAdj.iloc[i] < 0: bits.append("single-run spike (fragility cap)")
+        if not bits: bits = ["solid single-run read"]
+        # Projection tone
+        tone = "projects ½–1 up" if TotalAdj.iloc[i] >= 0.6 else ("right level / ½-step" if TotalAdj.iloc[i] >= 0.2 else "right level")
+        return f"{'; '.join(bits)}; {tone}."
+
+    Why = [ _why(i) for i in df.index ]
+
+    out = pd.DataFrame({
+        "Horse": df["Horse"].astype(str),
+        "GCI_Value": pd.to_numeric(gci_series, errors="coerce").round(2),
+        "GCI_Source": gci_src,
+        "CurrentBand": ClassBand_now,
+        "ClassIndex": ClassIndex_now.astype(float).round(2),
+        "RaceGCI_mass": round(race_gci_mass, 2) if np.isfinite(race_gci_mass) else np.nan,
+        "RaceIQR_Width": round(iqr_width, 2),
+        "RaceClassIndex": float(race_idx),
+        "DeltaClass": (ClassIndex_now - race_idx).astype(float).round(2),
+
+        "AgainstShape": pd.Series(AgainstShape).round(2),
+        "WithShape": pd.Series(WithShape).round(2),
+        "ShapeAdj": pd.Series(ShapeAdj).round(2),
+        "Eff": pd.Series(Eff).round(2),
+        "Ten": pd.Series(Ten).round(2),
+        "EffAdj": pd.Series(EffAdj).round(2),
+        "TenAdj": pd.Series(TenAdj).round(2),
+        "DomAdj": pd.Series(DomAdj).round(2),
+        "FragilityAdj": pd.Series(FragilityAdj).round(2),
+
+        "Reliability": pd.Series(Reliability).round(2),
+        "TotalAdj": pd.Series(TotalAdj).round(2),
+
+        "ProjectedIndex": pd.Series(ProjectedIndex).round(2),
+        "ProjectedBand": pd.Series(ProjectedBand),
+        "Confidence": pd.Series(ConfLevel),
+        "Why": Why,
+    })
+
+    # Diagnostics caption
+    try:
+        matched = int(pd.to_numeric(gci_series, errors="coerce").notna().sum())
+        st.caption(f"GCI source: {gci_src} · Matched {matched}/{len(df)} · Anchor: IQR-core median (n={n_core}, IQR={iqr_width:.2f}) → RaceClassIndex {race_idx}")
     except Exception:
         pass
 
-    out = rie_df.copy()
-    gci_num = pd.to_numeric(gci, errors="coerce")
-    out["GCI_Value"]  = gci_num.round(2)
-    out["GCI_Source"] = gci_src
+    # Sort by projected ceiling
+    return out.sort_values(["ProjectedIndex","GCI_Value"], ascending=[False, False]).reset_index(drop=True)
 
-    race_idx = _robust_race_class_index(gci_num)
-    labels, idxs = zip(*[gci_to_classband(v) for v in gci_num])
-    out["ClassBand"]  = labels
-    out["ClassIndex"] = idxs
-    out["RaceClassIndex"] = race_idx
-    out["DeltaClass"] = (pd.to_numeric(out["ClassIndex"], errors="coerce") - race_idx).clip(-3, 3).round(1)
-
-    # portability / fragility guards (use RIE pillars if present)
-    E = pd.to_numeric(out.get("P2_Efficiency"), errors="coerce")
-    R = pd.to_numeric(out.get("P6_Reliability"), errors="coerce")
-    E01 = (E/10.0).clip(0,1) if E is not None else pd.Series(0.5, index=out.index)
-    R01 = (R/10.0).clip(0,1) if R is not None else pd.Series(0.5, index=out.index)
-
-    med = float(np.nanmedian(gci_num))
-    mad = float(np.nanmedian(np.abs(gci_num - med))) or 0.0
-    hi = med + 3.0 * 1.4826 * mad if mad > 0 else np.inf
-
-    advice, notes = [], []
-    for i in out.index:
-        d = float(out.loc[i, "DeltaClass"])
-        base = _class_advice_core(d)
-        portable_soft = (E01.iloc[i] < 0.45) or (R01.iloc[i] < 0.45)
-        fragile_peak  = (float(out.loc[i, "GCI_Value"]) > hi) and (R01.iloc[i] < 0.55)
-        msg = base
-        if portable_soft: msg = _downgrade(msg)
-        if fragile_peak:  msg = _downgrade(msg)
-        note_bits = []
-        if fragile_peak: note_bits.append("fragile peak")
-        elif portable_soft: note_bits.append("portability a query")
-        advice.append(msg)
-        notes.append(", ".join(note_bits) if note_bits else "")
-    out["ClassAdvice"] = advice
-    out["ClassNote"]   = notes
-    return out
-# ================== /GCI Class Calibrator (v2.5) ==================
-# ======================= Race Intelligence Suite — RIE narrative + NRCI (1–5, fused peaks) =======================
-import numpy as np
-import pandas as pd
-import streamlit as st
-
-# ---------- RIE v1.1 (Trainer) ----------
-def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
-    df = metrics.copy()
-    if "Horse" not in df.columns:
-        df["Horse"] = "(Unnamed)"
-
-    gr_col = _pick_gr_col(df)
-    rsi = float(df.attrs.get("RSI", np.nan))
-    sci = float(df.attrs.get("SCI", 0.0))
-
-    # P1 — ENGINE (IAI preferred; else composite)
-    eng_vec = _engine_vector(df, gr_col)                # arbitrary scale
-    eng01   = _cdf01(eng_vec)                           # 0..1
-    P1 = (10.0 * eng01 * _alpha(eng01.notna().sum())).clip(0.0, 10.0)
-
-    # P2 — EFFICIENCY (BAL vs med + COMP vs med)
-    if "BAL" not in df.columns:
-        df["BAL"] = 100.0 - (pd.to_numeric(df.get("Accel"), errors="coerce")
-                              - pd.to_numeric(df.get(gr_col), errors="coerce")).abs()/2.0
-    if "COMP" not in df.columns:
-        df["COMP"] = 100.0 - (pd.to_numeric(df.get("tsSPI"), errors="coerce") - 100.0).abs()
-    bal_med  = float(pd.to_numeric(df["BAL"],  errors="coerce").median(skipna=True))
-    comp_med = float(pd.to_numeric(df["COMP"], errors="coerce").median(skipna=True))
-    eff01_raw = 0.6*df["BAL"].map(lambda v: _absdiff_tri(v, bal_med)) + \
-                0.4*df["COMP"].map(lambda v: _absdiff_tri(v, comp_med))
-    eff01 = pd.to_numeric(eff01_raw, errors="coerce").clip(0.0, 1.0)
-    P2 = 10.0 * eff01 * _alpha(np.isfinite(eff01).sum())
-
-    # P3 — SHAPE FIT (base × evidence)
-    accel = pd.to_numeric(df.get("Accel"),  errors="coerce")
-    mid   = pd.to_numeric(df.get("tsSPI"),  errors="coerce")
-    grind = pd.to_numeric(df.get(gr_col),   errors="coerce")
-    base_shape = pd.Series(
-        [_shape_alignment_base(rsi, sci, a, m, g)
-         for a, m, g in zip(accel.fillna(100), mid.fillna(100), grind.fillna(100))],
-        index=df.index
-    )
-    strength = _shape_strength(rsi, sci)                # 0..1
-    P3 = (base_shape * strength).clip(0.0, 10.0)
-
-    # P4 — TENACITY (late hold + ΔG)
-    dG     = pd.to_numeric(df.get("DeltaG"), errors="coerce")
-    ten_core = 0.70 * (grind - 100.0).clip(lower=0.0) + 0.30 * (dG - 98.0).clip(lower=0.0)
-    ten01 = _cdf01(ten_core)
-    P4 = 10.0 * ten01 * _alpha(np.isfinite(ten_core).sum())
-
-    # P5 — BIG MOMENT (GCI). SAFE DEFINITION + FALLBACK
-    # 1) choose the best-available GCI column (Series guaranteed)
-    if "GCI_RS" in df.columns:
-        gci = pd.to_numeric(df["GCI_RS"], errors="coerce")
-    elif "GCI" in df.columns:
-        gci = pd.to_numeric(df["GCI"], errors="coerce")
-    elif "CGI" in df.columns:   # common misname
-        gci = pd.to_numeric(df["CGI"], errors="coerce")
-    else:
-        gci = pd.Series(np.nan, index=df.index)
-
-    # 2) if entirely missing or flat, fall back to engine vector (keeps variance)
-    if gci.isna().all() or gci.nunique(dropna=True) <= 1:
-        gci = pd.to_numeric(eng_vec, errors="coerce")
-
-    gci01 = _cdf01(gci)
-    P5 = 10.0 * gci01 * _alpha(gci.notna().sum())
-
-    # P6 — RELIABILITY (integrity + late stability − TFS)
-    valid_cols = ["F200_idx","tsSPI","Accel",gr_col,"Finish_Time"]
-    completeness = df[valid_cols].notna().sum(axis=1) / len(valid_cols)
-
-    tfs = _as_series(df.get("TFS"), len(df)).where(lambda x: x>=0)
-    vt = tfs.dropna()
-    if len(vt) >= 3:
-        spread = float(vt.quantile(0.85) - vt.quantile(0.15)) or 1e-6
-        tfs_pen = (tfs / spread).clip(0.0, 1.0).fillna(0.0)
-    else:
-        tfs_pen = pd.Series(0.0, index=df.index)
-
-    late_stab = 1.0 - (abs(accel - grind)/6.0).clip(0.0, 1.0)
-    R01 = (0.55*completeness + 0.20*(1.0 - tfs_pen) + 0.25*late_stab).clip(0.0, 1.0)
-    P6 = 10.0 * R01
-
-    # Headline + coherence/reliability moderation
-    w1,w2,w3,w4,w5,w6 = 0.26,0.12,0.18,0.20,0.14,0.10
-    coh = _coherence(eng01.fillna(0.0), ten01.fillna(0.0), eff01.fillna(0.0))  # 0.5–1.0
-    headline = (w1*P1 + w2*P2 + w3*P3 + w4*P4 + w5*P5 + w6*P6)
-    RIE = (headline * coh * _reliability_multiplier(P6)).round(2)
-
-    # Race-relative verdicts
-    verdicts = _adaptive_verdicts(RIE, (
-        "Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"
-    ))
-
-    # Trainer paragraph
-    def _brief(i):
-        horse = str(df.loc[i, "Horse"])
-        cues = []
-        a   = _nz(accel.iloc[i]); g = _nz(grind.iloc[i]); t = _nz(mid.iloc[i])
-        bal = _nz(df.loc[i, "BAL"])
-        if g >= 101.0 or a >= 101.5: cues.append("finishes off strongly")
-        if t >= 100.5 and g >= 100.5: cues.append("maintains a solid mid-to-late rhythm")
-        if strength >= 0.35:
-            align = "with the likely shape" if P3.iloc[i] >= 6.5 else "against the likely shape"
-            cues.append(f"ran {align}")
-        if bal >= 100.0: cues.append("shows sound late balance")
-        if not cues: cues.append("profile is solid on run-only evidence")
-        msg = "; ".join(cues).replace("with the likely shape; against the likely shape","with the likely shape") \
-                              .replace("against the likely shape; with the likely shape","against the likely shape")
-        return f"**{horse}** — {verdicts[i]} (RIE {RIE.iloc[i]:.2f}). Engine {P1.iloc[i]:.2f}/10, Efficiency {P2.iloc[i]:.2f}/10, ShapeFit {P3.iloc[i]:.2f}/10, Tenacity {P4.iloc[i]:.2f}/10, BigMoment {P5.iloc[i]:.2f}/10, Reliability {P6.iloc[i]:.2f}/10. {msg}."
-
-    trainer_notes = [ _brief(i) for i in df.index ]
-
-    out = pd.DataFrame({
-        "Horse": df["Horse"].astype(str),
-        "RIE_Score": RIE,
-        "Verdict": verdicts,
-        "P1_Engine": P1.round(2),
-        "P2_Efficiency": P2.round(2),
-        "P3_ShapeFit": P3.round(2),
-        "P4_Tenacity": P4.round(2),
-        "P5_BigMoment": P5.round(2),
-        "P6_Reliability": P6.round(2),
-        "TrainerNote": trainer_notes
-    })
-    cat = pd.Categorical(out["Verdict"], ordered=True,
-                         categories=["Needs Setup / Place","Competitive Chance","Win/Place Material","Strong Win Candidate"])
-    out = out.assign(_k=cat).sort_values(["_k","RIE_Score"], ascending=[True, False]).drop(columns=["_k"]).reset_index(drop=True)
-    return out
-
-# ---------- NRCI v2.3 (Punter, 1–5; fused peaks + dominance) ----------
-def build_NRCI_v24(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
-    df = rie_df.copy()
-    if "Horse" not in df.columns:
-        df["Horse"] = "(Unnamed)"
-
-    # Pillars from RIE (0–10)
-    A_p1 = pd.to_numeric(df.get("P1_Engine"),     errors="coerce")
-    S    = pd.to_numeric(df.get("P3_ShapeFit"),   errors="coerce")
-    P    = pd.to_numeric(df.get("P4_Tenacity"),   errors="coerce")
-    E    = pd.to_numeric(df.get("P2_Efficiency"), errors="coerce")
-    R    = pd.to_numeric(df.get("P6_Reliability"),errors="coerce")
-    M_p5 = pd.to_numeric(df.get("P5_BigMoment"),  errors="coerce")
-
-    # Safe raw PI/GCI (Series even if absent)
-    PI_raw  = pd.to_numeric(df["PI_RS"] if "PI_RS" in df.columns else df.get("PI",  pd.Series(np.nan, index=df.index)), errors="coerce")
-    GCI_raw = pd.to_numeric(df["GCI_RS"] if "GCI_RS" in df.columns else df.get("GCI", pd.Series(np.nan, index=df.index)), errors="coerce")
-
-    # Ability fuse; Big Moment with fallback
-    A = pd.concat([A_p1, PI_raw], axis=1).max(axis=1, skipna=True)
-    M = M_p5 if not M_p5.isna().all() else GCI_raw
-
-    # Normalize to 0..1 via CDF (race-relative)
-    A01, S01, P01, E01, R01, M01 = map(_cdf01, [A, S, P, E, R, M])
-
-    # Moderators (gentle)
-    coh = _coherence(A01, P01, E01)                      # 0.5..1.0
-    coh_factor = 0.7 + 0.3 * coh.clip(0.5, 1.0)          # 0.85..1.0
-    rel_factor = _reliability_multiplier(R)              # 0.85..1.0
-
-    # Weights (give peaks more say without swamping reliability)
-    wA, wM, wE, wS, wP, wR = 0.35, 0.20, 0.18, 0.12, 0.10, 0.05
-    core = (wA*A01 + wM*M01 + wE*E01 + wS*S01 + wP*P01 + wR*R01).clip(0.0, 1.0)
-
-    # ---- Dominance uplift (bounded) ----
-    # 1) Excess above 80th percentile (on the 0..10 scale, converted to 0..1)
-    def pct80(s: pd.Series) -> float:
-        try:
-            return float(np.nanpercentile(pd.to_numeric(s, errors="coerce"), 80))
-        except Exception:
-            return np.nan
-    a80, m80 = pct80(A), pct80(M)
-    a_ex80 = np.maximum(0.0, (A - a80)/10.0) if np.isfinite(a80) else np.zeros(len(df))
-    m_ex80 = np.maximum(0.0, (M - m80)/10.0) if np.isfinite(m80) else np.zeros(len(df))
-
-    # 2) Gap to second-best (0..1 space)
-    def gap_to_second_best(x01: pd.Series) -> np.ndarray:
-        x = pd.to_numeric(x01, errors="coerce")
-        vals = x.dropna().sort_values().values
-        if len(vals) < 2: 
-            return np.zeros(len(x))
-        top, second = vals[-1], vals[-2]
-        gap = max(0.0, top - second)
-        # mark only the top runner with this gap; others get 0
-        out = np.zeros(len(x))
-        if gap > 0:
-            top_idx = x.idxmax()
-            out[df.index.get_loc(top_idx)] = gap
-        return out
-    a_gap = gap_to_second_best(A01)
-    m_gap = gap_to_second_best(M01)
-
-    # 3) Hard peak (PI/GCI >= 9/9.5 on the 0..10 raw scale)
-    peak10 = pd.concat([PI_raw.fillna(0.0), GCI_raw.fillna(0.0)], axis=1).max(axis=1)
-    hard_peak = np.where(peak10 >= 9.5, 0.08, np.where(peak10 >= 9.0, 0.04, 0.0))
-
-    # Combine (bounded total)
-    dom_uplift = (0.14*(0.6*a_ex80 + 0.4*m_ex80) + 0.18*(0.6*a_gap + 0.4*m_gap) + hard_peak)
-    dom_factor = (1.0 + dom_uplift).clip(1.0, 1.28)      # cap +28%
-
-    # Final 1–5 scale
-    core_mod = (core * coh_factor * rel_factor * dom_factor).clip(0.0, 1.0)
-    NRCI = (1.0 + 4.0 * core_mod).clip(1.0, 5.0)
-
-    # Light adaptive stretch so the top lands near 4.5 (bounded)
-    top_target = 4.7
-    cur_max = float(np.nanmax(NRCI.values)) if len(NRCI) else 0.0
-    if cur_max > 1.0 and cur_max < top_target:
-        stretch = ((top_target - 1.0) / (cur_max - 1.0))
-        stretch = float(np.clip(stretch, 1.00, 1.15))     # at most +15%
-        NRCI = 1.0 + (NRCI - 1.0) * stretch
-        NRCI = NRCI.clip(1.0, 5.0)
-
-    # Verdicts (adaptive to field)
-    verdicts = _adaptive_verdicts(NRCI, ("Speculative","Each-way","Solid chance","High confidence"))
-
-    out = pd.DataFrame({
-        "Horse": df["Horse"].astype(str),
-        "NRCI": NRCI.round(2),
-        "PunterVerdict": verdicts,
-        "A_Ability": A.round(2),
-        "S_Shape": S.round(2),
-        "P_Pressure": P.round(2),
-        "E_Efficiency": E.round(2),
-        "R_Reliability": R.round(2),
-        "ClassResponse": ["Better kept to same/slightly easier"]*len(df)
-    }).sort_values("NRCI", ascending=False).reset_index(drop=True)
-
-    if debug:
-        dbg = pd.DataFrame({
-            "Horse": df["Horse"],
-            "A01": A01.round(3), "M01": M01.round(3), "E01": E01.round(3),
-            "S01": S01.round(3), "P01": P01.round(3), "R01": R01.round(3),
-            "coh_factor": coh_factor.round(3), "rel_factor": rel_factor.round(3),
-            "dom_factor": dom_factor.round(3),
-            "core": core.round(3), "core_mod": core_mod.round(3),
-            "a_ex80": np.round(a_ex80,3), "m_ex80": np.round(m_ex80,3),
-            "a_gap": np.round(a_gap,3),   "m_gap": np.round(m_gap,3),
-            "peak10": peak10.round(2), "NRCI": NRCI.round(2)
-        }).sort_values("NRCI", ascending=False).reset_index(drop=True)
-        with st.expander("NRCI v2.4 debug (normals, gaps, factors)"):
-            st.dataframe(dbg, use_container_width=True, hide_index=True)
-
-    return out
-
-# ---------- Render ----------
+# --------------------------- Minimal Render ---------------------------
 st.markdown("---")
-st.markdown("## Race Intelligence Suite")
-
-# RIE narrative first
-rie_view = None
+st.markdown("## Race Intelligence — CeilingCore (Single-Run Class Ceiling)")
 try:
-    rie_view = build_RIE_v11(metrics)
-    # Add GCI class columns using metrics as primary source; falls back to RIE P5 if needed
-    rie_view = add_gci_class_columns(rie_view, metrics_df=metrics)
-    st.markdown("### RIE v1.1 — Six-Pillar Intelligence (Trainer)")
-    for i, line in enumerate(rie_view["TrainerNote"]):
-        cls  = rie_view.loc[i, "ClassBand"]
-        adv  = rie_view.loc[i, "ClassAdvice"]
-        note = rie_view.loc[i, "ClassNote"]
-        extra = f" Class read: {cls}. {adv}."
-        if note:
-            extra += f" ({note})"
-        st.markdown(line + extra)
+    ceiling_view = build_CeilingCore(metrics)
+    show_cols = [
+        "Horse","GCI_Value","CurrentBand",
+        "RaceGCI_mass","RaceClassIndex","DeltaClass",
+        "ProjectedBand","ProjectedIndex","Confidence","Why"
+    ]
+    st.dataframe(ceiling_view[show_cols], use_container_width=True, hide_index=True)
+    st.caption("CeilingCore projects each horse's next-run class ceiling using GCI, race shape (RSI/SCI), sectional balance, and a mass-based race anchor — no history required.")
 except Exception as e:
-    st.error("RIE v1.1 failed.")
+    st.error("CeilingCore failed.")
     st.exception(e)
-# --- GCI diagnostics (temporary) ---
-try:
-    st.write("metrics_df present:", metrics is not None)
-    if metrics is not None:
-        st.write("metrics columns (sample):", list(metrics.columns)[:20])
-        # show whether GCI columns exist
-        st.write("has 'GCI RS':", any(c.strip().lower().replace(" ","").replace("_","")== "gcirs" for c in metrics.columns))
-        st.write("has 'GCI':", any(c.strip().lower()=="gci" for c in metrics.columns))
-except Exception:
-    pass
-# NRCI table only if RIE succeeded
-if isinstance(rie_view, pd.DataFrame) and not rie_view.empty:
-    try:
-        nrci_view = build_NRCI_v24(rie_view, debug=False)  # or your current NRCI builder
-
-        display_df = nrci_view.merge(
-            rie_view[["Horse","GCI_Value","ClassBand","DeltaClass","ClassAdvice"]],
-            on="Horse", how="left"
-        )
-
-        cols_to_show = [
-            "Horse","NRCI","PunterVerdict",
-            "A_Ability","S_Shape","P_Pressure","E_Efficiency","R_Reliability",
-            "GCI_Value","ClassBand","DeltaClass","ClassAdvice"
-        ]
-        st.dataframe(display_df[cols_to_show], use_container_width=True, hide_index=True)
-        st.markdown("### NRCI v2.4 — Punter Confidence (1–5, fused peaks + dominance)")
-        st.dataframe(nrci_view, use_container_width=True, hide_index=True)
-        st.caption("NRCI fuses Engine with PI, includes Big-Moment, adds a bounded dominance uplift, and applies gentle coherence & reliability.")
-    except Exception as e:
-        st.error("NRCI v2.3 failed.")
-        st.exception(e)
-else:
-    st.warning("NRCI skipped because RIE did not produce a table.")
-# ======================= /END =======================
+# ===================== /CeilingCore v1.0 =====================
 # ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
 import sqlite3
 import io
