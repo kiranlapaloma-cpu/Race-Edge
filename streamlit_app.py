@@ -2303,11 +2303,6 @@ try:
         if note:
             extra += f" ({note})"
         st.markdown(line + extra)
-    for line in rie_view["TrainerNote"]:
-        st.markdown(line)
-    with st.expander("Show RIE pillars table"):
-        st.dataframe(rie_view.drop(columns=["TrainerNote"]), use_container_width=True, hide_index=True)
-    st.caption("RIE metrics: Engine · Efficiency · ShapeFit · Tenacity · Big-Moment · Reliability.")
 except Exception as e:
     st.error("RIE v1.1 failed.")
     st.exception(e)
