@@ -1934,9 +1934,16 @@ def _adaptive_verdicts(scores: pd.Series, labels: tuple[str, str, str, str]):
         else: out.append(labels[0])
     return out
 
-# ================== GCI Class Calibrator (v2.3 — GCI RS → GCI → P5, by Horse) ==================
-# Zero user inputs. Robust to column naming, aligns by Horse, outlier-aware.
+# ================== GCI Class Calibrator (v2.5 — HorseKey + FinishPos) ==================
+# Priority: GCI RS -> GCI -> P5_BigMoment. Aligns by normalized HorseKey and FINISH position (not grid).
+# Robust to Unicode/spacing/punctuation; guards against outliers; emits diagnostics.
 
+import re, unicodedata
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# ---------- class bands ----------
 def gci_to_classband(gci_value: float):
     g = float(gci_value or 0.0)
     if g >= 9.3:   return "🏆 Elite Group 1 calibre", 7
@@ -1947,37 +1954,64 @@ def gci_to_classband(gci_value: float):
     if g >= 5.3:   return "💠 Strong Handicapper",    2
     return "🔹 Low Handicapper",                      1
 
-# ---------- small helpers for robust column matching ----------
-def _norm_names(cols):
-    def norm(s):
-        return str(s).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
-    return {norm(c): c for c in cols}
+# ---------- name + column helpers ----------
+_ws = re.compile(r"\s+")
+_nonword = re.compile(r"[^a-z0-9]+")
 
-def _find_col(df: pd.DataFrame, targets: list[str]) -> str | None:
-    if df is None:
-        return None
-    nm = _norm_names(df.columns)
-    for t in targets:
-        key = t.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
-        if key in nm:
-            return nm[key]
+def _slug(s: str) -> str:
+    if s is None: return ""
+    s = unicodedata.normalize("NFKC", str(s))
+    s = _ws.sub(" ", s.lower().strip())
+    return _nonword.sub("", s)
+
+def _ensure_horsekey(df: pd.DataFrame) -> pd.DataFrame:
+    if "HorseKey" not in df.columns:
+        src = df
+        if "Horse" not in src.columns:
+            # try to find a column that means Horse
+            cand = next((c for c in src.columns if _slug(c) == "horse"), None)
+            if cand: src = src.rename(columns={cand: "Horse"})
+            else:
+                df = df.copy(); df["HorseKey"] = ""; return df
+        df = src.copy()
+        df["HorseKey"] = df["Horse"].map(_slug)
+    return df
+
+def _find_finish_col(df: pd.DataFrame) -> str | None:
+    """
+    Prefer true finishing position, explicitly excluding grid/draw/gate/stall/700 columns.
+    """
+    if df is None: return None
+    cols = [c for c in df.columns]
+    # hard excludes (grid/draw/etc.)
+    bad_tokens = ("grid", "gate", "stall", "box", "barrier", "draw", "700")
+    def is_bad(name): 
+        n = _slug(name)
+        return any(tok in n for tok in bad_tokens)
+
+    # finish candidates (ordered)
+    prefer = [
+        "finish_pos", "finishpos", "finish", "placing", "position", "pos", "finish_posn"
+    ]
+    nm = { _slug(c): c for c in cols if not is_bad(c) }
+    for want in prefer:
+        if want in nm: return nm[want]
     return None
 
-# ---------- robust race class estimator (MAD-capped, top-3 median) ----------
+def _finish_key(series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    # normalize to positive ints where possible
+    return s.round().astype("Int64")
+
 def _robust_race_class_index(gci_series: pd.Series) -> int:
     s = pd.to_numeric(gci_series, errors="coerce").dropna()
-    if len(s) == 0:
-        return 1
+    if len(s) == 0: return 1
     med = float(np.median(s))
     mad = float(np.median(np.abs(s - med))) or 0.0
-    if mad > 0:
-        s = s.clip(upper=med + 3.0 * 1.4826 * mad)  # upper cap only
-    s_sorted = s.sort_values(ascending=False)
-    top3 = s_sorted.head(3)
-    race_gci = float(np.median(top3)) if len(top3) else float(s_sorted.iloc[0])
+    if mad > 0: s = s.clip(upper=med + 3.0 * 1.4826 * mad)
+    race_gci = float(np.median(s.sort_values(ascending=False).head(3)))
     return gci_to_classband(race_gci)[1]
 
-# ---------- advice ladder ----------
 def _class_advice_core(delta_idx: float) -> str:
     if delta_idx >= 2.0:  return "Ran above the race — step up ~1 class"
     if delta_idx >= 1.0:  return "Progressive — try ½-step up or very strong same grade"
@@ -1999,97 +2033,111 @@ def _downgrade(text: str) -> str:
     except ValueError:
         return text
 
-# ---------- strict GCI picker (PRIORITY: GCI RS → GCI → P5_BigMoment), ALIGNED BY HORSE ----------
-def _pick_raw_gci_by_horse(rie_df: pd.DataFrame,
-                           metrics_df: pd.DataFrame | None,
-                           return_source: bool = False):
+# ---------- core picker: GCI RS -> GCI -> P5 (merge on HorseKey + FinishPos when available) ----------
+def _pick_raw_gci_by_horsepos(rie_df: pd.DataFrame,
+                              metrics_df: pd.DataFrame | None,
+                              return_source: bool = False):
     """
-    Returns (Series aligned to rie_df by Horse, source_tag).
-    Priority: metrics['GCI RS'] → metrics['GCI'] → rie['GCI RS'] → rie['GCI'] → rie['P5_BigMoment'].
-    Case/space/underscore/dash-insensitive. No user inputs.
+    Aligns by:
+      1) (HorseKey, FinishPos) when BOTH frames have a finish column
+      2) else HorseKey only
+      3) else fallback P5_BigMoment from rie_df
+    Priority of columns: 'GCI RS' -> 'GCI'
     """
+    # prepare keys
+    rie = _ensure_horsekey(rie_df)
+    mdf = _ensure_horsekey(metrics_df) if metrics_df is not None else None
 
-    # Ensure a 'Horse' column exists (rename if needed)
-    if "Horse" not in rie_df.columns:
-        horse_col = _find_col(rie_df, ["horse"])
-        if horse_col and horse_col != "Horse":
-            rie_df = rie_df.rename(columns={horse_col: "Horse"})
+    rie_fin_col = _find_finish_col(rie)
+    mdf_fin_col = _find_finish_col(mdf) if mdf is not None else None
+    rie_has_fin = rie_fin_col is not None
+    mdf_has_fin = mdf is not None and mdf_fin_col is not None
+
+    # build a small right-hand table picker
+    def _pick_from(df, tag):
+        if df is None: return None, None
+        # choose GCI column
+        gci_col = None
+        if "GCI RS" in df.columns: gci_col = "GCI RS"
+        elif "GCI" in df.columns:  gci_col = "GCI"
         else:
-            s = pd.Series(np.nan, index=rie_df.index)
-            return (s, "none") if return_source else s
+            # try insensitive
+            lowmap = {c.lower(): c for c in df.columns}
+            gci_col = lowmap.get("gci rs") or lowmap.get("gcirs") or lowmap.get("gci")
+        if not gci_col: return None, None
 
-    def _extract(df, tag):
-        if df is None:
-            return None, None
-        if "Horse" not in df.columns:
-            hc = _find_col(df, ["horse"])
-            if hc and hc != "Horse":
-                df = df.rename(columns={hc: "Horse"})
-            else:
-                return None, None
-        col = _find_col(df, ["GCI RS", "GCI"])
-        if not col:
-            return None, None
-        ser = pd.to_numeric(df[col], errors="coerce")
-        aligned = rie_df[["Horse"]].merge(df[["Horse", col]], on="Horse", how="left")[col]
-        return aligned, f"{tag}:{col}"
+        rhs = df[["HorseKey", gci_col]].copy()
+        rhs[gci_col] = pd.to_numeric(rhs[gci_col], errors="coerce")
 
-    # 1) metrics first
-    s, src = _extract(metrics_df, "metrics")
-    if s is not None and not s.isna().all():
+        # if both have finish, merge on both keys
+        if mdf_has_fin and rie_has_fin and df is mdf:
+            rhs["FinishKey"] = _finish_key(df[mdf_fin_col])
+            lhs = rie[["HorseKey"]].copy()
+            lhs["FinishKey"] = _finish_key(rie[rie_fin_col])
+            aligned = lhs.merge(rhs, on=["HorseKey","FinishKey"], how="left")[gci_col]
+            return aligned, f"{tag}:{gci_col} (by Horse+Finish)"
+        else:
+            # merge on HorseKey only
+            aligned = rie[["HorseKey"]].merge(rhs, on="HorseKey", how="left")[gci_col]
+            return aligned, f"{tag}:{gci_col} (by Horse)"
+
+    # 1) metrics preferred
+    s, src = _pick_from(mdf, "metrics")
+    if s is not None and s.notna().any():
         return (s, src) if return_source else s
 
-    # 2) then RIE view itself
-    s, src = _extract(rie_df, "rie")
-    if s is not None and not s.isna().all():
+    # 2) RIE frame as fallback
+    s, src = _pick_from(rie, "rie")
+    if s is not None and s.notna().any():
         return (s, src) if return_source else s
 
-    # 3) last resort: P5_BigMoment in rie_df
-    p5 = _find_col(rie_df, ["P5_BigMoment", "BigMoment", "P5BigMoment"])
+    # 3) last resort: P5 in RIE
+    p5 = None
+    for c in ("P5_BigMoment", "BigMoment", "P5BigMoment"):
+        if c in rie.columns: p5 = c; break
     if p5:
-        ser = pd.to_numeric(rie_df[p5], errors="coerce")
+        ser = pd.to_numeric(rie[p5], errors="coerce")
         return (ser, f"rie:{p5}") if return_source else ser
 
-    # 4) nothing
-    s = pd.Series(np.nan, index=rie_df.index)
-    return (s, "none") if return_source else s
+    # nothing
+    ser = pd.Series(np.nan, index=rie.index)
+    return (ser, "none") if return_source else ser
 
-# ---------- public: add class columns to RIE table ----------
+# ---------- public: add class columns ----------
 def add_gci_class_columns(rie_df: pd.DataFrame, metrics_df: pd.DataFrame | None = None) -> pd.DataFrame:
-    # pick raw GCI (GCI RS → GCI → P5) and note its source
-    gci, gci_src = _pick_raw_gci_by_horse(rie_df, metrics_df, return_source=True)
+    gci, gci_src = _pick_raw_gci_by_horsepos(rie_df, metrics_df, return_source=True)
 
-    # optional streamlit notice
+    # diagnostics
     try:
-        if gci_src == "none":
-            st.warning("No 'GCI RS' or 'GCI' found; class bands may be blank.")
-        elif "p5" in gci_src.lower() or "bigmoment" in gci_src.lower():
-            st.info(f"GCI bands using fallback {gci_src}. Supply 'GCI RS' or 'GCI' for true class.")
-        else:
-            st.caption(f"GCI bands source: {gci_src}")
+        n_total = len(rie_df)
+        n_have = int(pd.to_numeric(gci, errors="coerce").notna().sum())
+        st.caption(f"GCI bands source: {gci_src} (matched {n_have}/{n_total})")
+        if "p5" in gci_src.lower():  # clear fallback message
+            st.info("Using P5_BigMoment only because neither 'GCI RS' nor 'GCI' aligned. "
+                    "Check Horse names/finish positions in metrics.")
     except Exception:
         pass
 
-    # compute bands and advice
-    race_idx = _robust_race_class_index(gci)
-    labels, idxs = zip(*[gci_to_classband(v) for v in pd.to_numeric(gci, errors="coerce")])
-
     out = rie_df.copy()
-    out["GCI_Value"]  = pd.to_numeric(gci, errors="coerce").round(2)
+    gci_num = pd.to_numeric(gci, errors="coerce")
+    out["GCI_Value"]  = gci_num.round(2)
     out["GCI_Source"] = gci_src
+
+    race_idx = _robust_race_class_index(gci_num)
+    labels, idxs = zip(*[gci_to_classband(v) for v in gci_num])
     out["ClassBand"]  = labels
     out["ClassIndex"] = idxs
     out["RaceClassIndex"] = race_idx
     out["DeltaClass"] = (pd.to_numeric(out["ClassIndex"], errors="coerce") - race_idx).clip(-3, 3).round(1)
 
-    # portability / fragility guards
+    # portability / fragility guards (use RIE pillars if present)
     E = pd.to_numeric(out.get("P2_Efficiency"), errors="coerce")
     R = pd.to_numeric(out.get("P6_Reliability"), errors="coerce")
     E01 = (E/10.0).clip(0,1) if E is not None else pd.Series(0.5, index=out.index)
     R01 = (R/10.0).clip(0,1) if R is not None else pd.Series(0.5, index=out.index)
 
-    med = float(np.nanmedian(out["GCI_Value"]))
-    mad = float(np.nanmedian(np.abs(out["GCI_Value"] - med))) or 0.0
+    med = float(np.nanmedian(gci_num))
+    mad = float(np.nanmedian(np.abs(gci_num - med))) or 0.0
     hi = med + 3.0 * 1.4826 * mad if mad > 0 else np.inf
 
     advice, notes = [], []
@@ -2098,22 +2146,18 @@ def add_gci_class_columns(rie_df: pd.DataFrame, metrics_df: pd.DataFrame | None 
         base = _class_advice_core(d)
         portable_soft = (E01.iloc[i] < 0.45) or (R01.iloc[i] < 0.45)
         fragile_peak  = (float(out.loc[i, "GCI_Value"]) > hi) and (R01.iloc[i] < 0.55)
-
         msg = base
         if portable_soft: msg = _downgrade(msg)
         if fragile_peak:  msg = _downgrade(msg)
-
-        nb = []
-        if fragile_peak: nb.append("fragile peak")
-        elif portable_soft: nb.append("portability a query")
-
+        note_bits = []
+        if fragile_peak: note_bits.append("fragile peak")
+        elif portable_soft: note_bits.append("portability a query")
         advice.append(msg)
-        notes.append(", ".join(nb) if nb else "")
-
+        notes.append(", ".join(note_bits) if note_bits else "")
     out["ClassAdvice"] = advice
     out["ClassNote"]   = notes
     return out
-# ================== /GCI Class Calibrator (v2.3) ==================
+# ================== /GCI Class Calibrator (v2.5) ==================
 # ======================= Race Intelligence Suite — RIE narrative + NRCI (1–5, fused peaks) =======================
 import numpy as np
 import pandas as pd
