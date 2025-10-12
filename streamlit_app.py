@@ -2067,7 +2067,7 @@ def build_RIE_v11(metrics: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ---------- NRCI v2.3 (Punter, 1–5; fused peaks + dominance) ----------
-def build_NRCI_v23(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
+def build_NRCI_v24(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
     df = rie_df.copy()
     if "Horse" not in df.columns:
         df["Horse"] = "(Unnamed)"
@@ -2080,48 +2080,76 @@ def build_NRCI_v23(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
     R    = pd.to_numeric(df.get("P6_Reliability"),errors="coerce")
     M_p5 = pd.to_numeric(df.get("P5_BigMoment"),  errors="coerce")
 
-    # Ensure Series for PI/GCI
+    # Safe raw PI/GCI (Series even if absent)
     PI_raw  = pd.to_numeric(df["PI_RS"] if "PI_RS" in df.columns else df.get("PI",  pd.Series(np.nan, index=df.index)), errors="coerce")
     GCI_raw = pd.to_numeric(df["GCI_RS"] if "GCI_RS" in df.columns else df.get("GCI", pd.Series(np.nan, index=df.index)), errors="coerce")
 
-    # Ability fuse
+    # Ability fuse; Big Moment with fallback
     A = pd.concat([A_p1, PI_raw], axis=1).max(axis=1, skipna=True)
-
-    # Big moment source (prefer P5; else raw GCI)
     M = M_p5 if not M_p5.isna().all() else GCI_raw
 
-    # Normalize to 0..1
+    # Normalize to 0..1 via CDF (race-relative)
     A01, S01, P01, E01, R01, M01 = map(_cdf01, [A, S, P, E, R, M])
 
-    # Moderators
-    coh = _coherence(A01, P01, E01)                         # 0.5..1.0
-    coh_factor = 0.7 + 0.3 * coh.clip(0.5, 1.0)             # 0.85..1.0
-    rel_factor = _reliability_multiplier(R)                 # 0.85..1.0
+    # Moderators (gentle)
+    coh = _coherence(A01, P01, E01)                      # 0.5..1.0
+    coh_factor = 0.7 + 0.3 * coh.clip(0.5, 1.0)          # 0.85..1.0
+    rel_factor = _reliability_multiplier(R)              # 0.85..1.0
 
-    # Weights (peaks valued)
-    wA, wS, wP, wE, wR, wM = 0.32, 0.12, 0.12, 0.20, 0.08, 0.16
-    core = (wA*A01 + wS*S01 + wP*P01 + wE*E01 + wR*R01 + wM*M01).clip(0.0, 1.0)
+    # Weights (give peaks more say without swamping reliability)
+    wA, wM, wE, wS, wP, wR = 0.35, 0.20, 0.18, 0.12, 0.10, 0.05
+    core = (wA*A01 + wM*M01 + wE*E01 + wS*S01 + wP*P01 + wR*R01).clip(0.0, 1.0)
 
-    # Dominance uplift (bounded)
+    # ---- Dominance uplift (bounded) ----
+    # 1) Excess above 80th percentile (on the 0..10 scale, converted to 0..1)
     def pct80(s: pd.Series) -> float:
         try:
             return float(np.nanpercentile(pd.to_numeric(s, errors="coerce"), 80))
         except Exception:
             return np.nan
+    a80, m80 = pct80(A), pct80(M)
+    a_ex80 = np.maximum(0.0, (A - a80)/10.0) if np.isfinite(a80) else np.zeros(len(df))
+    m_ex80 = np.maximum(0.0, (M - m80)/10.0) if np.isfinite(m80) else np.zeros(len(df))
 
-    a80 = pct80(A); m80 = pct80(M)
-    a_ex = np.maximum(0.0, (A - a80) / 10.0) if np.isfinite(a80) else np.zeros(len(df))
-    m_ex = np.maximum(0.0, (M - m80) / 10.0) if np.isfinite(m80) else np.zeros(len(df))
+    # 2) Gap to second-best (0..1 space)
+    def gap_to_second_best(x01: pd.Series) -> np.ndarray:
+        x = pd.to_numeric(x01, errors="coerce")
+        vals = x.dropna().sort_values().values
+        if len(vals) < 2: 
+            return np.zeros(len(x))
+        top, second = vals[-1], vals[-2]
+        gap = max(0.0, top - second)
+        # mark only the top runner with this gap; others get 0
+        out = np.zeros(len(x))
+        if gap > 0:
+            top_idx = x.idxmax()
+            out[df.index.get_loc(top_idx)] = gap
+        return out
+    a_gap = gap_to_second_best(A01)
+    m_gap = gap_to_second_best(M01)
+
+    # 3) Hard peak (PI/GCI >= 9/9.5 on the 0..10 raw scale)
     peak10 = pd.concat([PI_raw.fillna(0.0), GCI_raw.fillna(0.0)], axis=1).max(axis=1)
-    hard_peak = np.where(peak10 >= 9.5, 0.06, np.where(peak10 >= 9.0, 0.03, 0.0))
-    dom_uplift = 0.12*(0.6*a_ex + 0.4*m_ex) + hard_peak
-    dom_factor = (1.0 + dom_uplift).clip(1.0, 1.18)
+    hard_peak = np.where(peak10 >= 9.5, 0.08, np.where(peak10 >= 9.0, 0.04, 0.0))
+
+    # Combine (bounded total)
+    dom_uplift = (0.14*(0.6*a_ex80 + 0.4*m_ex80) + 0.18*(0.6*a_gap + 0.4*m_gap) + hard_peak)
+    dom_factor = (1.0 + dom_uplift).clip(1.0, 1.28)      # cap +28%
 
     # Final 1–5 scale
     core_mod = (core * coh_factor * rel_factor * dom_factor).clip(0.0, 1.0)
     NRCI = (1.0 + 4.0 * core_mod).clip(1.0, 5.0)
 
-    # Verdicts (adaptive)
+    # Light adaptive stretch so the top lands near 4.5 (bounded)
+    top_target = 4.7
+    cur_max = float(np.nanmax(NRCI.values)) if len(NRCI) else 0.0
+    if cur_max > 1.0 and cur_max < top_target:
+        stretch = ((top_target - 1.0) / (cur_max - 1.0))
+        stretch = float(np.clip(stretch, 1.00, 1.15))     # at most +15%
+        NRCI = 1.0 + (NRCI - 1.0) * stretch
+        NRCI = NRCI.clip(1.0, 5.0)
+
+    # Verdicts (adaptive to field)
     verdicts = _adaptive_verdicts(NRCI, ("Speculative","Each-way","Solid chance","High confidence"))
 
     out = pd.DataFrame({
@@ -2139,14 +2167,16 @@ def build_NRCI_v23(rie_df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
     if debug:
         dbg = pd.DataFrame({
             "Horse": df["Horse"],
-            "A01": A01.round(3), "S01": S01.round(3), "P01": P01.round(3),
-            "E01": E01.round(3), "R01": R01.round(3), "M01": M01.round(3),
+            "A01": A01.round(3), "M01": M01.round(3), "E01": E01.round(3),
+            "S01": S01.round(3), "P01": P01.round(3), "R01": R01.round(3),
             "coh_factor": coh_factor.round(3), "rel_factor": rel_factor.round(3),
             "dom_factor": dom_factor.round(3),
             "core": core.round(3), "core_mod": core_mod.round(3),
-            "PI": PI_raw.round(2), "GCI": GCI_raw.round(2), "NRCI": NRCI.round(2)
+            "a_ex80": np.round(a_ex80,3), "m_ex80": np.round(m_ex80,3),
+            "a_gap": np.round(a_gap,3),   "m_gap": np.round(m_gap,3),
+            "peak10": peak10.round(2), "NRCI": NRCI.round(2)
         }).sort_values("NRCI", ascending=False).reset_index(drop=True)
-        with st.expander("NRCI debug (pillars, factors, dominance)"):
+        with st.expander("NRCI v2.4 debug (normals, gaps, factors)"):
             st.dataframe(dbg, use_container_width=True, hide_index=True)
 
     return out
@@ -2172,8 +2202,8 @@ except Exception as e:
 # NRCI table only if RIE succeeded
 if isinstance(rie_view, pd.DataFrame) and not rie_view.empty:
     try:
-        nrci_view = build_NRCI_v23(rie_view, debug=False)
-        st.markdown("### NRCI v2.3 — Punter Confidence (1–5, fused peaks + dominance)")
+        nrci_view = build_NRCI_v24(rie_view, debug=False)
+        st.markdown("### NRCI v2.4 — Punter Confidence (1–5, fused peaks + dominance)")
         st.dataframe(nrci_view, use_container_width=True, hide_index=True)
         st.caption("NRCI fuses Engine with PI, includes Big-Moment, adds a bounded dominance uplift, and applies gentle coherence & reliability.")
     except Exception as e:
