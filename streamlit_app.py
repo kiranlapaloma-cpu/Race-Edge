@@ -2765,405 +2765,216 @@ except Exception as e:
     st.error("CeilingCore failed.")
     st.exception(e)
 # ===================== /CeilingCore v1.0 =====================
-# ======================= Batch 4 — Database, Search & PDF Export (DROP-IN) =======================
-import sqlite3
-import io
+# ======== PDF Export v1 (drop-in) ========
+import io, math
 from datetime import datetime
 
-# ----------------------- DB helpers -----------------------
-def _open_db(path: str):
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA foreign_keys=ON;")
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+    from reportlab.lib.units import mm
+except Exception as _e_pdf:
+    _e_pdf = _e_pdf
 
-def _ensure_schema(conn: sqlite3.Connection):
-    """
-    Ensures that the DB schema is valid.
-    Drops and recreates tables if mismatched, with consistent TEXT race_id linkage.
-    """
-
-    cur = conn.cursor()
-    cur.execute("PRAGMA foreign_keys=OFF;")
-
-    # Drop old tables safely — one per execute() to avoid multi-statement error
+def _fmt(x, nd=2):
     try:
-        cur.execute("DROP TABLE IF EXISTS performances;")
-    except Exception as e:
-        print("Drop performances failed:", e)
-    try:
-        cur.execute("DROP TABLE IF EXISTS races;")
-    except Exception as e:
-        print("Drop races failed:", e)
-
-    # Recreate tables with consistent TEXT race_id
-    cur.execute("""
-    CREATE TABLE races(
-        race_id        TEXT PRIMARY KEY,
-        date           TEXT,
-        track          TEXT,
-        race_no        INTEGER,
-        distance_m     INTEGER NOT NULL,
-        split_step     INTEGER NOT NULL,
-        fsr            REAL,
-        collapse       REAL,
-        rsbi           REAL,
-        rsp            REAL,
-        use_cg         INTEGER,
-        dampen_when_collapsed INTEGER,
-        use_shape_module INTEGER,
-        going          TEXT,
-        rqs            REAL,
-        notes          TEXT
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE performances(
-        perf_id        TEXT PRIMARY KEY,
-        race_id        TEXT NOT NULL REFERENCES races(race_id) ON DELETE CASCADE,
-        horse          TEXT NOT NULL,
-        horse_canon    TEXT NOT NULL,
-        finish_pos     INTEGER,
-        race_time_s    REAL,
-        iai            REAL,
-        hidden         REAL,
-        ability        REAL,
-        tier           TEXT,
-        direction      TEXT,
-        confidence     TEXT,
-        pi             REAL,
-        gci            REAL,
-        -- AH module additions
-        ahs            REAL,
-        ah_tier        TEXT,
-        ah_confidence  TEXT,
-        inserted_ts    TEXT DEFAULT (datetime('now'))
-    );
-    """)
-
-    conn.commit()
-    cur.execute("PRAGMA foreign_keys=ON;")
-
-def _table_cols(conn: sqlite3.Connection, tbl: str) -> set[str]:
-    cur = conn.cursor()
-    return {row[1] for row in cur.execute(f"PRAGMA table_info({tbl})")}
-
-def _insert_or_replace(conn: sqlite3.Connection, tbl: str, row_dict: dict):
-    cols_present = _table_cols(conn, tbl)
-    payload = {k: v for k, v in row_dict.items() if k in cols_present}
-    if not payload:
-        return
-    keys = ",".join(payload.keys())
-    qmarks = ",".join(["?"] * len(payload))
-    conn.execute(
-        f"INSERT OR REPLACE INTO {tbl} ({keys}) VALUES ({qmarks})",
-        list(payload.values())
-    )
-
-# ----------------------- PDF Export -----------------------
-def _export_pdf_report(*,
-                       distance_m:int,
-                       metrics_table_df:pd.DataFrame,
-                       shape_png:bytes|None,
-                       pace_png:bytes|None,
-                       ability_png:bytes|None,
-                       ability_table_df:pd.DataFrame,
-                       hidden_table_df:pd.DataFrame,
-                       ah_table_df:pd.DataFrame,         # <— NEW
-                       race_title:str):
-    try:
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
-        from reportlab.lib.units import cm
+        v = float(x)
+        if not math.isfinite(v): return ""
+        return f"{v:.{nd}f}"
     except Exception:
-        st.error("PDF export needs `reportlab`. Install with: `pip install reportlab>=4`")
+        return str(x) if x is not None else ""
+
+def _make_table(df, cols, max_rows=12):
+    """Return a ReportLab Table from a pandas dataframe (safe, short)."""
+    if df is None or len(df) == 0:
         return None
+    use = [c for c in cols if c in df.columns]
+    if not use:
+        return None
+    sub = df[use].head(max_rows).copy()
+    # format numerics lightly
+    for c in use:
+        if str(c).lower() == "horse": continue
+        sub[c] = sub[c].map(lambda v: _fmt(v))
+    data = [use] + sub.values.tolist()
+    tbl = Table(data, hAlign="LEFT")
+    tbl.setStyle(TableStyle([
+        ("FONT", (0,0), (-1,0), "Helvetica-Bold", 9),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#34495e")),
+        ("ALIGN", (0,0), (-1,0), "CENTER"),
+        ("FONT", (0,1), (-1,-1), "Helvetica", 8),
+        ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+        ("LINEBELOW", (0,0), (-1,0), 0.5, colors.black),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.lightgrey]),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.HexColor("#bdc3c7")),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.black),
+    ]))
+    return tbl
+
+def build_race_pdf(metrics,
+                   sectional_df=None,
+                   hh_view=None,
+                   wd_view=None,
+                   dna_summaries=None,
+                   images=None,
+                   race_distance_m=None,
+                   split_step=None) -> bytes:
+    """
+    Build a compact PDF and return bytes.
+    Expected:
+      - metrics.attrs used for RSI/SCI/SHAPE_TAG/GOING/RQS/RPS/RACE_PROFILE
+      - sectional_df: your 'display_df' table (Sectional Metrics)
+      - hh_view: Hidden Horses v2 table
+      - wd_view: Winning DNA table
+      - dna_summaries: list of strings (per-horse one-liners), optional
+      - images: dict with {'shape': bytes, 'pace': bytes, 'ability': bytes} optional
+    """
+    if 'reportlab' in str(_e_pdf).lower():
+        raise RuntimeError("reportlab is not installed. Add 'reportlab' to requirements.txt")
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
-                            leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=16*mm, rightMargin=16*mm, topMargin=16*mm, bottomMargin=16*mm
+    )
+
     styles = getSampleStyleSheet()
+    H1 = styles["Heading1"]; H1.fontSize = 16; H1.spaceAfter = 6
+    H2 = styles["Heading2"]; H2.fontSize = 13; H2.spaceBefore = 6; H2.spaceAfter = 4
+    H3 = styles["Heading3"]; H3.fontSize = 11; H3.spaceBefore = 6; H3.spaceAfter = 2
+    P  = styles["BodyText"]; P.fontSize = 9.2; P.leading = 12
+
     story = []
 
-    # Header
-    story.append(Paragraph(f"<b>{race_title}</b> — {int(distance_m)} m", styles["Heading1"]))
-    fsr = metrics.attrs.get("FSR", None)
-    cs  = metrics.attrs.get("CollapseSeverity", None)
-    step= metrics.attrs.get("STEP", None)
-    cg  = "ON" if USE_CG else "OFF"
-    cg_line = f"CG: {cg}"
-    # RQS / RPS / Profile in the PDF header
-    rqs_pdf = metrics.attrs.get("RQS", None)
-    rps_pdf = metrics.attrs.get("RPS", None)
-    prof_pdf = metrics.attrs.get("RACE_PROFILE", "")
-    line_bits = []
-    if rqs_pdf is not None:
-        line_bits.append(f"RQS: {float(rqs_pdf):.1f}/100")
-    if rps_pdf is not None:
-        line_bits.append(f"RPS: {float(rps_pdf):.1f}/100")
-    if prof_pdf:
-        line_bits.append(prof_pdf)
-    if line_bits:
-        story.append(Paragraph(" · ".join(line_bits), styles["Normal"]))
-        story.append(Paragraph(
-            "RQS = field depth/consistency; RPS = peak performance; Profile = depth vs dominance.",
-            styles["Italic"]
-        ))
-        story.append(Spacer(0, 6))
-    # After header lines / before tables
-    if getattr(metrics, "attrs", {}).get("WIND_AFFECTED", False):
-        tag = metrics.attrs.get("WIND_TAG", "Wind")
-        story.append(Paragraph(f"<font color='#C0392B'><b>Wind disclaimer:</b> {tag}. "
-                               "Some sectional patterns may reflect wind effect.</font>", styles["Normal"]))
-        story.append(Spacer(0, 6))
+    # ---------- Header ----------
+    Dm   = int(float(race_distance_m or metrics.attrs.get("DIST", 0)) or 0)
+    step = int(split_step or metrics.attrs.get("STEP", 100))
+    rsi  = float(metrics.attrs.get("RSI", 0.0))
+    sci  = float(metrics.attrs.get("SCI", 0.0))
+    tag  = str(metrics.attrs.get("SHAPE_TAG", "EVEN"))
+    going = str(metrics.attrs.get("GOING", "Good"))
+    rqs  = metrics.attrs.get("RQS", None)
+    rps  = metrics.attrs.get("RPS", None)
+    prof = str(metrics.attrs.get("RACE_PROFILE", ""))
 
-   
+    story.append(Paragraph(f"Race Edge Report", H1))
+    hdr_line = f"Distance: <b>{Dm} m</b>  |  Splits: <b>{step}m</b>  |  Shape: <b>{tag}</b>  |  RSI: <b>{rsi:+.2f}</b>  |  SCI: <b>{sci:.2f}</b>  |  Going: <b>{going}</b>"
+    story.append(Paragraph(hdr_line, P))
+    meta_line = []
+    if rqs is not None: meta_line.append(f"RQS <b>{float(rqs):.1f}</b>/100")
+    if rps is not None: meta_line.append(f"RPS <b>{float(rps):.1f}</b>/100")
+    if prof:            meta_line.append(f"Profile: <b>{prof}</b>")
+    if meta_line:
+        story.append(Paragraph(" · ".join(meta_line), P))
+    story.append(Spacer(1, 6))
 
-    # Sectional Metrics table (safe cast to string)
-    story.append(Paragraph("Sectional Metrics", styles["Heading3"]))
-    tbl_df = metrics_table_df.copy().fillna("")
-    data = [list(tbl_df.columns)] + tbl_df.astype(str).values.tolist()
-    t = Table(data, repeatRows=1)
-    t.setStyle(TableStyle([
-        ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
-        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
-        ('GRID',(0,0),(-1,-1),0.25,colors.whitesmoke),
-        ('FONTSIZE',(0,0),(-1,-1),8),
-        ('ALIGN',(2,1),(-1,-1),'RIGHT')
-    ]))
-    story.append(t); story.append(Spacer(0, 8))
+    # PI going meta (if available)
+    pi_meta = metrics.attrs.get("PI_GOING_META", {})
+    if pi_meta:
+        moved = []
+        mult = pi_meta.get("multipliers", {})
+        for k in ["Accel","F200_idx","tsSPI","Grind"]:
+            m = mult.get(k, 1.0)
+            if abs(m-1.0) >= 0.005:
+                moved.append(f"{k}×{m:.3f}")
+        if moved:
+            story.append(Paragraph("PI going multipliers: " + ", ".join(moved), P))
+            story.append(Spacer(1, 6))
 
-    # Images
-    if shape_png:
-        story.append(Paragraph("Sectional Shape Map", styles["Heading3"]))
-        story.append(Image(io.BytesIO(shape_png), width=24*cm, height=17*cm, kind="proportional"))
-        story.append(Spacer(0, 6))
-    if pace_png:
-        story.append(Paragraph("Pace Curve", styles["Heading3"]))
-        story.append(Image(io.BytesIO(pace_png), width=24*cm, height=15*cm, kind="proportional"))
-        story.append(Spacer(0, 6))
-    if ability_png:
-        story.append(Paragraph("Ability Matrix", styles["Heading3"]))
-        story.append(Image(io.BytesIO(ability_png), width=24*cm, height=16*cm, kind="proportional"))
-        story.append(Spacer(0, 6))
+    # ---------- Tables ----------
+    story.append(Paragraph("Sectional Metrics — snapshot", H2))
+    sec_cols = ["Horse","PI","GCI_RS","F200_idx","tsSPI","Accel",metrics.attrs.get("GR_COL","Grind")]
+    tbl = _make_table(sectional_df, sec_cols, max_rows=12)
+    story.append(tbl if tbl else Paragraph("No data", P))
 
-    # Hidden Horses (flagged only)
-    story.append(Paragraph("Hidden Horses (flagged)", styles["Heading3"]))
-    flagged = hidden_table_df[hidden_table_df.get("Tier","") != ""].copy()
-    if not flagged.empty:
-        data_hh = [list(flagged.columns)] + flagged.fillna("").astype(str).values.tolist()
-        t2 = Table(data_hh, repeatRows=1)
-        t2.setStyle(TableStyle([
-            ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
-            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
-            ('GRID',(0,0),(-1,-1),0.25,colors.whitesmoke),
-            ('FONTSIZE',(0,0),(-1,-1),8),
-            ('ALIGN',(2,1),(-1,-1),'RIGHT')
-        ]))
-        story.append(t2)
-    else:
-        story.append(Paragraph("No horses flagged in this race.", styles["Normal"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Winning DNA — top factors", H2))
+    wd_cols = ["Horse","WinningDNA","EZ01","MC01","LP01","LL01","SOS01"]
+    tbl = _make_table(wd_view, wd_cols, max_rows=12)
+    story.append(tbl if tbl else Paragraph("No data", P))
 
-    # Ahead of Handicap (flagged only)
-    story.append(Paragraph("Ahead of Handicap (flagged)", styles["Heading3"]))
-    if ah_table_df is not None and not ah_table_df.empty:
-        flagged_ah = ah_table_df[ah_table_df.get("AH_Tier","").isin(["🏆 Dominant","🔥 Clear Ahead","🟢 Ahead"])].copy()
-        if not flagged_ah.empty:
-            data_ah = [list(flagged_ah.columns)] + flagged_ah.fillna("").astype(str).values.tolist()
-            t3 = Table(data_ah, repeatRows=1)
-            t3.setStyle(TableStyle([
-                ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
-                ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
-                ('GRID',(0,0),(-1,-1),0.25,colors.whitesmoke),
-                ('FONTSIZE',(0,0),(-1,-1),8),
-                ('ALIGN',(2,1),(-1,-1),'RIGHT')
-            ]))
-            story.append(t3)
-        else:
-            story.append(Paragraph("No runners flagged Ahead-of-Handicap in this race.", styles["Normal"]))
-    else:
-        story.append(Paragraph("No runners flagged Ahead-of-Handicap in this race.", styles["Normal"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Hidden Horses v2 — signals", H2))
+    hh_cols = ["Horse","Tier","HiddenScore","SOS","ASI2","TFS","UEI"]
+    tbl = _make_table(hh_view, hh_cols, max_rows=12)
+    story.append(tbl if tbl else Paragraph("No data", P))
+
+    # ---------- Race Pulse (one-liners) ----------
+    if dna_summaries and len(dna_summaries) > 0:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("Race Pulse — summaries", H2))
+        for line in dna_summaries[:14]:
+            story.append(Paragraph("• " + line, P))
+
+    # ---------- Images (optional) ----------
+    img_keys = ["shape","pace","ability"]
+    have_any = images and any(k in images and images[k] for k in img_keys)
+    if have_any:
+        story.append(PageBreak())
+        story.append(Paragraph("Figures", H2))
+        for label, key in [("Sectional Shape Map", "shape"),
+                           ("Pace Curve", "pace"),
+                           ("Ability Matrix", "ability")]:
+            if not images.get(key): 
+                continue
+            try:
+                img = Image(io.BytesIO(images[key]))
+                # fit width nicely
+                img.drawWidth = 170*mm
+                img.drawHeight = img.drawHeight * (img.drawWidth / img.drawWidth)  # keep aspect (ReportLab handles)
+                story.append(Paragraph(label, H3))
+                story.append(img)
+                story.append(Spacer(1, 6))
+            except Exception:
+                # skip bad image
+                pass
 
     doc.build(story)
-    buf.seek(0)
-    return buf
+    return buf.getvalue()
 
-# ----------------------- Save Current Race -----------------------
-def _save_current_race_to_db(db_path: str,
-                             race_date_str: str,
-                             race_track: str,
-                             race_no_int: int,
-                             title_override: str | None = None) -> int:
-    """
-    Saves one `races` row + N `performances` rows.
-    Returns the number of performances saved.
-    """
-    # Pull context from analysis
-    step        = int(metrics.attrs.get("STEP", 100))
-    fsr_val     = float(metrics.attrs.get("FSR", 1.0))
-    collapse_pt = float(metrics.attrs.get("CollapseSeverity", 0.0))
-    rsbi_val    = float(metrics.attrs.get("RSBI", np.nan)) if hasattr(metrics, "attrs") else np.nan
-    rsp_val     = float(metrics.attrs.get("RPS",  np.nan))  # <-- use RPS here
-   
-    use_cg_val  = 1 if USE_CG else 0
-    dampen_val  = 1 if DAMPEN_CG else 0
-    use_shape_val = 1 if ('USE_SHAPE' in globals() and USE_SHAPE) else 0
-
-    # Robust keys
-    _date  = str(race_date_str or "").strip()
-    _track = str(race_track or "").strip()
-    _rno   = int(race_no_int or 0)
-
-    # Deterministic race_id
-    race_id = sha1(f"{_date}|{_track}|{_rno}|{int(race_distance_input)}|{step}")
-
-    # Make sure we can save PI/GCI/IAI/etc.
-    _m = metrics.loc[:, ["Horse","RaceTime_s"]].copy() if "RaceTime_s" in metrics.columns else pd.DataFrame(columns=["Horse","RaceTime_s"])
-    _am = AM_view.copy() if 'AM_view' in globals() else pd.DataFrame()
-    _ah = AH_view.copy() if 'AH_view' in globals() else pd.DataFrame()
-    to_save = _am.merge(_m, on="Horse", how="left") if not _am.empty else pd.DataFrame()
-    if not _ah.empty:
-        # bring in AHS, AH_Tier, AH_Confidence
-        to_save = (to_save if not to_save.empty else _m.copy()).merge(
-            _ah[["Horse","AHS","AH_Tier","AH_Confidence"]], on="Horse", how="left"
-        )
-
-    conn = _open_db(db_path)
-    _ensure_schema(conn)
-
-    # Races row
-    race_row = {
-        "race_id": race_id,
-        "date": _date,
-        "track": _track,
-        "race_no": _rno,
-        "distance_m": int(race_distance_input),
-        "split_step": step,
-        "going": metrics.attrs.get("GOING", "Good"),
-        "rqs": float(metrics.attrs.get("RQS", np.nan)),
-        "fsr": fsr_val,
-        "collapse": collapse_pt,
-        # Optional, only written if columns exist in your DB
-        "rsbi": rsbi_val,
-        "rsp":  rsp_val,
-        "use_cg": use_cg_val,
-        "dampen_when_collapsed": dampen_val,
-        "use_shape_module": use_shape_val,
-        "notes": (title_override or "")
-    }
-    _insert_or_replace(conn, "races", race_row)
-
-    # Performances rows
-    n_saved = 0
-    if not to_save.empty:
-        for _, r in to_save.iterrows():
-            horse = str(r.get("Horse","")).strip()
-            if not horse:
-                continue
-            horse_canon = canon_horse(horse)
-            perf_id = sha1(f"{race_id}|{horse_canon}")
-
-            perf_row = {
-                "perf_id":     perf_id,
-                "race_id":     race_id,
-                "horse":       horse,
-                "horse_canon": horse_canon,
-                "finish_pos":  int(r.get("Finish_Pos")) if pd.notna(r.get("Finish_Pos")) else None,
-                "race_time_s": float(r.get("RaceTime_s")) if pd.notna(r.get("RaceTime_s")) else None,
-                "iai":         float(r.get("IAI")) if pd.notna(r.get("IAI")) else None,
-                "hidden":      float(r.get("HiddenScore")) if pd.notna(r.get("HiddenScore")) else None,
-                "ability":     float(r.get("AbilityScore")) if pd.notna(r.get("AbilityScore")) else None,
-                "tier":        str(r.get("AbilityTier")) if pd.notna(r.get("AbilityTier")) else None,
-                "direction":   str(r.get("DirectionHint")) if pd.notna(r.get("DirectionHint")) else None,
-                "confidence":  str(r.get("Confidence")) if pd.notna(r.get("Confidence")) else None,
-                "pi":          float(r.get("PI")) if pd.notna(r.get("PI")) else None,
-                "gci":         float(r.get("GCI")) if pd.notna(r.get("GCI")) else None,
-                "ahs":         float(r.get("AHS")) if pd.notna(r.get("AHS")) else None,
-                "ah_tier":     str(r.get("AH_Tier")) if pd.notna(r.get("AH_Tier")) else None,
-                "ah_confidence": str(r.get("AH_Confidence")) if pd.notna(r.get("AH_Confidence")) else None,
-            }
-            _insert_or_replace(conn, "performances", perf_row)
-            n_saved += 1
-
-    conn.commit()
-    conn.close()
-    return n_saved
-
-# ----------------------- UI: Horse search (can be used anytime) -----------------------
-st.markdown("---")
-st.markdown("### 🐎 Horse Database Search")
-_search_db_path = db_path if 'db_path' in globals() else "race_edge.db"   # sidebar text_input earlier
-search_name = st.text_input("Search horse name (exact or partial):", key="db_search_name").strip()
-if search_name:
-    try:
-        conn = _open_db(_search_db_path)
-        df_search = pd.read_sql_query(
-            "SELECT * FROM performances WHERE horse LIKE ? ORDER BY rowid DESC",
-            conn, params=[f"%{search_name}%"]
-        )
-        conn.close()
-        if df_search.empty:
-            st.info("No records found.")
+# ---- Streamlit hook (place this block where you want the button) ----
+try:
+    if st.button("Generate PDF report"):
+        if '_e_pdf' in globals() and isinstance(_e_pdf, Exception):
+            st.error("reportlab missing. Add it to requirements.txt.")
         else:
-            st.dataframe(df_search, use_container_width=True)
-            st.caption("Most recent first.")
-    except Exception as e:
-        st.error("Search failed.")
-        st.exception(e)
-else:
-    st.caption("Type at least part of a horse name to search stored performances.")
+            # Collect optional text lines from Winning DNA expander if you created them
+            try:
+                dna_lines = (WD.sort_values("WinningDNA", ascending=False)["DNA_Summary"]
+                               .dropna().astype(str).tolist())
+            except Exception:
+                dna_lines = []
 
-# ----------------------- UI: Save to DB -----------------------
-st.markdown("---")
-st.markdown("### 💾 Save current race to database")
-colA, colB, colC, colD = st.columns([1.1, 1.1, 0.6, 1.3])
-with colA:
-    ui_race_date = st.text_input("Race date (YYYY-MM-DD):", value=datetime.utcnow().strftime("%Y-%m-%d"))
-with colB:
-    ui_track = st.text_input("Track / Meeting:", value="")
-with colC:
-    ui_rno = st.number_input("Race #", min_value=0, max_value=50, value=1, step=1)
-with colD:
-    ui_title = st.text_input("Optional title / note:", value="")
+            # Collect images if present
+            imgs = {}
+            for k, var in [("shape", "shape_map_png"), ("pace", "pace_png"), ("ability", "ability_png")]:
+                try:
+                    if var in globals() and globals()[var] is not None:
+                        imgs[k] = globals()[var]
+                except Exception:
+                    pass
 
-if st.button("Save this race to DB"):
-    try:
-        saved_n = _save_current_race_to_db(
-            db_path,
-            race_date_str=ui_race_date,
-            race_track=ui_track,
-            race_no_int=int(ui_rno),
-            title_override=ui_title
-        )
-        st.success(f"Saved race and {saved_n} performances to {db_path}.")
-    except Exception as e:
-        st.error("Saving failed. See details below.")
-        st.exception(e)
-
-# ----------------------- UI: PDF Export -----------------------
-st.markdown("---")
-st.markdown("### 📥 Export Complete Race Report (PDF)")
-pdf_btn = st.button("Generate PDF Report")
-if pdf_btn:
-    pdf_buf = _export_pdf_report(
-    distance_m=int(race_distance_input),
-    metrics_table_df=display_df if 'display_df' in globals() else pd.DataFrame(),
-    shape_png=shape_map_png if 'shape_map_png' in globals() else None,
-    pace_png=pace_png if 'pace_png' in globals() else None,
-    ability_png=ability_png if 'ability_png' in globals() else None,
-    ability_table_df=AM_view if 'AM_view' in globals() else pd.DataFrame(),
-    hidden_table_df=hh_view if 'hh_view' in globals() else pd.DataFrame(),
-    ah_table_df=AH_view if 'AH_view' in globals() else pd.DataFrame(),   # <— NEW
-    race_title=f"{ui_track or 'Race'} · {ui_race_date or ''}"
-)
-    if pdf_buf is not None:
-        st.download_button(
-            "📥 Download PDF",
-            data=pdf_buf.getvalue(),
-            file_name=f"RaceEdge_{int(race_distance_input)}m_Report.pdf",
-            mime="application/pdf"
-        )
+            # Build and download
+            pdf_bytes = build_race_pdf(
+                metrics,
+                sectional_df=display_df if 'display_df' in globals() else metrics,
+                hh_view=hh_view if 'hh_view' in globals() else None,
+                wd_view=WD_view if 'WD_view' in globals() else (WD if 'WD' in globals() else None),
+                dna_summaries=dna_lines,
+                images=imgs,
+                race_distance_m=race_distance_input,
+                split_step=split_step
+            )
+            st.download_button(
+                "Download PDF",
+                data=pdf_bytes,
+                file_name=f"race_edge_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                mime="application/pdf",
+            )
+except Exception as e:
+    st.error(f"PDF generation failed: {e}")
+# ======== /PDF Export v1 ========
