@@ -1685,176 +1685,268 @@ else:
         st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 
     
-# ======================= Hidden Horses v3 (Shape-aware + RacePulse) =======================
-st.markdown("## Hidden Horses v3 (Shape-aware + RacePulse)")
+        # ======================= Hidden Horses (v2, shape-aware) =======================
+st.markdown("## Hidden Horses v2 (Shape-aware)")
 
-# --- local helpers ---
-def _rz(s: pd.Series) -> pd.Series:
-    mu, sd = np.nanmedian(s), mad_std(s)
-    return (s - mu) / (sd if np.isfinite(sd) and sd > 0 else 1.0)
-
-def _clip01(x): 
-    try: return max(0.0, min(1.0, float(x)))
-    except: return 0.0
-
-# --- working copy & essentials ---
-hh3 = metrics.copy()
+hh = metrics.copy()
 gr_col = metrics.attrs.get("GR_COL", "Grind")
-RSI = float(hh3.attrs.get("RSI", 0.0))
-SCI = float(hh3.attrs.get("SCI", 0.0))
-consensus = 0.60 + 0.40 * _clip01(SCI)
 
-# ---------- Rebuild core HH primitives if missing (self-contained) ----------
+# --- SOS (robust z-score blend) ---
 need_cols = {"tsSPI", "Accel", gr_col}
-if not need_cols.issubset(hh3.columns) or len(hh3) == 0:
-    st.info("Hidden Horses v3: required columns are missing.")
-else:
-    # SOS (robust z)
-    ts_w = winsorize(pd.to_numeric(hh3["tsSPI"], errors="coerce"))
-    ac_w = winsorize(pd.to_numeric(hh3["Accel"], errors="coerce"))
-    gr_w = winsorize(pd.to_numeric(hh3[gr_col], errors="coerce"))
-    z_ts, z_ac, z_gr = _rz(ts_w), _rz(ac_w), _rz(gr_w)
-    hh3["SOS_raw"] = 0.45*z_ts + 0.35*z_ac + 0.20*z_gr
-    q5, q95 = hh3["SOS_raw"].quantile(0.05), hh3["SOS_raw"].quantile(0.95)
+if need_cols.issubset(hh.columns) and len(hh) > 0:
+    ts_w = winsorize(pd.to_numeric(hh["tsSPI"], errors="coerce"))
+    ac_w = winsorize(pd.to_numeric(hh["Accel"], errors="coerce"))
+    gr_w = winsorize(pd.to_numeric(hh[gr_col], errors="coerce"))
+
+    def rz(s):
+        mu, sd = np.nanmedian(s), mad_std(s)
+        return (s - mu) / (sd if np.isfinite(sd) and sd > 0 else 1.0)
+
+    z_ts, z_ac, z_gr = rz(ts_w), rz(ac_w), rz(gr_w)
+    hh["SOS_raw"] = 0.45*z_ts + 0.35*z_ac + 0.20*z_gr
+    q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
     denom = max(q95 - q5, 1.0)
-    hh3["SOS"] = (2.0 * (hh3["SOS_raw"] - q5) / denom).clip(0, 2)
+    hh["SOS"] = (2.0 * (hh["SOS_raw"] - q5) / denom).clip(0, 2)
+else:
+    hh["SOS"] = 0.0
 
-    # ASI² (bias awareness: late-minus-mid vs field bias)
-    acc_med = pd.to_numeric(hh3.get("Accel"), errors="coerce").median(skipna=True)
-    grd_med = pd.to_numeric(hh3.get(gr_col), errors="coerce").median(skipna=True)
-    bias = (acc_med - 100.0) - (grd_med - 100.0)
-    B = min(1.0, abs(bias) / 4.0)
-    S = pd.to_numeric(hh3.get("Accel"), errors="coerce") - pd.to_numeric(hh3.get(gr_col), errors="coerce")
-    hh3["ASI2"] = (B * (-S if bias >= 0 else S).clip(lower=0.0) / 5.0).fillna(0.0)
+# --- ASI² (bias awareness) ---
+acc_med = pd.to_numeric(hh.get("Accel"), errors="coerce").median(skipna=True)
+grd_med = pd.to_numeric(hh.get(gr_col), errors="coerce").median(skipna=True)
+bias = (acc_med - 100.0) - (grd_med - 100.0)
+B = min(1.0, abs(bias) / 4.0)
+S = pd.to_numeric(hh.get("Accel"), errors="coerce") - pd.to_numeric(hh.get(gr_col), errors="coerce")
+hh["ASI2"] = (B * (-S if bias >= 0 else S).clip(lower=0.0) / 5.0).fillna(0.0)
 
-    # TFS (trip friction) + gate → TFS_plus
-    def _tfs_row(r):
-        last_cols = [c for c in ["300_Time", "200_Time", "100_Time"] if c in r.index]
-        spds = [metrics.attrs.get("STEP",100) / as_num(r.get(c)) for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
-        if len(spds) < 2: return np.nan
-        sigma = np.std(spds, ddof=0)
-        mid = as_num(r.get("_MID_spd"))
-        return np.nan if not np.isfinite(mid) or mid <= 0 else 100.0 * (sigma / mid)
-    hh3["TFS"] = hh3.apply(_tfs_row, axis=1)
-    D_rounded = int(np.ceil(float(race_distance_input)/200.0)*200)
-    gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
-    hh3["TFS_plus"] = hh3["TFS"].apply(lambda x: 0.0 if pd.isna(x) or x < gate else min(0.6, (x-gate)/3.0))
+# --- TFS (trip friction) ---
+def tfs_row(r):
+    last_cols = [c for c in ["300_Time", "200_Time", "100_Time"] if c in r.index]
+    spds = [metrics.attrs.get("STEP",100) / as_num(r.get(c)) for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
+    if len(spds) < 2: return np.nan
+    sigma = np.std(spds, ddof=0)
+    mid = as_num(r.get("_MID_spd"))
+    return np.nan if not np.isfinite(mid) or mid <= 0 else 100.0 * (sigma / mid)
 
-    # UEI (underused engine)
-    def _uei_row(r):
-        ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
-        if any(pd.isna([ts,ac,gr])): return 0.0
-        val = 0.0
-        if ts >= 102 and ac <= 98 and gr <= 98:
-            val = 0.3 + 0.3 * min((ts-102)/3.0, 1.0)
-        if ts >= 102 and gr >= 102 and ac <= 100:
-            val = max(val, 0.3 + 0.3 * min(((ts-102)+(gr-102))/6.0, 1.0))
-        return round(val, 3)
-    hh3["UEI"] = hh3.apply(_uei_row, axis=1)
+hh["TFS"] = hh.apply(tfs_row, axis=1)
+D_rounded = int(np.ceil(float(race_distance_input)/200.0)*200)
+gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
+hh["TFS_plus"] = hh["TFS"].apply(lambda x: 0.0 if pd.isna(x) or x < gate else min(0.6, (x-gate)/3.0))
 
-    # ---------- KSI: Kill-Switch Impact (shape-aware win-path capture) ----------
-    # Alignment term (late-minus-mid along RSI axis), smoothed into [-1,1] then 0..1
-    dLM = pd.to_numeric(hh3["Accel"], errors="coerce") - pd.to_numeric(hh3["tsSPI"], errors="coerce")
-    align = np.tanh((np.sign(RSI) * (dLM / 6.0)).fillna(0.0)) * consensus         # [-1..+1], gated by SCI
-    align01 = 0.5 + 0.5*align                                                    # 0..1
+# --- UEI (underused engine) ---
+def uei_row(r):
+    ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
+    if any(pd.isna([ts,ac,gr])): return 0.0
+    val = 0.0
+    if ts >= 102 and ac <= 98 and gr <= 98:
+        val = 0.3 + 0.3 * min((ts-102)/3.0, 1.0)
+    if ts >= 102 and gr >= 102 and ac <= 100:
+        val = max(val, 0.3 + 0.3 * min(((ts-102)+(gr-102))/6.0, 1.0))
+    return round(val, 3)
+hh["UEI"] = hh.apply(uei_row, axis=1)
 
-    # Capture term: did the horse deploy where it mattered given the shape?
-    F = pd.to_numeric(hh3["F200_idx"], errors="coerce")
-    A = pd.to_numeric(hh3["Accel"], errors="coerce")
-    if RSI >= 0:   # slow-early → late capture matters
-        capture01 = _clip01(((A - F) / 6.0))
-    else:          # fast-early → on-pace speed matters
-        capture01 = _clip01(((F - A) / 6.0))
+# --- HiddenScore ---
+hidden = (0.55*hh["SOS"] + 0.30*hh["ASI2"] + 0.10*hh["TFS_plus"] + 0.05*hh["UEI"]).fillna(0.0)
+if len(hh) <= 6: hidden *= 0.9
+h_med, h_mad = float(np.nanmedian(hidden)), float(np.nanmedian(np.abs(hidden - np.nanmedian(hidden))))
+h_sigma = max(1e-6, 1.4826*h_mad)
+hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
 
-    # Pressure flavor: finishing demand aligned with shape (uses Accel vs Grind)
-    G = pd.to_numeric(hh3[gr_col], errors="coerce")
-    if RSI >= 0:   # sprint-home: extra late/finish weight
-        pressure01 = _clip01(((G - A) / 6.0))
-    else:          # attritional: sustained/early-late cohesion
-        pressure01 = _clip01(((A - G) / 6.0))
-
-    # KSI on 0..10
-    KSI = 10.0 * (0.5*align01 + 0.3*capture01 + 0.2*pressure01)
-    hh3["KSI"] = pd.to_numeric(KSI).round(2)
-
-    # ---------- HiddenScore v3 (adds KSI) ----------
-    hidden_v3 = (0.50*hh3["SOS"] + 0.30*hh3["ASI2"] + 0.12*hh3["TFS_plus"] + 0.08*hh3["UEI"]).fillna(0.0)
-    # bring KSI in softly (0..10 → 0..1), then restandardise in-race
-    KSI01 = (hh3["KSI"] / 10.0).fillna(0.0)
-    hidden_v3 = hidden_v3 + 0.15*KSI01
-
-    # field-size softness (tiny fields are noisy)
-    if len(hh3) <= 6: hidden_v3 *= 0.9
-
-    h_med = float(np.nanmedian(hidden_v3))
-    h_mad = float(np.nanmedian(np.abs(hidden_v3 - h_med)))
-    h_sigma = max(1e-6, 1.4826*h_mad)
-    hh3["HiddenScore_v3"] = (1.2 + (hidden_v3 - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
-
-    # ---------- Tier logic (uses PI/GCI_RS lightly, unchanged spirit) ----------
-    def _tier_v3(r):
-        hs = as_num(r.get("HiddenScore_v3"))
-        if not np.isfinite(hs): return ""
-        pi_val  = as_num(r.get("PI"))
-        gci_rs  = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
-        def base_ok(top: bool) -> bool:
-            if top:
-                return ((np.isfinite(pi_val) and pi_val >= 5.4) or
-                        (np.isfinite(gci_rs) and gci_rs >= 4.8))
-            else:
-                return ((np.isfinite(pi_val) and pi_val >= 4.8) or
-                        (np.isfinite(gci_rs) and gci_rs >= 4.2))
-        if hs >= 1.8 and base_ok(True):  return "🔥 Top Hidden"
-        if hs >= 1.2 and base_ok(False): return "🟡 Notable Hidden"
+# --- Tier logic (race-shape-aware) ---
+def hh_tier_row(r):
+    """Return a tier label for Hidden Horses v2."""
+    hs = as_num(r.get("HiddenScore"))
+    if not np.isfinite(hs):
         return ""
-    hh3["Tier_v3"] = hh3.apply(_tier_v3, axis=1)
 
-    # ---------- RacePulse (one paragraph explainer) ----------
-    dLG = (pd.to_numeric(hh3[gr_col], errors="coerce") - pd.to_numeric(hh3["Accel"], errors="coerce"))
-    med_dLM = float(np.nanmedian(dLM)); med_dLG = float(np.nanmedian(dLG))
-    shape_tag = metrics.attrs.get("SHAPE_TAG", "EVEN")
-    # a compact sentence
-    if abs(RSI) < 1.2:
-        pulse = f"RacePulse: Even-flow event (RSI {RSI:+.2f}). Little systemic advantage; individual execution decided it."
-    else:
-        if RSI > 0:
-            finish_flav = "sprint-home" if med_dLG < -0.6 else "balanced-to-late"
-            pulse = (f"RacePulse: Slow-early ({shape_tag}, RSI {RSI:+.2f}); {finish_flav}. "
-                     "Profiles with stronger late vs mid (Accel > tsSPI) had the lane.")
+    # Baseline performance gates (robust to missing GCI_RS)
+    pi_val = as_num(r.get("PI"))
+    gci_rs = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
+
+    # Mild gates so we don't crown complete outliers with zero baseline
+    def baseline_ok_for(top: bool) -> bool:
+        if top:
+            return (
+                (np.isfinite(pi_val)  and pi_val  >= 5.4) or
+                (np.isfinite(gci_rs) and gci_rs >= 4.8)
+            )
         else:
-            finish_flav = "attritional" if med_dLG > +0.6 else "sustained pace"
-            pulse = (f"RacePulse: Fast-early ({shape_tag}, RSI {RSI:+.2f}); {finish_flav}. "
-                     "On-pace/sustained types (F200 ≥ Accel) were best served.")
-    st.caption(pulse)
+            return (
+                (np.isfinite(pi_val)  and pi_val  >= 4.8) or
+                (np.isfinite(gci_rs) and gci_rs >= 4.2)
+            )
 
-    # ---------- Render table ----------
-    view_cols = ["Horse","Finish_Pos","PI","GCI","GCI_RS","tsSPI","F200_idx","Accel",gr_col,
-                 "SOS","ASI2","TFS","UEI","KSI","HiddenScore_v3","Tier_v3"]
-    for c in view_cols:
-        if c not in hh3.columns: hh3[c] = np.nan
-    hh3_view = hh3.sort_values(
-        ["Tier_v3","HiddenScore_v3","PI"], ascending=[True, False, False]
-    )[view_cols]
-    st.dataframe(hh3_view, use_container_width=True)
-    st.caption("Hidden Horses v3 — adds KSI (win-path capture) and RacePulse paragraph. 🔥 ≥ strong hidden with baseline; 🟡 notable hidden.")
+    if hs >= 1.8 and baseline_ok_for(top=True):
+        return "🔥 Top Hidden"
+    if hs >= 1.2 and baseline_ok_for(top=False):
+        return "🟡 Notable Hidden"
+    return ""
+hh["Tier"] = hh.apply(hh_tier_row, axis=1)
 
-    # ---------- Optional: short “why” note per runner (uses KSI & pieces) ----------
-    def _why_row(r):
-        bits=[]
-        ksi = as_num(r.get("KSI"))
-        if np.isfinite(ksi):
-            bits.append(f"KSI {ksi:.1f}")
-        if as_num(r.get("ASI2")) >= 0.8: bits.append("against strong bias")
-        elif as_num(r.get("ASI2")) >= 0.4: bits.append("against bias")
+# --- Descriptive note ---
+def hh_note(r):
+    pi, gci_rs = as_num(r.get("PI")), as_num(r.get("GCI_RS"))
+    bits=[]
+    if np.isfinite(pi) and np.isfinite(gci_rs):
+        bits.append(f"PI {pi:.2f}, GCI_RS {gci_rs:.2f}")
+    else:
+        if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
+        asi2 = as_num(r.get("ASI2"))
+        if asi2 >= 0.8: bits.append("ran against strong bias")
+        elif asi2 >= 0.4: bits.append("ran against bias")
         if as_num(r.get("TFS_plus")) > 0: bits.append("trip friction late")
-        if as_num(r.get("UEI")) >= 0.5: bits.append("latent engine")
-        if not bits: bits.append("clean trip")
-        return ", ".join(bits)
-    hh3_view["_Why"] = hh3.apply(_why_row, axis=1)
-    # move Why next to Tier
-    cols_order = ["Horse","Finish_Pos","Tier_v3","_Why","HiddenScore_v3","KSI","PI","GCI_RS","tsSPI","F200_idx","Accel",gr_col,"SOS","ASI2","TFS","UEI"]
-    st.dataframe(hh3_view[cols_order], use_container_width=True)
-# ======================= /Hidden Horses v3 =======================
+        if as_num(r.get("UEI")) >= 0.5: bits.append("latent potential if shape flips")
+    return "; ".join(bits).capitalize()+"."
+hh["Note"] = hh.apply(hh_note, axis=1)
+
+cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+for c in cols_hh:
+    if c not in hh.columns: hh[c] = np.nan
+hh_view = hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True,False,False])[cols_hh]
+st.dataframe(hh_view, use_container_width=True)
+st.caption("Hidden Horses v2 — RS-aware tiering enabled · 🔥 ≥7.2/6.0 · 🟡 ≥6.2/5.0.")
+
+# ======================= Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict) =======================
+st.markdown("---")
+st.markdown("## Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict)")
+
+# Merge HiddenScore in
+AM = metrics.copy()
+if "Horse" not in AM.columns:
+    AM["Horse"] = work.get("Horse", "")
+AM = AM.merge(hh_view[["Horse","HiddenScore"]], on="Horse", how="left")
+AM["HiddenScore"] = AM["HiddenScore"].fillna(0.0)
+
+# Use corrected grind if active
+gr_col = metrics.attrs.get("GR_COL", "Grind")
+
+# ----- Core components -----
+AM["IAI"]  = 0.35*AM["tsSPI"] + 0.25*AM["Accel"] + 0.25*AM[gr_col] + 0.15*AM["F200_idx"]
+AM["BAL"]  = 100.0 - (AM["Accel"] - AM[gr_col]).abs() / 2.0
+AM["COMP"] = 100.0 - (AM["tsSPI"] - 100.0).abs()
+
+# ----- Percentiles within this race -----
+def pct_rank(s):
+    s = pd.to_numeric(s, errors="coerce")
+    return s.rank(pct=True, method="average").fillna(0.0).clip(0.0, 1.0)
+
+AM["IAI_pct"]  = pct_rank(AM["IAI"])
+AM["HID_pct"]  = pct_rank(AM["HiddenScore"])
+AM["BAL_pct"]  = 1.0 - pct_rank((AM["BAL"]  - 100.0).abs())
+AM["COMP_pct"] = 1.0 - pct_rank((AM["COMP"] - 100.0).abs())
+
+# ----- Hidden contribution caps (blocks hidden-only "elites") -----
+def hidden_scale(iai):
+    iai = float(iai) if pd.notna(iai) else np.nan
+    if not np.isfinite(iai): return 0.0
+    if iai < 101.0:  return 0.25     # average engines
+    if iai < 101.5:  return 0.50     # decent engines
+    return 1.00                      # strong engines
+
+AM["_hid_scale"] = AM["IAI"].map(hidden_scale)
+
+# ----- Composite score (for ordering/plot) -----
+AM["AbilityScore"] = (
+      6.5 * AM["IAI_pct"]
+    + 2.5 * (AM["HID_pct"] * AM["_hid_scale"])
+    + 0.6 * AM["BAL_pct"]
+    + 0.4 * AM["COMP_pct"]
+).clip(0.0, 10.0).round(2)
+
+# ----- Confidence by field size -----
+field_n = int(len(AM.index))
+def conf_band(n):
+    if n >= 12: return "High"
+    if n >= 8:  return "Med"
+    return "Low"
+if "Confidence" not in AM.columns:
+    AM["Confidence"] = conf_band(field_n)
+
+# ----- Strict tier gates (Section E) -----
+small_field = field_n <= 7
+elite_iai_floor = 102.0 if small_field else 101.8
+elite_pct_floor = 0.90  if small_field else 0.85
+
+def in_range(x, lo, hi):
+    x = float(x) if pd.notna(x) else np.nan
+    return np.isfinite(x) and (lo <= x <= hi)
+
+def to_float(x, default=np.nan):
+    try:
+        v = float(x);  return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+def tier_for_row(r):
+    iai      = to_float(r.get("IAI"))
+    pi       = to_float(r.get("PI"))
+    gci      = to_float(r.get("GCI"))
+    iai_pct  = to_float(r.get("IAI_pct"), 0.0)
+    bal      = to_float(r.get("BAL"))
+    conf_ok  = str(r.get("Confidence","")).strip() in ("High","Med")
+
+    # 🥇 Elite — all must pass
+    if (
+        np.isfinite(iai) and iai >= elite_iai_floor and
+        np.isfinite(pi)  and pi  >= 7.2 and
+        np.isfinite(gci) and gci >= 6.0 and
+        iai_pct >= elite_pct_floor and
+        in_range(bal, 98.0, 104.0) and
+        conf_ok
+    ):
+        return "🥇 Elite"
+
+    # 🥈 High — all must pass
+    if (
+        np.isfinite(iai) and iai >= 101.0 and
+        np.isfinite(pi)  and pi  >= 6.2 and
+        iai_pct >= 0.70 and
+        in_range(bal, 97.0, 105.0)
+    ):
+        return "🥈 High"
+
+    # 🥉 Competitive — any
+    if (
+        (np.isfinite(iai) and iai >= 100.4) or
+        iai_pct >= 0.55 or
+        (np.isfinite(pi) and pi >= 5.4)
+    ):
+        return "🥉 Competitive"
+
+    return "⚪ Ordinary"
+
+AM["AbilityTier"] = AM.apply(tier_for_row, axis=1)
+
+# Near-Elite helper (passes 4/6 elite gates but not all)
+def near_elite_row(r):
+    iai, pi, gci, iai_pct, bal = map(to_float, (r.get("IAI"), r.get("PI"), r.get("GCI"),
+                                                r.get("IAI_pct"), r.get("BAL")))
+    conf_ok  = str(r.get("Confidence","")).strip() in ("High","Med")
+    hits = 0
+    hits += int(np.isfinite(iai) and iai >= elite_iai_floor)
+    hits += int(np.isfinite(pi)  and pi  >= 7.2)
+    hits += int(np.isfinite(gci) and gci >= 6.0)
+    hits += int(iai_pct >= elite_pct_floor)
+    hits += int(in_range(bal, 98.0, 104.0))
+    hits += int(conf_ok)
+    return "⭐ Near-Elite" if (hits >= 4 and r.get("AbilityTier") != "🥇 Elite") else ""
+
+AM["NearEliteFlag"] = AM.apply(near_elite_row, axis=1)
+
+# “Why this tier?” explainer
+def why_tier_row(r):
+    conf_ok = str(r.get("Confidence","")).strip() in ("High","Med")
+    iai = to_float(r['IAI']); pi = to_float(r['PI']); gci = to_float(r['GCI'])
+    iai_pct = to_float(r['IAI_pct']); bal = to_float(r['BAL'])
+    return " · ".join([
+        f"IAI {iai:.2f} {'✅' if np.isfinite(iai) and iai>=elite_iai_floor else '❌'}",
+        f"PI {pi:.2f} {'✅' if np.isfinite(pi) and pi>=7.2 else '❌'}",
+        f"GCI {gci:.2f} {'✅' if np.isfinite(gci) and gci>=6.0 else '❌'}",
+        f"IAI_pct {iai_pct:.2f} {'✅' if iai_pct>=elite_pct_floor else '❌'}",
+        f"BAL {bal:.1f} {'✅' if in_range(bal,98,104) else '❌'}",
+        f"Conf {r.get('Confidence','')} {'✅' if conf_ok else '❌'}",
+    ])
+
+AM["WhyTier"] = AM.apply(why_tier_row, axis=1)
 
 # ---------- Plot (IAI vs Hidden) ----------
 try:
@@ -1862,15 +1954,10 @@ try:
 except NameError:
     ability_png = None
 
-    if "AM" not in locals() or AM is None or not isinstance(AM, pd.DataFrame):
-        st.info("Ability Matrix skipped — no AM dataset available.")
-    else:
-        need_cols_am = {"Horse","IAI","HiddenScore_v3"}
-        if not need_cols_am.issubset(AM.columns):
-            st.info("Ability Matrix: missing required columns.")
-        else:
-        # continue with your plotting logic
-    else:
+need_cols_am = {"Horse","IAI","HiddenScore","PI","BAL"}
+if not need_cols_am.issubset(AM.columns):
+    st.info("Ability Matrix: missing columns to plot.")
+else:
     plot_df = AM.dropna(subset=["IAI","HiddenScore","PI","BAL"]).copy()
     if plot_df.empty:
         st.info("Not enough complete data to draw Ability Matrix.")
