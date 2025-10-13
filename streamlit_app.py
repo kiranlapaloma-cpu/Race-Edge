@@ -2892,20 +2892,20 @@ def build_race_pdf(metrics,
     tbl = _make_table(sectional_df, sec_cols, max_rows=12)
     story.append(tbl if tbl else Paragraph("No data", P))
     story.append(PageBreak())
-                       
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Winning DNA — top factors", H2))
-    wd_cols = ["Horse","WinningDNA","EZ01","MC01","LP01","LL01","SOS01"]
-    tbl = _make_table(wd_view, wd_cols, max_rows=12)
-    story.append(tbl if tbl else Paragraph("No data", P))
-    story.append(PageBreak())
-                       
+                              
     story.append(Spacer(1, 8))
     story.append(Paragraph("Hidden Horses v2 — signals", H2))
     hh_cols = ["Horse","Tier","HiddenScore","SOS","ASI2","TFS","UEI"]
     tbl = _make_table(hh_view, hh_cols, max_rows=12)
     story.append(tbl if tbl else Paragraph("No data", P))
+    story.append(PageBreak())
 
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Winning DNA — top factors", H2))
+    wd_cols = ["Horse","WinningDNA","EZ01","MC01","LP01","LL01","SOS01"]
+    tbl = _make_table(wd_view, wd_cols, max_rows=12)
+    story.append(tbl if tbl else Paragraph("No data", P))
+    
     # ---------- Race Pulse (one-liners) ----------
     if dna_summaries and len(dna_summaries) > 0:
         story.append(Spacer(1, 8))
