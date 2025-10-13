@@ -1685,135 +1685,125 @@ else:
         st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 
     
-# ======================= Hidden Horses v4 — RacePulse Hidden (PI/GCI-free) =======================
-st.markdown("## Hidden Horses v4 — RacePulse Hidden")
+        # ======================= Hidden Horses (v2, shape-aware) =======================
+st.markdown("## Hidden Horses v2 (Shape-aware)")
 
 hh = metrics.copy()
-GR_COL = metrics.attrs.get("GR_COL", "Grind")
+gr_col = metrics.attrs.get("GR_COL", "Grind")
 
-# ---- Defensive casting ----
-for c in ["tsSPI","Accel",GR_COL]:
-    if c not in hh.columns: hh[c] = np.nan
-hh["tsSPI"] = pd.to_numeric(hh["tsSPI"], errors="coerce")
-hh["Accel"] = pd.to_numeric(hh["Accel"], errors="coerce")
-hh[GR_COL]  = pd.to_numeric(hh[GR_COL],  errors="coerce")
+# --- SOS (robust z-score blend) ---
+need_cols = {"tsSPI", "Accel", gr_col}
+if need_cols.issubset(hh.columns) and len(hh) > 0:
+    ts_w = winsorize(pd.to_numeric(hh["tsSPI"], errors="coerce"))
+    ac_w = winsorize(pd.to_numeric(hh["Accel"], errors="coerce"))
+    gr_w = winsorize(pd.to_numeric(hh[gr_col], errors="coerce"))
 
-# ---- Core race-shape context ----
-RSI = float(metrics.attrs.get("RSI", 0.0))
-SCI = float(metrics.attrs.get("SCI", 0.0))
-shape_sign = 0.0 if not np.isfinite(RSI) else (1.0 if RSI > 0 else (-1.0 if RSI < 0 else 0.0))
-flow_label = "Slow-Early (late favoured)" if RSI > 0 else ("Fast-Early (early favoured)" if RSI < 0 else "Even")
+    def rz(s):
+        mu, sd = np.nanmedian(s), mad_std(s)
+        return (s - mu) / (sd if np.isfinite(sd) and sd > 0 else 1.0)
 
-# ---- Components -----------------------------------------------------------
-# SAS: shape alignment score in [-1,+1] (positive = with flow; negative = against flow)
-SAS = np.tanh((hh["Accel"] - hh["tsSPI"]) / 6.0) * shape_sign
+    z_ts, z_ac, z_gr = rz(ts_w), rz(ac_w), rz(gr_w)
+    hh["SOS_raw"] = 0.45*z_ts + 0.35*z_ac + 0.20*z_gr
+    q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
+    denom = max(q95 - q5, 1.0)
+    hh["SOS"] = (2.0 * (hh["SOS_raw"] - q5) / denom).clip(0, 2)
+else:
+    hh["SOS"] = 0.0
 
-# BRI: bias resilience (0..1) — credit for running AGAINST flow
-BRI = (-SAS).clip(lower=0.0, upper=1.0)
+# --- ASI² (bias awareness) ---
+acc_med = pd.to_numeric(hh.get("Accel"), errors="coerce").median(skipna=True)
+grd_med = pd.to_numeric(hh.get(gr_col), errors="coerce").median(skipna=True)
+bias = (acc_med - 100.0) - (grd_med - 100.0)
+B = min(1.0, abs(bias) / 4.0)
+S = pd.to_numeric(hh.get("Accel"), errors="coerce") - pd.to_numeric(hh.get(gr_col), errors="coerce")
+hh["ASI2"] = (B * (-S if bias >= 0 else S).clip(lower=0.0) / 5.0).fillna(0.0)
 
-# Latent Engine (LE: 0..1) — unused power signatures
-gr_eff = hh[GR_COL]
-LE = (
-    0.8 * ((hh["tsSPI"] - 100.0).clip(lower=0.0) / 6.0) +
-    0.7 * ((100.0 - hh["Accel"]).clip(lower=0.0) / 6.0) +
-    0.5 * ((100.0 - gr_eff).clip(lower=0.0) / 6.0)
-).clip(0.0, 1.0)
+# --- TFS (trip friction) ---
+def tfs_row(r):
+    last_cols = [c for c in ["300_Time", "200_Time", "100_Time"] if c in r.index]
+    spds = [metrics.attrs.get("STEP",100) / as_num(r.get(c)) for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
+    if len(spds) < 2: return np.nan
+    sigma = np.std(spds, ddof=0)
+    mid = as_num(r.get("_MID_spd"))
+    return np.nan if not np.isfinite(mid) or mid <= 0 else 100.0 * (sigma / mid)
 
-# Inefficiency (INEF: 0..1) — uneven energy pattern implies upside if trip/setup improves
-d1 = (hh["Accel"] - hh["tsSPI"]).abs()
-d2 = (gr_eff - hh["Accel"]).abs()
-base_inef = (d1 + d2) / 2.0
-scale_inef = mad_std(base_inef)  # robust spread
-scale_inef = 1.0 if (not np.isfinite(scale_inef) or scale_inef <= 0) else scale_inef
-INEF = (base_inef / (2.5 * scale_inef)).clip(0.0, 1.0)
+hh["TFS"] = hh.apply(tfs_row, axis=1)
+D_rounded = int(np.ceil(float(race_distance_input)/200.0)*200)
+gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
+hh["TFS_plus"] = hh["TFS"].apply(lambda x: 0.0 if pd.isna(x) or x < gate else min(0.6, (x-gate)/3.0))
 
-# Trip Friction proxy (TFX: 0..1)
-# Use existing TFS_plus if present; else soft-fallback (0).
-TFS_plus = hh.get("TFS_plus", np.nan)
-if "TFS_plus" not in hh.columns:
-    # Soft fallback from last 300/200/100 if available (same logic as your v2, condensed)
-    step_here = int(metrics.attrs.get("STEP", 100))
-    def _tfs_row(r):
-        last_cols = [c for c in ["300_Time","200_Time","100_Time"] if c in r.index]
-        spds = [step_here / as_num(r.get(c)) for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
-        if len(spds) < 2: return np.nan
-        mid = as_num(r.get("_MID_spd"))
-        if not (np.isfinite(mid) and mid > 0): return np.nan
-        return 100.0 * (np.std(spds, ddof=0) / mid)
-    tmp_tfs = hh.apply(_tfs_row, axis=1)
-    # Distance-aware gate (same shape as your v2)
-    D_rounded = int(np.ceil(float(race_distance_input)/200.0)*200)
-    gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
-    TFS_plus = tmp_tfs.apply(lambda x: 0.0 if pd.isna(x) or x < gate else min(0.6, (x-gate)/3.0))
-TFX = (pd.to_numeric(TFS_plus, errors="coerce") / 0.6).clip(0.0, 1.0).fillna(0.0)
+# --- UEI (underused engine) ---
+def uei_row(r):
+    ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
+    if any(pd.isna([ts,ac,gr])): return 0.0
+    val = 0.0
+    if ts >= 102 and ac <= 98 and gr <= 98:
+        val = 0.3 + 0.3 * min((ts-102)/3.0, 1.0)
+    if ts >= 102 and gr >= 102 and ac <= 100:
+        val = max(val, 0.3 + 0.3 * min(((ts-102)+(gr-102))/6.0, 1.0))
+    return round(val, 3)
+hh["UEI"] = hh.apply(uei_row, axis=1)
 
-# ---- Hidden Index (HI_raw) and robust 0..3 scaling -----------------------
-HI_raw = 0.45*BRI + 0.35*LE + 0.20*INEF - 0.15*TFX
-# robust field scaling: map Q10..Q90 → 0..3, clip outside
-q10, q90 = np.nanpercentile(HI_raw.dropna().values, [10, 90]) if HI_raw.notna().any() else (0.0, 1.0)
-rng = max(1e-6, q90 - q10)
-HI = (3.0 * (HI_raw - q10) / rng).clip(0.0, 3.0)
+# --- HiddenScore ---
+hidden = (0.55*hh["SOS"] + 0.30*hh["ASI2"] + 0.10*hh["TFS_plus"] + 0.05*hh["UEI"]).fillna(0.0)
+if len(hh) <= 6: hidden *= 0.9
+h_med, h_mad = float(np.nanmedian(hidden)), float(np.nanmedian(np.abs(hidden - np.nanmedian(hidden))))
+h_sigma = max(1e-6, 1.4826*h_mad)
+hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
 
-# ---- Tiers ---------------------------------------------------------------
-def hh4_tier(v: float) -> str:
-    if not np.isfinite(v): return ""
-    if v >= 1.8: return "🔥 Top Hidden"
-    if v >= 1.2: return "🟡 Notable Hidden"
+# --- Tier logic (race-shape-aware) ---
+def hh_tier_row(r):
+    """Return a tier label for Hidden Horses v2."""
+    hs = as_num(r.get("HiddenScore"))
+    if not np.isfinite(hs):
+        return ""
+
+    # Baseline performance gates (robust to missing GCI_RS)
+    pi_val = as_num(r.get("PI"))
+    gci_rs = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
+
+    # Mild gates so we don't crown complete outliers with zero baseline
+    def baseline_ok_for(top: bool) -> bool:
+        if top:
+            return (
+                (np.isfinite(pi_val)  and pi_val  >= 5.4) or
+                (np.isfinite(gci_rs) and gci_rs >= 4.8)
+            )
+        else:
+            return (
+                (np.isfinite(pi_val)  and pi_val  >= 4.8) or
+                (np.isfinite(gci_rs) and gci_rs >= 4.2)
+            )
+
+    if hs >= 1.8 and baseline_ok_for(top=True):
+        return "🔥 Top Hidden"
+    if hs >= 1.2 and baseline_ok_for(top=False):
+        return "🟡 Notable Hidden"
     return ""
+hh["Tier"] = hh.apply(hh_tier_row, axis=1)
 
-# ---- Taglines (concise “why” in plain English) --------------------------
-def _tagline_row(i):
-    bits = []
-    if BRI.iloc[i] >= 0.60: bits.append("ran against flow")
-    if LE.iloc[i]  >= 0.60: bits.append("latent engine")
-    if INEF.iloc[i] >= 0.60: bits.append("inefficient energy (upside)")
-    if TFX.iloc[i]  >= 0.50: bits.append("trip friction late")
-    return "; ".join(bits).capitalize()+("." if bits else "")
+# --- Descriptive note ---
+def hh_note(r):
+    pi, gci_rs = as_num(r.get("PI")), as_num(r.get("GCI_RS"))
+    bits=[]
+    if np.isfinite(pi) and np.isfinite(gci_rs):
+        bits.append(f"PI {pi:.2f}, GCI_RS {gci_rs:.2f}")
+    else:
+        if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
+        asi2 = as_num(r.get("ASI2"))
+        if asi2 >= 0.8: bits.append("ran against strong bias")
+        elif asi2 >= 0.4: bits.append("ran against bias")
+        if as_num(r.get("TFS_plus")) > 0: bits.append("trip friction late")
+        if as_num(r.get("UEI")) >= 0.5: bits.append("latent potential if shape flips")
+    return "; ".join(bits).capitalize()+"."
+hh["Note"] = hh.apply(hh_note, axis=1)
 
-# ---- RacePulse summary sentence -----------------------------------------
-# Flow stress = blend of RSI magnitude and dLM dispersion
-dLM = (hh["Accel"] - hh["tsSPI"])
-disp = mad_std(dLM)  # robust spread
-rsi_mag = abs(RSI)
-stress_score = 0.6 * min(1.0, rsi_mag / 6.0) + 0.4 * min(1.0, disp / 4.0)
-if stress_score < 0.33: stress_label = "low"
-elif stress_score < 0.66: stress_label = "moderate"
-else: stress_label = "high"
-
-# Top hidden list (names) for the sentence
-hh_names = hh["Horse"].astype(str).fillna("")
-top_mask = HI >= 1.2
-top_names = hh_names[top_mask].tolist()
-top_names = [n for n in top_names if n]  # tidy
-
-pulse = (
-    f"*{flow_label}* race (RSI {RSI:+.2f}, SCI {SCI:.2f}) — "
-    f"flow stress **{stress_label}**. "
-    + (f"Hidden merit surfaced from **{', '.join(top_names[:5])}**." if top_names else "Hidden merit was limited.")
-)
-
-# ---- Assemble view -------------------------------------------------------
-view = pd.DataFrame({
-    "Horse": hh["Horse"].astype(str),
-    "HI": HI.round(2),
-    "BRI": BRI.round(2),
-    "LE": LE.round(2),
-    "TFX": TFX.round(2),
-})
-view["Tier"] = [hh4_tier(v) for v in view["HI"]]
-view["Why"]  = [_tagline_row(i) for i in range(len(view))]
-
-# Order: Tier, HI desc
-tier_order = pd.CategoricalDtype(["🔥 Top Hidden","🟡 Notable Hidden",""], ordered=True)
-view["Tier"] = view["Tier"].astype(tier_order)
-view = view.sort_values(["Tier","HI"], ascending=[True, False]).reset_index(drop=True)
-
-# ---- Render --------------------------------------------------------------
-st.caption(pulse)
-cols_show = ["Horse","Tier","HI","BRI","LE","TFX","Why"]
-st.dataframe(view[cols_show], use_container_width=True, hide_index=True)
-st.caption("BRI = Bias Resilience (ran against flow) · LE = Latent Engine (unused power) · TFX = Trip Friction (late instability).")
-# ======================= /Hidden Horses v4 — RacePulse Hidden =======================
+cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+for c in cols_hh:
+    if c not in hh.columns: hh[c] = np.nan
+hh_view = hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True,False,False])[cols_hh]
+st.dataframe(hh_view, use_container_width=True)
+st.caption("Hidden Horses v2 — RS-aware tiering enabled · 🔥 ≥7.2/6.0 · 🟡 ≥6.2/5.0.")
 
 # ======================= Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict) =======================
 st.markdown("---")
