@@ -1647,8 +1647,8 @@ else:
         ax2.plot(x_idx, field_avg, linewidth=2.2, color="black",
                  label="Field average", marker=None)
 
-        palette = color_cycle(len(top8))
-        for i, (_, r) in enumerate(top8.iterrows()):
+        palette = color_cycle(len(top10))
+        for i, (_, r) in enumerate(top10.iterrows()):
             # find the row in the raw table for this horse (for timing columns)
             if "Horse" in work.columns and "Horse" in metrics.columns:
                 row0 = work[work["Horse"] == r.get("Horse")]
