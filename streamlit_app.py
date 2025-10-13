@@ -1684,49 +1684,143 @@ else:
                            file_name="pace_curve.png", mime="image/png")
         st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 
-# ======================= Winning DNA Matrix — distance-aware (EZ/MC/LP/LL + SOS) =======================
+# ======================= Winning DNA Matrix — distance-aware & report cards =======================
 st.markdown("## Winning DNA Matrix")
 
 WD = metrics.copy()
 gr_col = metrics.attrs.get("GR_COL", "Grind")
-D_m    = float(race_distance_input)
-RSI    = float(metrics.attrs.get("RSI", 0.0))      # + = slow-early, - = fast-early
-SCI    = float(metrics.attrs.get("SCI", 0.0))      # 0..1 (consensus/strength)
+D_m  = float(race_distance_input)
+RSI  = float(metrics.attrs.get("RSI", 0.0))      # + = slow-early, - = fast-early
+SCI  = float(metrics.attrs.get("SCI", 0.0))      # 0..1 (consensus/strength)
+
+# ---- safety: make sure the columns exist ----
+for c in ["Horse", "F200_idx", "tsSPI", "Accel", gr_col]:
+    if c not in WD.columns:
+        WD[c] = np.nan
 
 # ---- helpers ----
+def _clamp01(x): 
+    return float(max(0.0, min(1.0, x)))
+
 def _lerp(a, b, t): 
     return a + (b - a) * float(max(0.0, min(1.0, t)))
 
-def _score01(idx_val, lo=98.0, hi=104.0):
-    """Map index ~[98..104] to 0..1 with clamping; safe for NaN."""
+def _band_knots(metric: str):
+    """
+    Priors for (lo, hi) index bands that map to 0..1.
+    Distance knots: 1000,1100,1200,1400,1600,1800,2000+
+    """
+    if metric == "EZ":  # F200_idx
+        return [
+            (1000, (96.0, 106.0)), (1100, (96.5, 105.5)), (1200, (97.0, 105.0)),
+            (1400, (98.0, 104.0)), (1600, (98.5, 103.5)), (1800, (99.0, 103.0)),
+            (2000, (99.2, 102.8)),
+        ]
+    if metric == "MC":  # tsSPI
+        return [
+            (1000, (98.0, 102.0)), (1100, (98.0, 102.0)), (1200, (98.0, 102.0)),
+            (1400, (98.0, 102.2)), (1600, (97.8, 102.4)), (1800, (97.6, 102.6)),
+            (2000, (97.5, 102.7)),
+        ]
+    if metric == "LP":  # Accel
+        return [
+            (1000, (96.0, 104.0)), (1100, (96.5, 103.8)), (1200, (97.0, 103.5)),
+            (1400, (97.5, 103.0)), (1600, (98.0, 102.5)), (1800, (98.3, 102.3)),
+            (2000, (98.5, 102.0)),
+        ]
+    if metric == "LL":  # Grind (or Grind_CG)
+        return [
+            (1000, (98.5, 101.5)), (1100, (98.0, 102.0)), (1200, (98.0, 102.0)),
+            (1400, (97.5, 102.5)), (1600, (97.0, 103.0)), (1800, (96.5, 103.5)),
+            (2000, (96.0, 104.0)),
+        ]
+    return [(1200, (98.0, 102.0)), (2000, (98.0, 102.0))]
+
+def _prior_band(distance_m: float, metric: str):
+    """Piecewise-linear interpolation over the metric's distance knots."""
+    knots = _band_knots(metric)
+    dm = float(distance_m)
+    if dm <= knots[0][0]: 
+        return knots[0][1]
+    if dm >= knots[-1][0]:
+        return knots[-1][1]
+    for (ad, (alo, ahi)), (bd, (blo, bhi)) in zip(knots, knots[1:]):
+        if ad <= dm <= bd:
+            t = (dm - ad) / (bd - ad)
+            return (_lerp(alo, blo, t), _lerp(ahi, bhi, t))
+    return knots[-1][1]
+
+def _shape_shift(lo, hi, metric: str, rsi: float, sci: float):
+    """
+    Shift band centers by ±(0.2 * SCI) depending on RSI sign.
+    Fast-early (RSI<0): EZ/LP shift up; LL/MC shift down.
+    Slow-early (RSI>0): LL/MC shift up; EZ/LP shift down.
+    """
+    if not np.isfinite(sci) or sci <= 0: 
+        return lo, hi
+    shift = 0.2 * float(min(1.0, max(0.0, sci)))
+    center = 0.5*(lo+hi)
+    half   = 0.5*(hi-lo)
+    if rsi < -1e-9:   # fast-early
+        if metric in ("EZ","LP"): center += shift
+        if metric in ("LL","MC"): center -= shift
+    elif rsi >  1e-9: # slow-early
+        if metric in ("LL","MC"): center += shift
+        if metric in ("EZ","LP"): center -= shift
+    return (center - half, center + half)
+
+def _blend_with_field(lo, hi, series: pd.Series):
+    """Blend priors (70%) with field 10th/90th (30%) if available."""
+    s = pd.to_numeric(series, errors="coerce")
+    if s.notna().any():
+        q10, q90 = np.nanpercentile(s.dropna(), [10, 90])
+        lo = 0.7*lo + 0.3*float(q10)
+        hi = 0.7*hi + 0.3*float(q90)
+    if hi <= lo: 
+        hi = lo + 1.0
+    return lo, hi
+
+def _score01_from_band(x, lo, hi):
     try:
-        x = float(idx_val)
-        if not np.isfinite(x): return 0.0
-        return float(max(0.0, min(1.0, (x - lo) / (hi - lo))))
+        xv = float(x)
+        if not np.isfinite(xv): return 0.0
+        return _clamp01((xv - lo) / (hi - lo))
     except Exception:
         return 0.0
 
-def _wdna_base_weights(distance_m: float) -> dict:
-    """
-    Return base weights for EZ/MC/LP/LL that sum to 0.85 (SOS is fixed 0.15).
-    Knot table (your spec):
-      Dist:   EZ   MC   LP   LL   (sum=0.85)
-      1000:  0.25 0.21 0.28 0.11
-      1100:  0.22 0.22 0.27 0.14
-      1200:  0.20 0.22 0.25 0.18
-      1400:  0.15 0.24 0.24 0.22
-      1600:  0.10 0.26 0.23 0.26
-      1800:  0.06 0.28 0.22 0.29
-      2000+: 0.03 0.30 0.20 0.32
-    """
-    dm = float(distance_m)
-    # clamp regimes
-    if dm <= 1000: 
-        return {"EZ":0.25,"MC":0.21,"LP":0.28,"LL":0.11}
-    if dm >= 2000:
-        return {"EZ":0.03,"MC":0.30,"LP":0.20,"LL":0.32}
+# ---- compute distance/shape-aware 0..1 components ----
+bands = {}
+for metric_key, col in [("EZ","F200_idx"), ("MC","tsSPI"), ("LP","Accel"), ("LL",gr_col)]:
+    lo0, hi0 = _prior_band(D_m, metric_key)
+    lo1, hi1 = _shape_shift(lo0, hi0, metric_key, RSI, SCI)
+    lo, hi   = _blend_with_field(lo1, hi1, WD[col])
+    bands[metric_key] = (lo, hi)
 
-    # piecewise linear interpolation across knots
+WD["EZ01"] = WD["F200_idx"].map(lambda v: _score01_from_band(v, *bands["EZ"]))
+WD["MC01"] = WD["tsSPI"].map(lambda v: _score01_from_band(v, *bands["MC"]))
+WD["LP01"] = WD["Accel" ].map(lambda v: _score01_from_band(v, *bands["LP"]))
+WD["LL01"] = WD[gr_col   ].map(lambda v: _score01_from_band(v, *bands["LL"]))
+
+# ---- SOS (0..1) using your robust z-blend idea ----
+def _sos01_series(df: pd.DataFrame) -> pd.Series:
+    ts = winsorize(pd.to_numeric(df["tsSPI"], errors="coerce"))
+    ac = winsorize(pd.to_numeric(df["Accel"], errors="coerce"))
+    gr = winsorize(pd.to_numeric(df[gr_col],  errors="coerce"))
+    def rz(s):
+        mu, sd = np.nanmedian(s), mad_std(s)
+        sd = sd if (np.isfinite(sd) and sd > 0) else 1.0
+        return (s - mu) / sd
+    raw = 0.45*rz(ts) + 0.35*rz(ac) + 0.20*rz(gr)
+    if raw.notna().any():
+        q5, q95 = np.nanpercentile(raw.dropna(), [5, 95])
+        denom = max(q95 - q5, 1.0)
+        return ((raw - q5) / denom).clip(0.0, 1.0)
+    return pd.Series(0.0, index=df.index)
+
+WD["SOS01"] = _sos01_series(WD)
+
+# ---- weights (distance + shape nudges) ----
+def _wdna_base_weights(distance_m: float) -> dict:
     knots = [
         (1000, {"EZ":0.25,"MC":0.21,"LP":0.28,"LL":0.11}),
         (1100, {"EZ":0.22,"MC":0.22,"LP":0.27,"LL":0.14}),
@@ -1736,143 +1830,130 @@ def _wdna_base_weights(distance_m: float) -> dict:
         (1800, {"EZ":0.06,"MC":0.28,"LP":0.22,"LL":0.29}),
         (2000, {"EZ":0.03,"MC":0.30,"LP":0.20,"LL":0.32}),
     ]
-    # find segment
-    for (a_dm, a_w), (b_dm, b_w) in zip(knots, knots[1:]):
-        if a_dm <= dm <= b_dm:
-            t = (dm - a_dm) / (b_dm - a_dm)
-            return {
-                "EZ": _lerp(a_w["EZ"], b_w["EZ"], t),
-                "MC": _lerp(a_w["MC"], b_w["MC"], t),
-                "LP": _lerp(a_w["LP"], b_w["LP"], t),
-                "LL": _lerp(a_w["LL"], b_w["LL"], t),
-            }
-    # fallback (should not hit)
-    return {"EZ":0.20,"MC":0.22,"LP":0.25,"LL":0.18}
+    dm = float(distance_m)
+    if dm <= knots[0][0]:  return knots[0][1]
+    if dm >= knots[-1][0]: return knots[-1][1]
+    for (ad, aw), (bd, bw) in zip(knots, knots[1:]):
+        if ad <= dm <= bd:
+            t = (dm - ad) / (bd - ad)
+            return {k: _lerp(aw[k], bw[k], t) for k in aw}
+    return knots[-1][1]
 
 def _apply_shape_nudges(w: dict, rsi: float, sci: float) -> dict:
-    """
-    Gentle nudges by RSI sign, scaled by SCI. Re-normalises to 0.85 total.
-      FAST-early (RSI<0): +0.01*SCI to EZ & LP, -0.01*SCI split from LL/MC
-      SLOW-early (RSI>0): +0.01*SCI to LL & MC, -0.01*SCI split from EZ/LP
-    """
     w = w.copy()
     mag = 0.01 * max(0.0, min(1.0, sci))
-    if rsi < -1e-9:  # fast-early
-        give = mag
-        take_each = give / 2.0
-        w["EZ"] += give; w["LP"] += give
-        w["LL"] = max(0.0, w["LL"] - take_each)
-        w["MC"] = max(0.0, w["MC"] - take_each)
-    elif rsi > 1e-9:  # slow-early
-        give = mag
-        take_each = give / 2.0
-        w["LL"] += give; w["MC"] += give
-        w["EZ"] = max(0.0, w["EZ"] - take_each)
-        w["LP"] = max(0.0, w["LP"] - take_each)
-
+    if rsi < -1e-9:   # fast-early
+        take = mag/2.0
+        w["EZ"] += mag; w["LP"] += mag
+        w["LL"] = max(0.0, w["LL"] - take); w["MC"] = max(0.0, w["MC"] - take)
+    elif rsi >  1e-9: # slow-early
+        take = mag/2.0
+        w["LL"] += mag; w["MC"] += mag
+        w["EZ"] = max(0.0, w["EZ"] - take); w["LP"] = max(0.0, w["LP"] - take)
     s = sum(w.values()) or 1.0
-    # renormalise to 0.85 (SOS is fixed 0.15 outside this)
-    return {k: (v / s) * 0.85 for k, v in w.items()}
+    return {k: (v/s)*0.85 for k,v in w.items()}  # SOS fixed outside
 
 def _wdna_weights(distance_m: float, rsi: float, sci: float) -> dict:
     base = _wdna_base_weights(distance_m)
     shaped = _apply_shape_nudges(base, rsi, sci)
-    shaped["SOS"] = 0.15  # fixed
-    # final safety normalisation to 1.00
+    shaped["SOS"] = 0.15
     S = sum(shaped.values()) or 1.0
     return {k: v / S for k, v in shaped.items()}
 
-# ---- component strengths (0..1) ----
-for c in ["F200_idx","tsSPI","Accel",gr_col]:
-    if c not in WD.columns:
-        WD[c] = np.nan
+W = _wdna_weights(D_m, RSI, SCI)  # EZ/MC/LP/LL/SOS sum to 1.0
 
-WD["EZ01"] = WD["F200_idx"].map(_score01)    # Early Zip
-WD["MC01"] = WD["tsSPI"].map(_score01)       # Mid Control
-WD["LP01"] = WD["Accel"].map(_score01)       # Late Punch
-WD["LL01"] = WD[gr_col].map(_score01)        # Lasting Lift
-
-# ---- SOS (0..1) using the same robust z-blend idea as Hidden Horses ----
-def _sos01_series(df: pd.DataFrame) -> pd.Series:
-    # winsorise & robust z on sectionals
-    ts = winsorize(pd.to_numeric(df["tsSPI"], errors="coerce"))
-    ac = winsorize(pd.to_numeric(df["Accel"], errors="coerce"))
-    gr = winsorize(pd.to_numeric(df[gr_col], errors="coerce"))
-
-    def rz(s):
-        mu, sd = np.nanmedian(s), mad_std(s)
-        sd = sd if (np.isfinite(sd) and sd > 0) else 1.0
-        return (s - mu) / sd
-
-    raw = 0.45*rz(ts) + 0.35*rz(ac) + 0.20*rz(gr)
-    q5, q95 = np.nanpercentile(raw.dropna(), [5, 95]) if raw.notna().any() else (0.0, 1.0)
-    denom = max(q95 - q5, 1.0)
-    return ((raw - q5) / denom).clip(0.0, 1.0)
-
-WD["SOS01"] = _sos01_series(WD)
-
-# ---- weights for this race ----
-W = _wdna_weights(D_m, RSI, SCI)   # dict with EZ/MC/LP/LL/SOS summing to 1.0
-
-# ---- composite Winning DNA score (0..10) ----
-WD["WinningDNA"] = 10.0 * (
+# ---- composite (0..1) -> re-centered 0..10 with median ≈ 5 ----
+comp01 = (
     W["EZ"]  * WD["EZ01"].fillna(0.0)  +
     W["MC"]  * WD["MC01"].fillna(0.0)  +
     W["LP"]  * WD["LP01"].fillna(0.0)  +
     W["LL"]  * WD["LL01"].fillna(0.0)  +
     W["SOS"] * WD["SOS01"].fillna(0.0)
 )
-WD["WinningDNA"] = WD["WinningDNA"].clip(0.0, 10.0).round(2)
+med = float(np.nanmedian(comp01)) if comp01.notna().any() else 0.5
+q10, q90 = (np.nanpercentile(comp01.dropna(), [10,90]) if comp01.notna().any() else (0.3,0.7))
+den = max(q90 - q10, 1e-6)
 
-# ---- quick tags & summary ----
-def _top_traits(r):
-    pairs = [
-        ("Early Zip",  r.get("EZ01", 0.0)),
-        ("Mid Control",r.get("MC01", 0.0)),
-        ("Late Punch", r.get("LP01", 0.0)),
-        ("Lasting Lift", r.get("LL01", 0.0)),
-    ]
-    pairs = [(n, float(v if np.isfinite(v) else 0.0)) for n, v in pairs]
+WD["WinningDNA"] = (5.0 + 5.0 * ((comp01 - med) / den)).clip(0.0, 10.0).round(2)
+
+# ---- tags, tiers, summaries ----
+def _top_traits_row(r):
+    pairs = [("Early Zip", r.get("EZ01",0.0)), ("Mid Control", r.get("MC01",0.0)),
+             ("Late Punch", r.get("LP01",0.0)), ("Lasting Lift", r.get("LL01",0.0))]
+    pairs = [(n, float(v if np.isfinite(v) else 0.0)) for n,v in pairs]
     pairs.sort(key=lambda x: x[1], reverse=True)
-    keep = [n for n, v in pairs[:2] if v >= 0.55]  # show top 1–2 if decent
-    return " · ".join(keep) if keep else ""
+    keep = [n for n,v in pairs[:2] if v >= 0.55]
+    # specialist flags
+    ez, ll = float(r.get("EZ01",0.0)), float(r.get("LL01",0.0))
+    if ez >= 0.70 and ll <= 0.45: keep.append("Sprinter-leaning")
+    if ll >= 0.70 and ez <= 0.45: keep.append("Stayer-leaning")
+    return " · ".join(keep)
 
-def _summary_line(r):
+def _tier_badge(score):
+    if not np.isfinite(score): return ("", "")
+    if score >= 8.0: return ("🔥 Prime", "A")
+    if score >= 7.0: return ("🟢 Live", "B")
+    if score >= 6.0: return ("⚪ Comp", "C")
+    return ("⚪ Setup", "D")
+
+def _summary_row(r):
     name = str(r.get("Horse","")).strip()
-    dn   = float(r.get("WinningDNA", 0.0))
-    parts = []
-    # dominant attributes
-    dom = _top_traits(r)
-    if dom:
-        parts.append(f"{dom}")
-    # shape context
+    sc   = float(r.get("WinningDNA",0.0))
+    traits = r.get("DNA_TopTraits","")
+    badge,_ = _tier_badge(sc)
+    parts = [f"{badge} DNA {sc:.2f}/10"]
+    if traits: parts.append(traits)
     if SCI >= 0.6 and abs(RSI) >= 1.2:
-        parts.append("ran with race shape" if (np.sign(RSI)*(r["LP01"]-r["MC01"]) >= 0) else "ran against race shape")
-    # compact sentence
-    return f"{name}: DNA {dn:.2f}/10 — " + (", ".join(parts) if parts else "balanced profile.")
+        with_shape = np.sign(RSI)*(float(r.get("LP01",0.0))-float(r.get("MC01",0.0))) >= 0
+        parts.append("with race shape" if with_shape else "against race shape")
+    return f"{name}: " + " — ".join(parts) + "."
 
-WD["DNA_TopTraits"] = WD.apply(_top_traits, axis=1)
-WD["DNA_Summary"]   = WD.apply(_summary_line, axis=1)
+WD["DNA_TopTraits"] = WD.apply(_top_traits_row, axis=1)
+WD["DNA_Summary"]   = WD.apply(_summary_row,    axis=1)
 
-# ---- render table ----
-show_cols = [
-    "Horse","WinningDNA",
-    "EZ01","MC01","LP01","LL01","SOS01",
-    "DNA_TopTraits"
-]
-for c in show_cols:
-    if c not in WD.columns: WD[c] = np.nan
+# ---- Top-6 report cards ----
+cards = WD.sort_values("WinningDNA", ascending=False).head(6).copy()
+if len(cards) > 0:
+    st.markdown("**Top profiles (report cards)**")
+    cols = st.columns(3)
+    for i, (_, r) in enumerate(cards.iterrows()):
+        col = cols[i % 3]
+        nm  = str(r["Horse"])
+        sc  = float(r["WinningDNA"])
+        ez,mc,lp,ll,sos = [float(r[k]) for k in ["EZ01","MC01","LP01","LL01","SOS01"]]
+        badge, grade = _tier_badge(sc)
+        with col:
+            st.markdown(
+                f"""
+<div style="border:1px solid rgba(255,255,255,0.15); border-radius:10px; padding:10px; margin-bottom:10px;">
+  <div style="font-weight:700; font-size:1.05rem;">{nm}</div>
+  <div style="margin:4px 0;"><span style="font-weight:700;">{badge}</span> · Grade <b>{grade}</b> · DNA <b>{sc:.2f}</b>/10</div>
+  <div style="font-size:0.9rem; opacity:0.9;">{r['DNA_TopTraits']}</div>
+  <div style="margin-top:6px; font-size:0.85rem; opacity:0.8;">
+    EZ {ez:.2f} · MC {mc:.2f} · LP {lp:.2f} · LL {ll:.2f} · SOS {sos:.2f}
+  </div>
+</div>
+""",
+                unsafe_allow_html=True
+            )
 
+# ---- Full table ----
+show_cols = ["Horse","WinningDNA","EZ01","MC01","LP01","LL01","SOS01","DNA_TopTraits"]
 WD_view = WD.sort_values(["WinningDNA","Accel",gr_col], ascending=[False, False, False])[show_cols]
 st.dataframe(WD_view, use_container_width=True)
 
-# ---- small per-horse paragraph summaries ----
+# ---- Per-horse summaries ----
 with st.expander("Race Pulse — per-horse summaries"):
     for _, r in WD.sort_values("WinningDNA", ascending=False).iterrows():
         st.write("• " + r["DNA_Summary"])
-# ---- footnote ----
+
+# ---- footnote: weights & band hints ----
 w_note = ", ".join([f"{k} {W[k]:.2f}" for k in ["EZ","MC","LP","LL","SOS"]])
-st.caption(f"Weights — EZ/F200 fades with distance; LL grows. Shape nudges applied via RSI×SCI. Final weights: {w_note}.")
+st.caption(
+    f"Weights — EZ fades with distance; LL grows; shape nudges via RSI×SCI. Final weights: {w_note}. "
+    f"Bands are distance-aware, shape-shifted, and blended 70/30 with field 10th/90th percentiles; "
+    f"DNA recentered so race median ≈ 5."
+)
 # ======================= /Winning DNA Matrix =======================
     
         # ======================= Hidden Horses (v2, shape-aware) =======================
