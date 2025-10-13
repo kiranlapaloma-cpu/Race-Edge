@@ -2871,7 +2871,7 @@ def build_race_pdf(metrics,
     if prof:            meta_line.append(f"Profile: <b>{prof}</b>")
     if meta_line:
         story.append(Paragraph(" · ".join(meta_line), P))
-    story.append(PageBreak())
+    story.append(Spacer(1, 6))
 
     # PI going meta (if available)
     pi_meta = metrics.attrs.get("PI_GOING_META", {})
@@ -2891,13 +2891,15 @@ def build_race_pdf(metrics,
     sec_cols = ["Horse","PI","GCI_RS","F200_idx","tsSPI","Accel",metrics.attrs.get("GR_COL","Grind")]
     tbl = _make_table(sectional_df, sec_cols, max_rows=12)
     story.append(tbl if tbl else Paragraph("No data", P))
-
+    story.append(PageBreak())
+                       
     story.append(Spacer(1, 8))
     story.append(Paragraph("Winning DNA — top factors", H2))
     wd_cols = ["Horse","WinningDNA","EZ01","MC01","LP01","LL01","SOS01"]
     tbl = _make_table(wd_view, wd_cols, max_rows=12)
     story.append(tbl if tbl else Paragraph("No data", P))
-
+    story.append(PageBreak())
+                       
     story.append(Spacer(1, 8))
     story.append(Paragraph("Hidden Horses v2 — signals", H2))
     hh_cols = ["Horse","Tier","HiddenScore","SOS","ASI2","TFS","UEI"]
