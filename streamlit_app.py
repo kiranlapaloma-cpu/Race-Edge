@@ -1744,11 +1744,66 @@ def uei_row(r):
 hh["UEI"] = hh.apply(uei_row, axis=1)
 
 # ======================= Hidden Horses v3 (Shape-aware + RacePulse Insight) =======================
+# ======================= Hidden Horses v3 (Shape-aware + RacePulse) =======================
 st.markdown("## Hidden Horses v3 (Shape-aware + RacePulse)")
-# ensure required columns exist (for independent execution)
-for c in ["SOS", "ASI2", "TFS_plus", "UEI"]:
-    if c not in hh.columns:
-        hh[c] = 0.0
+
+gr_col = metrics.attrs.get("GR_COL", "Grind")
+hh3 = metrics.copy()  # keep v3 independent of v2
+
+# Ensure v2 components exist (compute if missing)
+need = {"SOS", "ASI2", "TFS_plus", "UEI"}
+if not need.issubset(hh3.columns):
+    # --- SOS (robust z-score blend) ---
+    ts_w = winsorize(pd.to_numeric(hh3.get("tsSPI"), errors="coerce"))
+    ac_w = winsorize(pd.to_numeric(hh3.get("Accel"), errors="coerce"))
+    gr_w = winsorize(pd.to_numeric(hh3.get(gr_col), errors="coerce"))
+
+    def rz(s):
+        mu, sd = np.nanmedian(s), mad_std(s)
+        return (s - mu) / (sd if np.isfinite(sd) and sd > 0 else 1.0)
+
+    z_ts, z_ac, z_gr = rz(ts_w), rz(ac_w), rz(gr_w)
+    raw = 0.45*z_ts + 0.35*z_ac + 0.20*z_gr
+    q5, q95 = raw.quantile(0.05), raw.quantile(0.95)
+    denom = max(q95 - q5, 1.0)
+    hh3["SOS"] = (2.0 * (raw - q5) / denom).clip(0, 2)
+
+    # --- ASI² (bias awareness) ---
+    acc_med = pd.to_numeric(hh3.get("Accel"), errors="coerce").median(skipna=True)
+    grd_med = pd.to_numeric(hh3.get(gr_col), errors="coerce").median(skipna=True)
+    bias = (acc_med - 100.0) - (grd_med - 100.0)
+    B = min(1.0, abs(bias) / 4.0)
+    S = pd.to_numeric(hh3.get("Accel"), errors="coerce") - pd.to_numeric(hh3.get(gr_col), errors="coerce")
+    hh3["ASI2"] = (B * (-S if bias >= 0 else S).clip(lower=0.0) / 5.0).fillna(0.0)
+
+    # --- TFS_plus (late trip friction) ---
+    def _tfs_row(r):
+        last_cols = [c for c in ["300_Time", "200_Time", "100_Time"] if c in r.index]
+        spds = [metrics.attrs.get("STEP", 100) / as_num(r.get(c))
+                for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
+        if len(spds) < 2: return np.nan
+        sigma = np.std(spds, ddof=0)
+        mid = as_num(r.get("_MID_spd"))
+        return np.nan if not np.isfinite(mid) or mid <= 0 else 100.0 * (sigma / mid)
+
+    D_rounded = int(np.ceil(float(race_distance_input) / 200.0) * 200)
+    gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
+    tfs_vals = hh3.apply(_tfs_row, axis=1)
+    hh3["TFS_plus"] = tfs_vals.apply(lambda x: 0.0 if pd.isna(x) or x < gate else min(0.6, (x - gate) / 3.0))
+
+    # --- UEI (underused engine) ---
+    def _uei_row(r):
+        ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
+        if any(pd.isna([ts, ac, gr])): return 0.0
+        val = 0.0
+        if ts >= 102 and ac <= 98 and gr <= 98:
+            val = 0.3 + 0.3 * min((ts - 102) / 3.0, 1.0)
+        if ts >= 102 and gr >= 102 and ac <= 100:
+            val = max(val, 0.3 + 0.3 * min(((ts - 102) + (gr - 102)) / 6.0, 1.0))
+        return round(val, 3)
+    hh3["UEI"] = hh3.apply(_uei_row, axis=1)
+
+# >>> from here on, in your v3 logic, use hh3[...] instead of hh[...]
 
 hh = metrics.copy()
 gr_col = metrics.attrs.get("GR_COL", "Grind")
