@@ -1865,28 +1865,81 @@ if need_cols.issubset(hh.columns) and len(hh) > 0:
 else:
     hh["SOS"] = 0.0
 
-# --- ASI² (bias awareness) ---
-acc_med = pd.to_numeric(hh.get("Accel"), errors="coerce").median(skipna=True)
-grd_med = pd.to_numeric(hh.get(gr_col), errors="coerce").median(skipna=True)
-bias = (acc_med - 100.0) - (grd_med - 100.0)
-B = min(1.0, abs(bias) / 4.0)
-S = pd.to_numeric(hh.get("Accel"), errors="coerce") - pd.to_numeric(hh.get(gr_col), errors="coerce")
-hh["ASI2"] = (B * (-S if bias >= 0 else S).clip(lower=0.0) / 5.0).fillna(0.0)
-
-# --- TFS (trip friction) ---
+# --- TFS (trip friction) ---  (moved above ASI so ASI can use TFS_plus)
 def tfs_row(r):
     last_cols = [c for c in ["300_Time", "200_Time", "100_Time"] if c in r.index]
-    spds = [metrics.attrs.get("STEP",100) / as_num(r.get(c)) for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
-    if len(spds) < 2: return np.nan
+    spds = [metrics.attrs.get("STEP", 100) / as_num(r.get(c))
+            for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
+    if len(spds) < 2:
+        return np.nan
     sigma = np.std(spds, ddof=0)
     mid = as_num(r.get("_MID_spd"))
     return np.nan if not np.isfinite(mid) or mid <= 0 else 100.0 * (sigma / mid)
 
 hh["TFS"] = hh.apply(tfs_row, axis=1)
-D_rounded = int(np.ceil(float(race_distance_input)/200.0)*200)
-gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
-hh["TFS_plus"] = hh["TFS"].apply(lambda x: 0.0 if pd.isna(x) or x < gate else min(0.6, (x-gate)/3.0))
+D_rounded = int(np.ceil(float(race_distance_input) / 200.0) * 200)
+_gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
+hh["TFS_plus"] = hh["TFS"].apply(lambda x: 0.0 if pd.isna(x) or x < _gate else min(0.6, (x - _gate) / 3.0))
 
+
+# --- ASI (Against-Shape Index, v3; race-local, 0–2 scale) ---
+def _rz(s):
+    s = winsorize(pd.to_numeric(s, errors="coerce"))
+    mu = np.nanmedian(s)
+    mad = np.nanmedian(np.abs(s - mu))
+    sd = 1.4826 * mad if mad > 0 else np.nanstd(s)
+    if not np.isfinite(sd) or sd <= 0:
+        sd = 1.0
+    return (s - mu) / sd
+
+# 1) Flow strength (FS) from RacePulse if available, else a safe proxy
+RSI = metrics.attrs.get("RSI", np.nan)
+SCI = metrics.attrs.get("SCI", np.nan)
+collapse = float(metrics.attrs.get("CollapseSeverity", 0.0) or 0.0)
+
+if not np.isfinite(RSI) or not np.isfinite(SCI):
+    # Fallback proxy using early/late distribution
+    zE = _rz(hh.get("EARLY_idx")) if "EARLY_idx" in hh.columns else pd.Series(0.0, index=hh.index)
+    zL = _rz(hh.get("LATE_idx"))  if "LATE_idx"  in hh.columns else pd.Series(0.0, index=hh.index)
+    RSI = float(np.nanmedian(zE) - np.nanmedian(zL))  # >0 early tilt
+    SCI = 0.50  # neutral clarity if unknown
+
+_dir = 0 if (not np.isfinite(RSI) or abs(RSI) < 1e-6) else (1 if RSI > 0 else -1)
+FS = 0.0 if _dir == 0 else (0.6 + 0.4 * max(0.0, min(1.0, float(SCI)))) * min(1.0, abs(float(RSI)) / 2.0)
+if collapse >= 3.0:
+    FS *= 0.75  # collapse guard
+
+# 2) Style opposition (SO): early vs late style using Accel vs Grind
+zA, zG = _rz(hh.get("Accel")), _rz(hh.get(gr_col))
+if _dir == 1:   # early-favoured race
+    SO = (zG - zA).clip(lower=0)
+elif _dir == -1:  # late-favoured race
+    SO = (zA - zG).clip(lower=0)
+else:
+    SO = pd.Series(0.0, index=hh.index)
+
+# 3) Segment execution opposition (XO): EARLY_idx vs LATE_idx
+zE = _rz(hh.get("EARLY_idx")) if "EARLY_idx" in hh.columns else pd.Series(0.0, index=hh.index)
+zL = _rz(hh.get("LATE_idx"))  if "LATE_idx"  in hh.columns else pd.Series(0.0, index=hh.index)
+if _dir == 1:
+    XO = (zL - zE).clip(lower=0)
+elif _dir == -1:
+    XO = (zE - zL).clip(lower=0)
+else:
+    XO = pd.Series(0.0, index=hh.index)
+
+# 4) False-positive dampeners (trip friction & grind anomalies)
+tfs_plus = pd.to_numeric(hh.get("TFS_plus"), errors="coerce").fillna(0.0)
+gr_adj  = pd.to_numeric(hh.get("GrindAdjPts"), errors="coerce").fillna(1.0)
+
+D1 = 1.0 - np.minimum(0.35, tfs_plus.clip(lower=0.0))                   # up to -35%
+D2 = 1.0 - np.minimum(0.25, ((gr_adj - 1.0).clip(lower=0.0) / 3.0))      # up to -25%
+D  = D1 * D2
+
+# Combine (more weight on style than execution), scale to 0–10, then to 0–2
+Opp   = 0.6 * SO + 0.4 * XO
+ASI10 = 10.0 * FS * Opp * D
+hh["ASI2"] = (0.2 * ASI10).clip(0.0, 2.0).fillna(0.0)
 # --- UEI (underused engine) ---
 def uei_row(r):
     ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
