@@ -1686,7 +1686,6 @@ else:
 
     
         # ======================= Hidden Horses (v2, shape-aware) =======================
-st.markdown("## Hidden Horses v2 (Shape-aware)")
 
 hh = metrics.copy()
 gr_col = metrics.attrs.get("GR_COL", "Grind")
@@ -1746,6 +1745,10 @@ hh["UEI"] = hh.apply(uei_row, axis=1)
 
 # ======================= Hidden Horses v3 (Shape-aware + RacePulse Insight) =======================
 st.markdown("## Hidden Horses v3 (Shape-aware + RacePulse)")
+# ensure required columns exist (for independent execution)
+for c in ["SOS", "ASI2", "TFS_plus", "UEI"]:
+    if c not in hh.columns:
+        hh[c] = 0.0
 
 hh = metrics.copy()
 gr_col = metrics.attrs.get("GR_COL", "Grind")
