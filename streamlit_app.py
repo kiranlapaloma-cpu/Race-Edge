@@ -1870,7 +1870,7 @@ except NameError:
             st.info("Ability Matrix: missing required columns.")
         else:
         # continue with your plotting logic
-else:
+    else:
     plot_df = AM.dropna(subset=["IAI","HiddenScore","PI","BAL"]).copy()
     if plot_df.empty:
         st.info("Not enough complete data to draw Ability Matrix.")
