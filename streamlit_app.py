@@ -1694,7 +1694,7 @@ st.markdown("## Winning DNA Matrix")
 # race_distance_input: current race distance (m)
 # gr_col: name of grind column (e.g., "Grind_CG" or "Grind")
 
-gr_col = metrics.attrs.get("GR_COL", "Grind") if "metrics" in globals() else globals().get("gr_col", "Grind")
+gr_col = metrics.attrs.get("GRIND_CG", "Grind") if "metrics" in globals() else globals().get("gr_col", "Grind")
 assert gr_col in WD.columns, f"Winning DNA needs grind column '{gr_col}' in WD."
 
 # ---- (A) Weights (uses your W if present; else distance-aware defaults) ---
