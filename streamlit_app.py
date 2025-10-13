@@ -2776,8 +2776,9 @@ try:
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
     from reportlab.lib.units import mm
-except Exception as _e_pdf:
-    _e_pdf = _e_pdf
+    _e_pdf = None
+except Exception as e:
+    _e_pdf = e
 
 def _fmt(x, nd=2):
     try:
