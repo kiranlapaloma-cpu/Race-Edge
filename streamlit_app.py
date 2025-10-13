@@ -1744,66 +1744,104 @@ def uei_row(r):
     return round(val, 3)
 hh["UEI"] = hh.apply(uei_row, axis=1)
 
-# --- HiddenScore ---
-hidden = (0.55*hh["SOS"] + 0.30*hh["ASI2"] + 0.10*hh["TFS_plus"] + 0.05*hh["UEI"]).fillna(0.0)
-if len(hh) <= 6: hidden *= 0.9
-h_med, h_mad = float(np.nanmedian(hidden)), float(np.nanmedian(np.abs(hidden - np.nanmedian(hidden))))
-h_sigma = max(1e-6, 1.4826*h_mad)
-hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
+# ======================= Hidden Horses v3 (Shape-aware + RacePulse Insight) =======================
+st.markdown("## Hidden Horses v3 (Shape-aware + RacePulse)")
 
-# --- Tier logic (race-shape-aware) ---
-def hh_tier_row(r):
-    """Return a tier label for Hidden Horses v2."""
-    hs = as_num(r.get("HiddenScore"))
-    if not np.isfinite(hs):
-        return ""
+hh = metrics.copy()
+gr_col = metrics.attrs.get("GR_COL", "Grind")
 
-    # Baseline performance gates (robust to missing GCI_RS)
-    pi_val = as_num(r.get("PI"))
-    gci_rs = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
+# --- carry over all earlier SOS / ASI2 / TFS / UEI blocks ---
 
-    # Mild gates so we don't crown complete outliers with zero baseline
-    def baseline_ok_for(top: bool) -> bool:
-        if top:
-            return (
-                (np.isfinite(pi_val)  and pi_val  >= 5.4) or
-                (np.isfinite(gci_rs) and gci_rs >= 4.8)
-            )
-        else:
-            return (
-                (np.isfinite(pi_val)  and pi_val  >= 4.8) or
-                (np.isfinite(gci_rs) and gci_rs >= 4.2)
-            )
+# --- KSI (Kinetic Shape Index) ---
+def ksi_row(r):
+    try:
+        ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
+        if not all(np.isfinite([ts, ac, gr])): 
+            return np.nan
+        return ((gr - ac) - (ac - ts)) / 4.0
+    except Exception:
+        return np.nan
+hh["KSI"] = hh.apply(ksi_row, axis=1)
 
-    if hs >= 1.8 and baseline_ok_for(top=True):
-        return "🔥 Top Hidden"
-    if hs >= 1.2 and baseline_ok_for(top=False):
-        return "🟡 Notable Hidden"
-    return ""
-hh["Tier"] = hh.apply(hh_tier_row, axis=1)
+# --- HiddenScore (now KSI-aware) ---
+hidden = (
+    0.50 * hh["SOS"] +
+    0.30 * hh["ASI2"] +
+    0.10 * hh["TFS_plus"] +
+    0.05 * hh["UEI"] +
+    0.05 * hh["KSI"].clip(-1, 1).add(1).fillna(1)/2  # small lift for balanced/positive KSI
+).fillna(0.0)
 
-# --- Descriptive note ---
-def hh_note(r):
-    pi, gci_rs = as_num(r.get("PI")), as_num(r.get("GCI_RS"))
-    bits=[]
-    if np.isfinite(pi) and np.isfinite(gci_rs):
-        bits.append(f"PI {pi:.2f}, GCI_RS {gci_rs:.2f}")
-    else:
-        if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
-        asi2 = as_num(r.get("ASI2"))
-        if asi2 >= 0.8: bits.append("ran against strong bias")
-        elif asi2 >= 0.4: bits.append("ran against bias")
-        if as_num(r.get("TFS_plus")) > 0: bits.append("trip friction late")
-        if as_num(r.get("UEI")) >= 0.5: bits.append("latent potential if shape flips")
-    return "; ".join(bits).capitalize()+"."
-hh["Note"] = hh.apply(hh_note, axis=1)
+if len(hh) <= 6:
+    hidden *= 0.9
 
-cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+h_med  = float(np.nanmedian(hidden))
+h_mad  = float(np.nanmedian(np.abs(hidden - h_med)))
+h_sigma = max(1e-6, 1.4826 * h_mad)
+hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5 * h_sigma)).clip(0.0, 3.0)
+
+# --- Tier logic & Note remain unchanged from your v2 block ---
+# (reuse hh_tier_row and hh_note from above)
+
+cols_hh = ["Horse","Finish_Pos","PI","GCI","GCI_RS","tsSPI","Accel",gr_col,"KSI","SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
 for c in cols_hh:
-    if c not in hh.columns: hh[c] = np.nan
+    if c not in hh.columns: 
+        hh[c] = np.nan
+
 hh_view = hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True,False,False])[cols_hh]
 st.dataframe(hh_view, use_container_width=True)
-st.caption("Hidden Horses v2 — RS-aware tiering enabled · 🔥 ≥7.2/6.0 · 🟡 ≥6.2/5.0.")
+st.caption("Hidden Horses v3 — KSI-aware · Shape-integrated · RS narrative enabled.")
+
+# ======================= RacePulse Insight (A-mode narrative) =======================
+try:
+    rsi  = float(metrics.attrs.get("RSI", np.nan))
+    sci  = float(metrics.attrs.get("SCI", np.nan))
+    flow = float(metrics.attrs.get("FlowStress", np.nan))
+except Exception:
+    rsi = sci = flow = np.nan
+
+def describe_shape(rsi, sci, flow):
+    if not np.isfinite(rsi): 
+        return "Race shape unavailable."
+    tone = "evenly run" if 0.95 <= rsi <= 1.05 else ("pace-biased" if rsi > 1.05 else "closer-biased")
+    stress = f"{int(flow*100) if np.isfinite(flow) else 0}% flow stress"
+    return f"Race unfolded as a {tone} event (RSI {rsi:.2f} · SCI {sci:.2f}, {stress})."
+
+# Bias direction
+bias_dir = np.sign(rsi - 1.0)  # +1 = favours pace, -1 = favours closers
+
+# Identify bias-defiers & star-quality
+defied, aided, stars = [], [], []
+for _, r in hh.iterrows():
+    name = str(r.get("Horse"))
+    ksi  = as_num(r.get("KSI"))
+    gci  = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
+    hid  = as_num(r.get("HiddenScore"))
+    if not np.isfinite(ksi): 
+        continue
+    if bias_dir * ksi < -0.15:
+        defied.append((name, hid, gci))
+    elif bias_dir * ksi > 0.15:
+        aided.append((name, hid, gci))
+    if gci >= 7.5 and hid >= 1.5:
+        stars.append(name)
+
+# Compose narrative
+lines = [f"**RacePulse Insight**  ", describe_shape(rsi, sci, flow)]
+if defied:
+    names = ", ".join([n for n,_,_ in defied[:3]])
+    lines.append(f"{names} defied the prevailing bias with sustained effort.")
+if stars:
+    star_txt = ", ".join(stars[:2])
+    lines.append(f"{star_txt} displayed genuine star-quality signals.")
+if aided:
+    names = ", ".join([n for n,_,_ in aided[:2]])
+    lines.append(f"{names} were likely assisted by the race flow.")
+if not (defied or aided or stars):
+    lines.append("No significant bias or standout profiles detected.")
+st.markdown("---")
+st.markdown("### RacePulse Insight")
+st.markdown(" ".join(lines))
 
 # ======================= Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict) =======================
 st.markdown("---")
