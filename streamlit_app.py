@@ -1684,219 +1684,199 @@ else:
                            file_name="pace_curve.png", mime="image/png")
         st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 
-# =========================== Winning DNA Matrix — Drop-in ===========================
-# Safe, standalone render of a neat Top-6 "report card" based on F200/Accel/Late/Grind.
-# - Automatically resolves your metrics dataframe and column names.
-# - Prefers Grind_CG when present; falls back to Grind.
-# - Applies Kiran's distance-based F200 weighting:
-#     1200m=0.20, 1400m=0.15, 1600m=0.10, 1800m=0.08, 2000m=0.06, 2200m=0.05, >2200m=0.04
-# - Renders clean 6 cards (3 per row × 2), scaled to container width.
+# ======================= Winning DNA Matrix — Visual Top-12 (Drop-in) =======================
+# Responsive grid cards with value-coded bars, SOS pill, Top-12. Prefers Grind_CG.
 
 import math
-from typing import Optional, Dict, Any
+from typing import Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ------------- Helpers -------------
-def _is_df(x):
-    return isinstance(x, pd.DataFrame) and len(getattr(x, "columns", [])) > 0
-
+# ---------- small helpers ----------
+def _is_df(x): return isinstance(x, pd.DataFrame) and len(getattr(x, "columns", [])) > 0
 def _resolve_df() -> Optional[pd.DataFrame]:
-    """Find the working metrics dataframe by scanning common globals."""
-    candidates = ["WD", "WDM", "METRICS", "metrics", "SECT", "sectionals", "SM", "df", "DATA"]
-    for name in candidates:
-        if name in globals() and _is_df(globals()[name]):
-            return globals()[name]
+    for name in ["WD","WDM","METRICS","metrics","SECT","sectionals","SM","df","DATA"]:
+        if name in globals() and _is_df(globals()[name]): return globals()[name]
     return None
 
+def _resolve_col(df, prefs): return next((c for c in prefs if c in df.columns), None)
+
 def _get_distance_m(df: Optional[pd.DataFrame]) -> int:
-    """Try to detect race distance from session_state, globals, or df attrs/columns."""
-    # From session_state toggles/inputs (use the most common keys)
-    for k in ["race_distance_m", "race_distance", "RaceDistance_m", "Distance_m"]:
-        v = st.session_state.get(k)
-        if v is not None:
-            try:
-                return int(float(v))
-            except Exception:
-                pass
-    # From dataframe columns/attrs
+    for k in ["race_distance_m","race_distance","RaceDistance_m","Distance_m"]:
+        if k in st.session_state:
+            try: return int(float(st.session_state[k]))
+            except: pass
     if df is not None:
-        for k in ["RaceDistance_m", "Distance_m", "Distance", "distance_m"]:
+        for k in ["RaceDistance_m","Distance_m","Distance","distance_m"]:
             if k in df.columns:
-                try:
-                    val = pd.to_numeric(df[k]).dropna()
-                    if len(val):
-                        return int(val.iloc[0])
-                except Exception:
-                    pass
-        # attrs hook if you attached meta
-        dist_attr = getattr(df, "attrs", {}).get("race_distance_m")
-        if dist_attr:
-            try:
-                return int(float(dist_attr))
-            except Exception:
-                pass
-    # Fallback
+                s = pd.to_numeric(df[k], errors="coerce").dropna()
+                if len(s): return int(s.iloc[0])
+        v = getattr(df, "attrs", {}).get("race_distance_m")
+        if v: 
+            try: return int(float(v))
+            except: pass
     return 1600
 
-def _resolve_col(df: pd.DataFrame, prefs) -> Optional[str]:
-    return next((c for c in prefs if c in df.columns), None)
-
-def _nz(x, alt=np.nan):
-    try:
-        v = float(x)
-        return v if np.isfinite(v) else alt
-    except Exception:
-        return alt
-
-def _scale100_to_0_1(v):
-    """Map index values ~100± to 0–1 band; clip for neat progress bars."""
-    if v is None or not np.isfinite(v):
-        return np.nan
-    return float(np.clip(v / 100.0, 0.0, 1.6))  # allow a bit above 1 for standout runs
-
-def _f200_weight(distance_m: int) -> float:
-    """Kiran's taper: 1200:0.20, 1400:0.15, 1600:0.10, then steadily down."""
-    d = int(distance_m)
+def _f200_weight(d):
+    d = int(d)
     if d <= 1200: return 0.20
     if d <= 1400: return 0.15
     if d <= 1600: return 0.10
     if d <= 1800: return 0.08
     if d <= 2000: return 0.06
     if d <= 2200: return 0.05
-    return 0.04  # 2400m+
+    return 0.04
 
-def _remaining_weights(f200_w: float) -> Dict[str, float]:
-    """Distribute the remainder across Accel, Late, Grind (balanced, race-agnostic)."""
-    # Base proportions favouring finishing ability: Accel:Late:Grind = 0.35:0.30:0.35
-    rem = max(0.0, 1.0 - f200_w)
-    a, l, g = 0.35, 0.30, 0.35
-    s = a + l + g
-    return {"accel": rem * a / s, "late": rem * l / s, "grind": rem * g / s}
+def _rest(wf):
+    rem = max(0.0, 1.0 - wf)
+    a,l,g = 0.35,0.30,0.35
+    s=a+l+g
+    return {"accel":rem*a/s, "late":rem*l/s, "grind":rem*g/s}
 
-def _bar(label: str, frac: float):
-    """Neat single-line bar using HTML — scales cleanly in Streamlit."""
-    if not np.isfinite(frac):
-        frac = 0.0
-    pct = max(0.0, min(frac, 1.2))  # visual cap at 120%
-    bg = "#2a2a2a"
-    fg = "#4c8bf5"  # Streamlit default-ish; theme will still harmonize
-    st.markdown(
-        f"""
-        <div style="margin:2px 0 6px 0;">
-          <div style="display:flex;justify-content:space-between;font-size:0.84rem;">
-            <span>{label}</span><span>{frac*100:.1f}</span>
-          </div>
-          <div style="background:{bg};height:8px;border-radius:6px;overflow:hidden;">
-            <div style="width:{pct*100:.1f}%;height:100%;background:{fg};"></div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+def _safe100_to01(v):
+    try:
+        v=float(v); 
+        if not np.isfinite(v): return np.nan
+        return float(np.clip(v/100.0, 0.0, 1.6))
+    except: return np.nan
 
-def _nice(val: float) -> str:
-    return f"{val:.2f}" if np.isfinite(val) else "—"
+def _nice(x): 
+    return f"{x:.2f}" if x is not None and np.isfinite(x) else "—"
 
-# ------------- Main render -------------
+def _hue_for_val(idx100):
+    """Color: <98 cool, ~100 neutral, >104 warm. Returns CSS hsl()."""
+    try: 
+        v=float(idx100)
+    except: 
+        return "hsl(215, 10%, 60%)"
+    # map 92..110 → 220..0 hue (blue→red), clamp
+    v = np.clip(v, 92, 110)
+    t = (v-92)/(110-92)
+    hue = 220*(1-t)  # 220→0
+    sat = 70
+    lum = 50
+    return f"hsl({hue:.0f}, {sat}%, {lum}%)"
+
+# ---------- render ----------
 st.markdown("## Winning DNA Matrix")
 
 wd = _resolve_df()
-if wd is None:
+if not _is_df(wd):
     st.warning("⚠️ Couldn’t find the metrics dataframe — skipping Winning DNA Matrix.")
 else:
-    # Core columns
-    horse_col = _resolve_col(wd, ["Horse", "Runner", "Name", "HorseName"])
-    finish_col = _resolve_col(wd, ["Finish_Pos", "FinishPos", "Placing", "Pos"])
-    f200_col  = _resolve_col(wd, ["F200_idx", "F200", "F200Idx", "F200_idx_norm"])
-    accel_col = _resolve_col(wd, ["Accel", "Accel_idx", "ACCEL_idx"])
-    late_col  = _resolve_col(wd, ["LATE_idx", "Late_idx", "Late", "LATE"])
-    grind_col = _resolve_col(wd, ["Grind_CG", "GrindCorrected", "GrindAdj", "Grind_Corr", "Grind", "Grind_idx"])
+    # columns
+    horse = _resolve_col(wd, ["Horse","Runner","Name","HorseName"])
+    fin   = _resolve_col(wd, ["Finish_Pos","FinishPos","Placing","Pos"])
+    f200  = _resolve_col(wd, ["F200_idx","F200","F200Idx","F200_idx_norm"])
+    accel = _resolve_col(wd, ["Accel","Accel_idx","ACCEL_idx"])
+    late  = _resolve_col(wd, ["LATE_idx","Late_idx","Late","LATE"])
+    grind = _resolve_col(wd, ["Grind_CG","GrindCorrected","GrindAdj","Grind_Corr","Grind","Grind_idx"])
+    sos   = _resolve_col(wd, ["SOS","sos","ShapeSOS","SetupStrength","SignalSOS"])
 
-    # Respect a sidebar toggle if you use one (optional)
     use_cg = st.session_state.get("use_corrected_grind", True)
-    if use_cg and "Grind_CG" in wd.columns:
-        grind_col = "Grind_CG"
+    if use_cg and "Grind_CG" in wd.columns: grind = "Grind_CG"
 
-    missing = [cname for cname, label in [
-        (horse_col, "Horse"), (f200_col, "F200"), (accel_col, "Accel"),
-        (late_col, "Late"), (grind_col, "Grind/Grind_CG")
-    ] if cname is None]
+    missing = [lbl for lbl, c in [("Horse",horse),("F200",f200),("Accel",accel),("Late",late),("Grind",grind)] if c is None]
     if missing:
-        st.warning("⚠️ Winning DNA Matrix needs columns: " + ", ".join(missing) + ".")
+        st.warning("⚠️ Winning DNA Matrix needs: " + ", ".join(missing) + ".")
     else:
-        # Compute score per runner
         d_m = _get_distance_m(wd)
-        w_f = _f200_weight(d_m)
-        rest = _remaining_weights(w_f)
+        wf  = _f200_weight(d_m)
+        W   = _rest(wf)
 
-        df = wd[[horse_col, finish_col, f200_col, accel_col, late_col, grind_col]].copy()
-        df.rename(columns={
-            horse_col: "Horse",
-            finish_col: "Finish_Pos",
-            f200_col:  "F200",
-            accel_col: "Accel",
-            late_col:  "Late",
-            grind_col: "Grind"
-        }, inplace=True)
+        df = wd[[horse, fin, f200, accel, late, grind] + ([sos] if sos else [])].copy()
+        df.columns = ["Horse","Finish_Pos","F200","Accel","Late","Grind"] + (["SOS"] if sos else [])
 
-        # Normalize indices to ~0–1 scale (100 = 1.00)
-        for c in ["F200", "Accel", "Late", "Grind"]:
-            df[c+"_n"] = df[c].apply(_nz).apply(_scale100_to_0_1)
+        for c in ["F200","Accel","Late","Grind"]:
+            df[c+"_n"] = df[c].apply(_safe100_to01)
 
-        # Final composite
-        df["WDM_Score"] = (
-            w_f        * df["F200_n"] +
-            rest["accel"] * df["Accel_n"] +
-            rest["late"]  * df["Late_n"] +
-            rest["grind"] * df["Grind_n"]
-        )
-
-        # Order by score (tie-break with Finish_Pos if present)
-        if "Finish_Pos" in df.columns:
+        df["WDM_Score"] = wf*df["F200_n"] + W["accel"]*df["Accel_n"] + W["late"]*df["Late_n"] + W["grind"]*df["Grind_n"]
+        if "Finish_Pos" in df:
             df["_fp"] = pd.to_numeric(df["Finish_Pos"], errors="coerce")
-            df.sort_values(by=["WDM_Score", "_fp"], ascending=[False, True], inplace=True)
+            df = df.sort_values(["WDM_Score","_fp"], ascending=[False,True])
         else:
-            df.sort_values(by=["WDM_Score"], ascending=False, inplace=True)
+            df = df.sort_values("WDM_Score", ascending=False)
 
-        top = df.head(6).reset_index(drop=True)
+        top = df.head(12).reset_index(drop=True)
 
-        # Header note
+        # legend / weights
         st.caption(
-            f"Top-6 by Winning DNA Score • Distance: **{d_m}m** • Weights → "
-            f"F200: **{w_f:.2f}**, Accel: **{rest['accel']:.2f}**, Late: **{rest['late']:.2f}**, Grind: **{rest['grind']:.2f}**"
+            f"Top-12 by Winning DNA Score • Distance **{d_m}m** • Weights → "
+            f"F200 **{wf:.2f}**, Accel **{W['accel']:.2f}**, Late **{W['late']:.2f}**, Grind **{W['grind']:.2f}** "
+            "• Bar color: below-par → blue, baseline ~100 → neutral, standout → warm."
         )
 
-        # Render 3 cards per row × 2 rows
-        rows = math.ceil(len(top) / 3)
-        for r in range(rows):
-            cols = st.columns(3)
-            for j in range(3):
-                i = r*3 + j
-                if i >= len(top): break
-                row = top.iloc[i]
-                with cols[j]:
-                    st.markdown(
-                        f"""
-                        <div style="border:1px solid rgba(255,255,255,0.08);
-                                   border-radius:10px;padding:12px 12px 8px 12px;margin-bottom:10px;">
-                          <div style="display:flex;justify-content:space-between;align-items:center;">
-                            <div style="font-weight:700;font-size:1.05rem;">{row['Horse']}</div>
-                            <div style="opacity:0.8;">Pos: {row.get('Finish_Pos', '—')}</div>
-                          </div>
-                          <div style="opacity:0.8;font-size:0.85rem;margin-top:2px;">
-                            WDM Score: <strong>{_nice(row['WDM_Score']*100)}</strong>
-                          </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-                    _bar("F200", row["F200_n"])
-                    _bar("Accel", row["Accel_n"])
-                    _bar("Late", row["Late_n"])
-                    _bar("Grind", row["Grind_n"])
-# ========================= End Winning DNA Matrix — Drop-in =========================
+        # responsive grid styles
+        st.markdown("""
+            <style>
+            .wdm-grid {
+              display: grid;
+              grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+              gap: 14px;
+            }
+            .wdm-card {
+              border: 1px solid rgba(255,255,255,0.08);
+              border-radius: 12px;
+              padding: 12px 12px 10px 12px;
+            }
+            .wdm-head { display:flex; justify-content:space-between; align-items:center; }
+            .wdm-title { font-weight:700; font-size:1.02rem; }
+            .wdm-pos { opacity:0.8; }
+            .wdm-sub { opacity:0.85; font-size:0.86rem; margin-top:2px; }
+            .wdm-pill {
+              display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.78rem; margin-left:6px;
+              background:rgba(255,255,255,0.08);
+            }
+            .wdm-barwrap { background:rgba(255,255,255,0.08); height:8px; border-radius:6px; overflow:hidden; }
+            .wdm-row { margin:8px 0 10px 0; }
+            .wdm-lab { display:flex; justify-content:space-between; font-size:0.84rem; }
+            </style>
+        """, unsafe_allow_html=True)
+
+        def render_bar(name, idx100):
+            frac = _safe100_to01(idx100)
+            pct  = 100.0*max(0.0, min(frac, 1.25))
+            color = _hue_for_val(idx100)
+            st.markdown(
+                f"""
+                <div class="wdm-row">
+                  <div class="wdm-lab"><span>{name}</span><span>{_nice(idx100)}</span></div>
+                  <div class="wdm-barwrap">
+                    <div style="width:{pct:.1f}%;height:100%;background:{color};"></div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        # GRID
+        st.markdown('<div class="wdm-grid">', unsafe_allow_html=True)
+        for _, r in top.iterrows():
+            sos_html = ""
+            if "SOS" in r and pd.notna(r["SOS"]):
+                sos_html = f'<span class="wdm-pill">SOS: {_nice(float(r["SOS"]))}</span>'
+            st.markdown(
+                f"""
+                <div class="wdm-card">
+                  <div class="wdm-head">
+                    <div class="wdm-title">{r['Horse']}</div>
+                    <div class="wdm-pos">Pos: {r.get('Finish_Pos','—')}</div>
+                  </div>
+                  <div class="wdm-sub">
+                    WDM Score: <strong>{_nice(float(r['WDM_Score']*100))}</strong>
+                    {sos_html}
+                  </div>
+                """,
+                unsafe_allow_html=True
+            )
+            render_bar("F200", r["F200"])
+            render_bar("Accel", r["Accel"])
+            render_bar("Late",  r["Late"])
+            render_bar("Grind", r["Grind"])
+            st.markdown("</div>", unsafe_allow_html=True)  # close card
+        st.markdown("</div>", unsafe_allow_html=True)       # close grid
+# ===================== /Winning DNA Matrix — Visual Top-12 (Drop-in) =====================
     
         # ======================= Hidden Horses (v2, shape-aware) =======================
 st.markdown("## Hidden Horses v2 (Shape-aware)")
