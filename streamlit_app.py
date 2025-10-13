@@ -2924,12 +2924,15 @@ def build_race_pdf(metrics,
                 continue
             try:
                 img = Image(io.BytesIO(images[key]))
-                # fit width nicely
-                img.drawWidth = 170*mm
-                img.drawHeight = img.drawHeight * (img.drawWidth / img.drawWidth)  # keep aspect (ReportLab handles)
+                # ✅ scale dynamically to fit A4 height (~250 mm usable)
+                max_w, max_h = 170*mm, 120*mm
+                img.drawWidth = min(img.imageWidth, max_w)
+                ratio = img.drawWidth / float(img.imageWidth)
+                img.drawHeight = min(img.imageHeight * ratio, max_h)
+
                 story.append(Paragraph(label, H3))
                 story.append(img)
-                story.append(Spacer(1, 6))
+                story.append(PageBreak())
             except Exception:
                 # skip bad image
                 pass
