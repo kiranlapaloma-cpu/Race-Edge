@@ -1862,13 +1862,13 @@ try:
 except NameError:
     ability_png = None
 
-if "AM" not in locals() or AM is None or not isinstance(AM, pd.DataFrame):
-    st.info("Ability Matrix skipped — no AM dataset available.")
-else:
-    need_cols_am = {"Horse","IAI","HiddenScore_v3"}
-    if not need_cols_am.issubset(AM.columns):
-        st.info("Ability Matrix: missing required columns.")
+    if "AM" not in locals() or AM is None or not isinstance(AM, pd.DataFrame):
+        st.info("Ability Matrix skipped — no AM dataset available.")
     else:
+        need_cols_am = {"Horse","IAI","HiddenScore_v3"}
+        if not need_cols_am.issubset(AM.columns):
+            st.info("Ability Matrix: missing required columns.")
+        else:
         # continue with your plotting logic
 else:
     plot_df = AM.dropna(subset=["IAI","HiddenScore","PI","BAL"]).copy()
