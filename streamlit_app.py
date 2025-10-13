@@ -1684,183 +1684,219 @@ else:
                            file_name="pace_curve.png", mime="image/png")
         st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 
-# =============== Winning DNA Matrix — Report Card (DROP-IN) ===============
+# =========================== Winning DNA Matrix — Drop-in ===========================
+# Safe, standalone render of a neat Top-6 "report card" based on F200/Accel/Late/Grind.
+# - Automatically resolves your metrics dataframe and column names.
+# - Prefers Grind_CG when present; falls back to Grind.
+# - Applies Kiran's distance-based F200 weighting:
+#     1200m=0.20, 1400m=0.15, 1600m=0.10, 1800m=0.08, 2000m=0.06, 2200m=0.05, >2200m=0.04
+# - Renders clean 6 cards (3 per row × 2), scaled to container width.
 
-st.markdown("## Winning DNA Matrix")
+import math
+from typing import Optional, Dict, Any
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-# ---------- Safe grind column resolver ----------
-gr_col = None
-for cand in ["Grind_CG", "Grind", "GrindIdx", "Grind_idx"]:
-    if cand in WD.columns:
-        gr_col = cand
-        break
-# ---- Auto-detect grind column safely ----
-if "metrics" in globals() and hasattr(metrics, "attrs"):
-    gr_col = metrics.attrs.get("GR_COL", None)
-else:
-    gr_col = None
+# ------------- Helpers -------------
+def _is_df(x):
+    return isinstance(x, pd.DataFrame) and len(getattr(x, "columns", [])) > 0
 
-# fallback options in case GR_COL not set
-if not gr_col or gr_col not in WD.columns:
-    for cand in ["Grind_CG", "Grind", "GrindAdj", "GrindCorrected"]:
-        if cand in WD.columns:
-            gr_col = cand
-            break
+def _resolve_df() -> Optional[pd.DataFrame]:
+    """Find the working metrics dataframe by scanning common globals."""
+    candidates = ["WD", "WDM", "METRICS", "metrics", "SECT", "sectionals", "SM", "df", "DATA"]
+    for name in candidates:
+        if name in globals() and _is_df(globals()[name]):
+            return globals()[name]
+    return None
 
-# if still missing, just log a gentle message and skip gracefully
-if gr_col not in WD.columns:
-    st.warning("Winning DNA: no grind column found in WD (expected 'Grind_CG' or 'Grind').")
-    st.stop()
+def _get_distance_m(df: Optional[pd.DataFrame]) -> int:
+    """Try to detect race distance from session_state, globals, or df attrs/columns."""
+    # From session_state toggles/inputs (use the most common keys)
+    for k in ["race_distance_m", "race_distance", "RaceDistance_m", "Distance_m"]:
+        v = st.session_state.get(k)
+        if v is not None:
+            try:
+                return int(float(v))
+            except Exception:
+                pass
+    # From dataframe columns/attrs
+    if df is not None:
+        for k in ["RaceDistance_m", "Distance_m", "Distance", "distance_m"]:
+            if k in df.columns:
+                try:
+                    val = pd.to_numeric(df[k]).dropna()
+                    if len(val):
+                        return int(val.iloc[0])
+                except Exception:
+                    pass
+        # attrs hook if you attached meta
+        dist_attr = getattr(df, "attrs", {}).get("race_distance_m")
+        if dist_attr:
+            try:
+                return int(float(dist_attr))
+            except Exception:
+                pass
+    # Fallback
+    return 1600
 
-# ---- (A) Weights (uses your W if present; else distance-aware defaults) ---
-def _ez_weight_from_distance(d_m: float) -> float:
-    # 1200→0.20, 1400→0.15, 1600→0.10, 1800→0.07, 2000→0.05, 2400+→0.03 (linear steps)
-    d = float(d_m or 1400)
+def _resolve_col(df: pd.DataFrame, prefs) -> Optional[str]:
+    return next((c for c in prefs if c in df.columns), None)
+
+def _nz(x, alt=np.nan):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else alt
+    except Exception:
+        return alt
+
+def _scale100_to_0_1(v):
+    """Map index values ~100± to 0–1 band; clip for neat progress bars."""
+    if v is None or not np.isfinite(v):
+        return np.nan
+    return float(np.clip(v / 100.0, 0.0, 1.6))  # allow a bit above 1 for standout runs
+
+def _f200_weight(distance_m: int) -> float:
+    """Kiran's taper: 1200:0.20, 1400:0.15, 1600:0.10, then steadily down."""
+    d = int(distance_m)
     if d <= 1200: return 0.20
     if d <= 1400: return 0.15
     if d <= 1600: return 0.10
-    if d <= 1800: return 0.07
-    if d <= 2000: return 0.05
-    return 0.03
+    if d <= 1800: return 0.08
+    if d <= 2000: return 0.06
+    if d <= 2200: return 0.05
+    return 0.04  # 2400m+
 
-if "W" in globals() and isinstance(W, dict) and all(k in W for k in ["EZ","MC","LP","LL","SOS"]):
-    weights = dict(W)  # respect caller’s weights
+def _remaining_weights(f200_w: float) -> Dict[str, float]:
+    """Distribute the remainder across Accel, Late, Grind (balanced, race-agnostic)."""
+    # Base proportions favouring finishing ability: Accel:Late:Grind = 0.35:0.30:0.35
+    rem = max(0.0, 1.0 - f200_w)
+    a, l, g = 0.35, 0.30, 0.35
+    s = a + l + g
+    return {"accel": rem * a / s, "late": rem * l / s, "grind": rem * g / s}
+
+def _bar(label: str, frac: float):
+    """Neat single-line bar using HTML — scales cleanly in Streamlit."""
+    if not np.isfinite(frac):
+        frac = 0.0
+    pct = max(0.0, min(frac, 1.2))  # visual cap at 120%
+    bg = "#2a2a2a"
+    fg = "#4c8bf5"  # Streamlit default-ish; theme will still harmonize
+    st.markdown(
+        f"""
+        <div style="margin:2px 0 6px 0;">
+          <div style="display:flex;justify-content:space-between;font-size:0.84rem;">
+            <span>{label}</span><span>{frac*100:.1f}</span>
+          </div>
+          <div style="background:{bg};height:8px;border-radius:6px;overflow:hidden;">
+            <div style="width:{pct*100:.1f}%;height:100%;background:{fg};"></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def _nice(val: float) -> str:
+    return f"{val:.2f}" if np.isfinite(val) else "—"
+
+# ------------- Main render -------------
+st.markdown("## Winning DNA Matrix")
+
+wd = _resolve_df()
+if wd is None:
+    st.warning("⚠️ Couldn’t find the metrics dataframe — skipping Winning DNA Matrix.")
 else:
-    base = {"MC": 0.22, "LP": 0.25, "LL": 0.18, "SOS": 0.15}  # your earlier split
-    ez = _ez_weight_from_distance(globals().get("race_distance_input", 1400))
-    # spread the remainder proportionally across MC/LP/LL/SOS
-    rem = max(0.0, 1.0 - ez)
-    scale = rem / sum(base.values())
-    weights = {"EZ": ez, **{k: v*scale for k, v in base.items()}}
+    # Core columns
+    horse_col = _resolve_col(wd, ["Horse", "Runner", "Name", "HorseName"])
+    finish_col = _resolve_col(wd, ["Finish_Pos", "FinishPos", "Placing", "Pos"])
+    f200_col  = _resolve_col(wd, ["F200_idx", "F200", "F200Idx", "F200_idx_norm"])
+    accel_col = _resolve_col(wd, ["Accel", "Accel_idx", "ACCEL_idx"])
+    late_col  = _resolve_col(wd, ["LATE_idx", "Late_idx", "Late", "LATE"])
+    grind_col = _resolve_col(wd, ["Grind_CG", "GrindCorrected", "GrindAdj", "Grind_Corr", "Grind", "Grind_idx"])
 
-W = weights  # keep for captions
+    # Respect a sidebar toggle if you use one (optional)
+    use_cg = st.session_state.get("use_corrected_grind", True)
+    if use_cg and "Grind_CG" in wd.columns:
+        grind_col = "Grind_CG"
 
-# ---- (B) Build/ensure pillars --------------------------------------------
-need_cols = ["Horse", "F200_idx", "tsSPI", "Accel", gr_col]
-missing = [c for c in need_cols if c not in WD.columns]
-if missing:
-    st.info(f"Winning DNA: missing columns {missing}; cannot render.")
-else:
-    X = WD.copy()
-    for c in ["F200_idx", "tsSPI", "Accel", gr_col]:
-        X[c] = pd.to_numeric(X[c], errors="coerce")
-
-    # SOS01 fallback if not provided: robust blend → 0..1 via q5–q95
-    if "SOS01" not in X.columns:
-        def _winsor(s):
-            q1, q99 = np.nanpercentile(s.dropna(), [1,99]) if s.notna().any() else (s.median(), s.median())
-            return s.clip(q1, q99)
-        ts_w = _winsor(X["tsSPI"]); ac_w = _winsor(X["Accel"]); gr_w = _winsor(X[gr_col])
-        def _rz(s):
-            mu, mad = np.nanmedian(s), np.nanmedian(np.abs(s - np.nanmedian(s)))
-            sd = 1.4826*mad if mad > 0 else 1.0
-            return (s - mu) / sd
-        sos_raw = 0.45*_rz(ts_w) + 0.35*_rz(ac_w) + 0.20*_rz(gr_w)
-        q5, q95 = np.nanpercentile(sos_raw.dropna(), [5,95]) if sos_raw.notna().any() else (0,1)
-        denom = max(q95 - q5, 1e-6)
-        X["SOS01"] = ((sos_raw - q5) / denom).clip(0, 1)
+    missing = [cname for cname, label in [
+        (horse_col, "Horse"), (f200_col, "F200"), (accel_col, "Accel"),
+        (late_col, "Late"), (grind_col, "Grind/Grind_CG")
+    ] if cname is None]
+    if missing:
+        st.warning("⚠️ Winning DNA Matrix needs columns: " + ", ".join(missing) + ".")
     else:
-        X["SOS01"] = pd.to_numeric(X["SOS01"], errors="coerce").clip(0, 1)
+        # Compute score per runner
+        d_m = _get_distance_m(wd)
+        w_f = _f200_weight(d_m)
+        rest = _remaining_weights(w_f)
 
-    # ---- (C) Field-relative scaling (q10–q90 → 0..1) ----------------------
-    def _rescale_q(s: pd.Series) -> pd.Series:
-        s = pd.to_numeric(s, errors="coerce")
-        if not s.notna().any(): return s*0
-        q10, q90 = np.nanpercentile(s.dropna(), [10, 90])
-        rng = max(q90 - q10, 1e-6)
-        return ((s - q10) / rng).clip(0, 1)
+        df = wd[[horse_col, finish_col, f200_col, accel_col, late_col, grind_col]].copy()
+        df.rename(columns={
+            horse_col: "Horse",
+            finish_col: "Finish_Pos",
+            f200_col:  "F200",
+            accel_col: "Accel",
+            late_col:  "Late",
+            grind_col: "Grind"
+        }, inplace=True)
 
-    X["EZ01"]  = _rescale_q(X["F200_idx"])
-    X["MC01"]  = _rescale_q(X["tsSPI"])
-    X["LP01"]  = _rescale_q(X["Accel"])
-    X["LL01"]  = _rescale_q(X[gr_col])
-    # SOS already 0..1; small reframe to match spread
-    X["SOS01"] = _rescale_q(X["SOS01"])
+        # Normalize indices to ~0–1 scale (100 = 1.00)
+        for c in ["F200", "Accel", "Late", "Grind"]:
+            df[c+"_n"] = df[c].apply(_nz).apply(_scale100_to_0_1)
 
-    # ---- (D) DNA score (0..10) & grades ----------------------------------
-    X["WinningDNA"] = 10.0 * (
-        W["EZ"]  * X["EZ01"].fillna(0.0)  +
-        W["MC"]  * X["MC01"].fillna(0.0)  +
-        W["LP"]  * X["LP01"].fillna(0.0)  +
-        W["LL"]  * X["LL01"].fillna(0.0)  +
-        W["SOS"] * X["SOS01"].fillna(0.0)
-    )
-    X["WinningDNA"] = X["WinningDNA"].clip(0, 10).round(2)
+        # Final composite
+        df["WDM_Score"] = (
+            w_f        * df["F200_n"] +
+            rest["accel"] * df["Accel_n"] +
+            rest["late"]  * df["Late_n"] +
+            rest["grind"] * df["Grind_n"]
+        )
 
-    def _grade(x: float) -> str:
-        if x >= 9.2: return "A+"
-        if x >= 8.6: return "A"
-        if x >= 8.0: return "A-"
-        if x >= 7.4: return "B+"
-        if x >= 6.8: return "B"
-        if x >= 6.2: return "B-"
-        if x >= 5.6: return "C+"
-        if x >= 5.0: return "C"
-        if x >= 4.4: return "C-"
-        return "D"
-    X["Grade"] = X["WinningDNA"].apply(_grade)
+        # Order by score (tie-break with Finish_Pos if present)
+        if "Finish_Pos" in df.columns:
+            df["_fp"] = pd.to_numeric(df["Finish_Pos"], errors="coerce")
+            df.sort_values(by=["WDM_Score", "_fp"], ascending=[False, True], inplace=True)
+        else:
+            df.sort_values(by=["WDM_Score"], ascending=False, inplace=True)
 
-    # Top traits (two best pillars per horse)
-    def _badges(r):
-        parts = {
-            "Early Zip": r["EZ01"],
-            "Mid Control": r["MC01"],
-            "Late Punch": r["LP01"],
-            "Lasting Lift": r["LL01"],
-            "Orchestration": r["SOS01"],
-        }
-        top2 = sorted(parts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)[:2]
-        return " · ".join([k for k,_ in top2])
-    X["DNA_TopTraits"] = X.apply(_badges, axis=1)
+        top = df.head(6).reset_index(drop=True)
 
-    # ---- (E) Table with progress columns ----------------------------------
-    from streamlit import column_config as cc
+        # Header note
+        st.caption(
+            f"Top-6 by Winning DNA Score • Distance: **{d_m}m** • Weights → "
+            f"F200: **{w_f:.2f}**, Accel: **{rest['accel']:.2f}**, Late: **{rest['late']:.2f}**, Grind: **{rest['grind']:.2f}**"
+        )
 
-    X["DNA_10"] = X["WinningDNA"]
-    X["EZ_p"]   = X["EZ01"].fillna(0.0)
-    X["MC_p"]   = X["MC01"].fillna(0.0)
-    X["LP_p"]   = X["LP01"].fillna(0.0)
-    X["LL_p"]   = X["LL01"].fillna(0.0)
-    X["SOS_p"]  = X["SOS01"].fillna(0.0)
-
-    table_cols = ["Horse","Grade","DNA_10","EZ_p","MC_p","LP_p","LL_p","SOS_p","DNA_TopTraits"]
-    view = X.sort_values(["DNA_10","LP_p","MC_p"], ascending=[False, False, False])[table_cols]
-
-    st.dataframe(
-        view,
-        use_container_width=True,
-        column_config={
-            "DNA_10": cc.ProgressColumn("Winning DNA", help="0–10", min_value=0, max_value=10, format="%.2f"),
-            "EZ_p":   cc.ProgressColumn("Early Zip (F200)",     min_value=0.0, max_value=1.0, format="%.0f%%"),
-            "MC_p":   cc.ProgressColumn("Mid Control (tsSPI)",  min_value=0.0, max_value=1.0, format="%.0f%%"),
-            "LP_p":   cc.ProgressColumn("Late Punch (Accel)",   min_value=0.0, max_value=1.0, format="%.0f%%"),
-            "LL_p":   cc.ProgressColumn("Lasting Lift (Grind)", min_value=0.0, max_value=1.0, format="%.0f%%"),
-            "SOS_p":  cc.ProgressColumn("Orchestration (SOS)",  min_value=0.0, max_value=1.0, format="%.0f%%"),
-            "DNA_TopTraits": cc.TextColumn("Badges")
-        },
-        hide_index=True
-    )
-
-    # ---- (F) Top-6 report cards -------------------------------------------
-    st.markdown("### Report Cards (Top 6)")
-    topN = X.sort_values("DNA_10", ascending=False).head(6)
-    for i, (_, r) in enumerate(topN.iterrows(), start=1):
-        c1, c2 = st.columns([3, 5])
-        with c1:
-            st.markdown(f"**{i}. {r['Horse']}**")
-            st.metric("Winning DNA", f"{r['DNA_10']:.2f}/10")
-            st.write(f"**Grade:** {r['Grade']}  \n**Badges:** {r['DNA_TopTraits'] or '—'}")
-        with c2:
-            st.progress(float(r["EZ_p"]));  st.caption("Early Zip (F200)")
-            st.progress(float(r["MC_p"]));  st.caption("Mid Control (tsSPI)")
-            st.progress(float(r["LP_p"]));  st.caption("Late Punch (Accel)")
-            st.progress(float(r["LL_p"]));  st.caption("Lasting Lift (Grind)")
-            st.progress(float(r["SOS_p"])); st.caption("Orchestration (SOS)")
-
-    # ---- (G) Footnote ------------------------------------------------------
-    w_note = ", ".join([f"{k} {W[k]:.2f}" for k in ["EZ","MC","LP","LL","SOS"]])
-    st.caption(f"Field-relative scaling (q10–q90) applied. Final weights: {w_note}.")
-# =========================== /Winning DNA ==================================
+        # Render 3 cards per row × 2 rows
+        rows = math.ceil(len(top) / 3)
+        for r in range(rows):
+            cols = st.columns(3)
+            for j in range(3):
+                i = r*3 + j
+                if i >= len(top): break
+                row = top.iloc[i]
+                with cols[j]:
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid rgba(255,255,255,0.08);
+                                   border-radius:10px;padding:12px 12px 8px 12px;margin-bottom:10px;">
+                          <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <div style="font-weight:700;font-size:1.05rem;">{row['Horse']}</div>
+                            <div style="opacity:0.8;">Pos: {row.get('Finish_Pos', '—')}</div>
+                          </div>
+                          <div style="opacity:0.8;font-size:0.85rem;margin-top:2px;">
+                            WDM Score: <strong>{_nice(row['WDM_Score']*100)}</strong>
+                          </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                    _bar("F200", row["F200_n"])
+                    _bar("Accel", row["Accel_n"])
+                    _bar("Late", row["Late_n"])
+                    _bar("Grind", row["Grind_n"])
+# ========================= End Winning DNA Matrix — Drop-in =========================
     
         # ======================= Hidden Horses (v2, shape-aware) =======================
 st.markdown("## Hidden Horses v2 (Shape-aware)")
