@@ -1688,6 +1688,12 @@ else:
 
 st.markdown("## Winning DNA Matrix")
 
+# ---------- Safe grind column resolver ----------
+gr_col = None
+for cand in ["Grind_CG", "Grind", "GrindIdx", "Grind_idx"]:
+    if cand in WD.columns:
+        gr_col = cand
+        break
 # ---- Auto-detect grind column safely ----
 if "metrics" in globals() and hasattr(metrics, "attrs"):
     gr_col = metrics.attrs.get("GR_COL", None)
