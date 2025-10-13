@@ -1582,8 +1582,8 @@ else:
         st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
         st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
 
-# ======================= Pace Curve — field average (black) + Top 8 finishers =======================
-st.markdown("## Pace Curve — field average (black) + Top 8 finishers")
+# ======================= Pace Curve — field average (black) + Top 10 finishers =======================
+st.markdown("## Pace Curve — field average (black) + Top 10 finishers")
 pace_png = None
 
 step = int(metrics.attrs.get("STEP", 100))
@@ -1633,11 +1633,11 @@ else:
     else:
         # Choose which horses to plot
         if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
-            top8 = metrics.sort_values("Finish_Pos").head(8)
-            top8_rule = "Top-8 by Finish_Pos"
+            top10 = metrics.sort_values("Finish_Pos").head(10)
+            top10_rule = "Top-10 by Finish_Pos"
         else:
-            top8 = metrics.sort_values("PI", ascending=False).head(8)
-            top8_rule = "Top-8 by PI"
+            top10 = metrics.sort_values("PI", ascending=False).head(10)
+            top10_rule = "Top-10 by PI"
 
         # X axis
         x_idx    = list(range(len(segs)))
@@ -1682,7 +1682,7 @@ else:
         pace_png = buf.getvalue()
         st.download_button("Download pace curve (PNG)", pace_png,
                            file_name="pace_curve.png", mime="image/png")
-        st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
+        st.caption(f"Top-10 plotted: {top10_rule}. Finish segment included explicitly.")
 
 # ======================= Winning DNA Matrix — distance-aware & report cards =======================
 st.markdown("## Winning DNA Matrix")
