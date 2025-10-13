@@ -1684,199 +1684,196 @@ else:
                            file_name="pace_curve.png", mime="image/png")
         st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 
-# ======================= Winning DNA Matrix — Visual Top-12 (Drop-in) =======================
-# Responsive grid cards with value-coded bars, SOS pill, Top-12. Prefers Grind_CG.
-
-import math
-from typing import Optional
-import numpy as np
-import pandas as pd
-import streamlit as st
-
-# ---------- small helpers ----------
-def _is_df(x): return isinstance(x, pd.DataFrame) and len(getattr(x, "columns", [])) > 0
-def _resolve_df() -> Optional[pd.DataFrame]:
-    for name in ["WD","WDM","METRICS","metrics","SECT","sectionals","SM","df","DATA"]:
-        if name in globals() and _is_df(globals()[name]): return globals()[name]
-    return None
-
-def _resolve_col(df, prefs): return next((c for c in prefs if c in df.columns), None)
-
-def _get_distance_m(df: Optional[pd.DataFrame]) -> int:
-    for k in ["race_distance_m","race_distance","RaceDistance_m","Distance_m"]:
-        if k in st.session_state:
-            try: return int(float(st.session_state[k]))
-            except: pass
-    if df is not None:
-        for k in ["RaceDistance_m","Distance_m","Distance","distance_m"]:
-            if k in df.columns:
-                s = pd.to_numeric(df[k], errors="coerce").dropna()
-                if len(s): return int(s.iloc[0])
-        v = getattr(df, "attrs", {}).get("race_distance_m")
-        if v: 
-            try: return int(float(v))
-            except: pass
-    return 1600
-
-def _f200_weight(d):
-    d = int(d)
-    if d <= 1200: return 0.20
-    if d <= 1400: return 0.15
-    if d <= 1600: return 0.10
-    if d <= 1800: return 0.08
-    if d <= 2000: return 0.06
-    if d <= 2200: return 0.05
-    return 0.04
-
-def _rest(wf):
-    rem = max(0.0, 1.0 - wf)
-    a,l,g = 0.35,0.30,0.35
-    s=a+l+g
-    return {"accel":rem*a/s, "late":rem*l/s, "grind":rem*g/s}
-
-def _safe100_to01(v):
-    try:
-        v=float(v); 
-        if not np.isfinite(v): return np.nan
-        return float(np.clip(v/100.0, 0.0, 1.6))
-    except: return np.nan
-
-def _nice(x): 
-    return f"{x:.2f}" if x is not None and np.isfinite(x) else "—"
-
-def _hue_for_val(idx100):
-    """Color: <98 cool, ~100 neutral, >104 warm. Returns CSS hsl()."""
-    try: 
-        v=float(idx100)
-    except: 
-        return "hsl(215, 10%, 60%)"
-    # map 92..110 → 220..0 hue (blue→red), clamp
-    v = np.clip(v, 92, 110)
-    t = (v-92)/(110-92)
-    hue = 220*(1-t)  # 220→0
-    sat = 70
-    lum = 50
-    return f"hsl({hue:.0f}, {sat}%, {lum}%)"
-
-# ---------- render ----------
+# ======================= Winning DNA Matrix — distance-aware (EZ/MC/LP/LL + SOS) =======================
 st.markdown("## Winning DNA Matrix")
 
-wd = _resolve_df()
-if not _is_df(wd):
-    st.warning("⚠️ Couldn’t find the metrics dataframe — skipping Winning DNA Matrix.")
-else:
-    # columns
-    horse = _resolve_col(wd, ["Horse","Runner","Name","HorseName"])
-    fin   = _resolve_col(wd, ["Finish_Pos","FinishPos","Placing","Pos"])
-    f200  = _resolve_col(wd, ["F200_idx","F200","F200Idx","F200_idx_norm"])
-    accel = _resolve_col(wd, ["Accel","Accel_idx","ACCEL_idx"])
-    late  = _resolve_col(wd, ["LATE_idx","Late_idx","Late","LATE"])
-    grind = _resolve_col(wd, ["Grind_CG","GrindCorrected","GrindAdj","Grind_Corr","Grind","Grind_idx"])
-    sos   = _resolve_col(wd, ["SOS","sos","ShapeSOS","SetupStrength","SignalSOS"])
+WD = metrics.copy()
+gr_col = metrics.attrs.get("GR_COL", "Grind")
+D_m    = float(race_distance_input)
+RSI    = float(metrics.attrs.get("RSI", 0.0))      # + = slow-early, - = fast-early
+SCI    = float(metrics.attrs.get("SCI", 0.0))      # 0..1 (consensus/strength)
 
-    use_cg = st.session_state.get("use_corrected_grind", True)
-    if use_cg and "Grind_CG" in wd.columns: grind = "Grind_CG"
+# ---- helpers ----
+def _lerp(a, b, t): 
+    return a + (b - a) * float(max(0.0, min(1.0, t)))
 
-    missing = [lbl for lbl, c in [("Horse",horse),("F200",f200),("Accel",accel),("Late",late),("Grind",grind)] if c is None]
-    if missing:
-        st.warning("⚠️ Winning DNA Matrix needs: " + ", ".join(missing) + ".")
-    else:
-        d_m = _get_distance_m(wd)
-        wf  = _f200_weight(d_m)
-        W   = _rest(wf)
+def _score01(idx_val, lo=98.0, hi=104.0):
+    """Map index ~[98..104] to 0..1 with clamping; safe for NaN."""
+    try:
+        x = float(idx_val)
+        if not np.isfinite(x): return 0.0
+        return float(max(0.0, min(1.0, (x - lo) / (hi - lo))))
+    except Exception:
+        return 0.0
 
-        df = wd[[horse, fin, f200, accel, late, grind] + ([sos] if sos else [])].copy()
-        df.columns = ["Horse","Finish_Pos","F200","Accel","Late","Grind"] + (["SOS"] if sos else [])
+def _wdna_base_weights(distance_m: float) -> dict:
+    """
+    Return base weights for EZ/MC/LP/LL that sum to 0.85 (SOS is fixed 0.15).
+    Knot table (your spec):
+      Dist:   EZ   MC   LP   LL   (sum=0.85)
+      1000:  0.25 0.21 0.28 0.11
+      1100:  0.22 0.22 0.27 0.14
+      1200:  0.20 0.22 0.25 0.18
+      1400:  0.15 0.24 0.24 0.22
+      1600:  0.10 0.26 0.23 0.26
+      1800:  0.06 0.28 0.22 0.29
+      2000+: 0.03 0.30 0.20 0.32
+    """
+    dm = float(distance_m)
+    # clamp regimes
+    if dm <= 1000: 
+        return {"EZ":0.25,"MC":0.21,"LP":0.28,"LL":0.11}
+    if dm >= 2000:
+        return {"EZ":0.03,"MC":0.30,"LP":0.20,"LL":0.32}
 
-        for c in ["F200","Accel","Late","Grind"]:
-            df[c+"_n"] = df[c].apply(_safe100_to01)
-
-        df["WDM_Score"] = wf*df["F200_n"] + W["accel"]*df["Accel_n"] + W["late"]*df["Late_n"] + W["grind"]*df["Grind_n"]
-        if "Finish_Pos" in df:
-            df["_fp"] = pd.to_numeric(df["Finish_Pos"], errors="coerce")
-            df = df.sort_values(["WDM_Score","_fp"], ascending=[False,True])
-        else:
-            df = df.sort_values("WDM_Score", ascending=False)
-
-        top = df.head(12).reset_index(drop=True)
-
-        # legend / weights
-        st.caption(
-            f"Top-12 by Winning DNA Score • Distance **{d_m}m** • Weights → "
-            f"F200 **{wf:.2f}**, Accel **{W['accel']:.2f}**, Late **{W['late']:.2f}**, Grind **{W['grind']:.2f}** "
-            "• Bar color: below-par → blue, baseline ~100 → neutral, standout → warm."
-        )
-
-        # responsive grid styles
-        st.markdown("""
-            <style>
-            .wdm-grid {
-              display: grid;
-              grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-              gap: 14px;
+    # piecewise linear interpolation across knots
+    knots = [
+        (1000, {"EZ":0.25,"MC":0.21,"LP":0.28,"LL":0.11}),
+        (1100, {"EZ":0.22,"MC":0.22,"LP":0.27,"LL":0.14}),
+        (1200, {"EZ":0.20,"MC":0.22,"LP":0.25,"LL":0.18}),
+        (1400, {"EZ":0.15,"MC":0.24,"LP":0.24,"LL":0.22}),
+        (1600, {"EZ":0.10,"MC":0.26,"LP":0.23,"LL":0.26}),
+        (1800, {"EZ":0.06,"MC":0.28,"LP":0.22,"LL":0.29}),
+        (2000, {"EZ":0.03,"MC":0.30,"LP":0.20,"LL":0.32}),
+    ]
+    # find segment
+    for (a_dm, a_w), (b_dm, b_w) in zip(knots, knots[1:]):
+        if a_dm <= dm <= b_dm:
+            t = (dm - a_dm) / (b_dm - a_dm)
+            return {
+                "EZ": _lerp(a_w["EZ"], b_w["EZ"], t),
+                "MC": _lerp(a_w["MC"], b_w["MC"], t),
+                "LP": _lerp(a_w["LP"], b_w["LP"], t),
+                "LL": _lerp(a_w["LL"], b_w["LL"], t),
             }
-            .wdm-card {
-              border: 1px solid rgba(255,255,255,0.08);
-              border-radius: 12px;
-              padding: 12px 12px 10px 12px;
-            }
-            .wdm-head { display:flex; justify-content:space-between; align-items:center; }
-            .wdm-title { font-weight:700; font-size:1.02rem; }
-            .wdm-pos { opacity:0.8; }
-            .wdm-sub { opacity:0.85; font-size:0.86rem; margin-top:2px; }
-            .wdm-pill {
-              display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.78rem; margin-left:6px;
-              background:rgba(255,255,255,0.08);
-            }
-            .wdm-barwrap { background:rgba(255,255,255,0.08); height:8px; border-radius:6px; overflow:hidden; }
-            .wdm-row { margin:8px 0 10px 0; }
-            .wdm-lab { display:flex; justify-content:space-between; font-size:0.84rem; }
-            </style>
-        """, unsafe_allow_html=True)
+    # fallback (should not hit)
+    return {"EZ":0.20,"MC":0.22,"LP":0.25,"LL":0.18}
 
-        def render_bar(name, idx100):
-            frac = _safe100_to01(idx100)
-            pct  = 100.0*max(0.0, min(frac, 1.25))
-            color = _hue_for_val(idx100)
-            st.markdown(
-                f"""
-                <div class="wdm-row">
-                  <div class="wdm-lab"><span>{name}</span><span>{_nice(idx100)}</span></div>
-                  <div class="wdm-barwrap">
-                    <div style="width:{pct:.1f}%;height:100%;background:{color};"></div>
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+def _apply_shape_nudges(w: dict, rsi: float, sci: float) -> dict:
+    """
+    Gentle nudges by RSI sign, scaled by SCI. Re-normalises to 0.85 total.
+      FAST-early (RSI<0): +0.01*SCI to EZ & LP, -0.01*SCI split from LL/MC
+      SLOW-early (RSI>0): +0.01*SCI to LL & MC, -0.01*SCI split from EZ/LP
+    """
+    w = w.copy()
+    mag = 0.01 * max(0.0, min(1.0, sci))
+    if rsi < -1e-9:  # fast-early
+        give = mag
+        take_each = give / 2.0
+        w["EZ"] += give; w["LP"] += give
+        w["LL"] = max(0.0, w["LL"] - take_each)
+        w["MC"] = max(0.0, w["MC"] - take_each)
+    elif rsi > 1e-9:  # slow-early
+        give = mag
+        take_each = give / 2.0
+        w["LL"] += give; w["MC"] += give
+        w["EZ"] = max(0.0, w["EZ"] - take_each)
+        w["LP"] = max(0.0, w["LP"] - take_each)
 
-        # GRID
-        st.markdown('<div class="wdm-grid">', unsafe_allow_html=True)
-        for _, r in top.iterrows():
-            sos_html = ""
-            if "SOS" in r and pd.notna(r["SOS"]):
-                sos_html = f'<span class="wdm-pill">SOS: {_nice(float(r["SOS"]))}</span>'
-            st.markdown(
-                f"""
-                <div class="wdm-card">
-                  <div class="wdm-head">
-                    <div class="wdm-title">{r['Horse']}</div>
-                    <div class="wdm-pos">Pos: {r.get('Finish_Pos','—')}</div>
-                  </div>
-                  <div class="wdm-sub">
-                    WDM Score: <strong>{_nice(float(r['WDM_Score']*100))}</strong>
-                    {sos_html}
-                  </div>
-                """,
-                unsafe_allow_html=True
-            )
-            render_bar("F200", r["F200"])
-            render_bar("Accel", r["Accel"])
-            render_bar("Late",  r["Late"])
-            render_bar("Grind", r["Grind"])
-            st.markdown("</div>", unsafe_allow_html=True)  # close card
-        st.markdown("</div>", unsafe_allow_html=True)       # close grid
-# ===================== /Winning DNA Matrix — Visual Top-12 (Drop-in) =====================
+    s = sum(w.values()) or 1.0
+    # renormalise to 0.85 (SOS is fixed 0.15 outside this)
+    return {k: (v / s) * 0.85 for k, v in w.items()}
+
+def _wdna_weights(distance_m: float, rsi: float, sci: float) -> dict:
+    base = _wdna_base_weights(distance_m)
+    shaped = _apply_shape_nudges(base, rsi, sci)
+    shaped["SOS"] = 0.15  # fixed
+    # final safety normalisation to 1.00
+    S = sum(shaped.values()) or 1.0
+    return {k: v / S for k, v in shaped.items()}
+
+# ---- component strengths (0..1) ----
+for c in ["F200_idx","tsSPI","Accel",gr_col]:
+    if c not in WD.columns:
+        WD[c] = np.nan
+
+WD["EZ01"] = WD["F200_idx"].map(_score01)    # Early Zip
+WD["MC01"] = WD["tsSPI"].map(_score01)       # Mid Control
+WD["LP01"] = WD["Accel"].map(_score01)       # Late Punch
+WD["LL01"] = WD[gr_col].map(_score01)        # Lasting Lift
+
+# ---- SOS (0..1) using the same robust z-blend idea as Hidden Horses ----
+def _sos01_series(df: pd.DataFrame) -> pd.Series:
+    # winsorise & robust z on sectionals
+    ts = winsorize(pd.to_numeric(df["tsSPI"], errors="coerce"))
+    ac = winsorize(pd.to_numeric(df["Accel"], errors="coerce"))
+    gr = winsorize(pd.to_numeric(df[gr_col], errors="coerce"))
+
+    def rz(s):
+        mu, sd = np.nanmedian(s), mad_std(s)
+        sd = sd if (np.isfinite(sd) and sd > 0) else 1.0
+        return (s - mu) / sd
+
+    raw = 0.45*rz(ts) + 0.35*rz(ac) + 0.20*rz(gr)
+    q5, q95 = np.nanpercentile(raw.dropna(), [5, 95]) if raw.notna().any() else (0.0, 1.0)
+    denom = max(q95 - q5, 1.0)
+    return ((raw - q5) / denom).clip(0.0, 1.0)
+
+WD["SOS01"] = _sos01_series(WD)
+
+# ---- weights for this race ----
+W = _wdna_weights(D_m, RSI, SCI)   # dict with EZ/MC/LP/LL/SOS summing to 1.0
+
+# ---- composite Winning DNA score (0..10) ----
+WD["WinningDNA"] = 10.0 * (
+    W["EZ"]  * WD["EZ01"].fillna(0.0)  +
+    W["MC"]  * WD["MC01"].fillna(0.0)  +
+    W["LP"]  * WD["LP01"].fillna(0.0)  +
+    W["LL"]  * WD["LL01"].fillna(0.0)  +
+    W["SOS"] * WD["SOS01"].fillna(0.0)
+)
+WD["WinningDNA"] = WD["WinningDNA"].clip(0.0, 10.0).round(2)
+
+# ---- quick tags & summary ----
+def _top_traits(r):
+    pairs = [
+        ("Early Zip",  r.get("EZ01", 0.0)),
+        ("Mid Control",r.get("MC01", 0.0)),
+        ("Late Punch", r.get("LP01", 0.0)),
+        ("Lasting Lift", r.get("LL01", 0.0)),
+    ]
+    pairs = [(n, float(v if np.isfinite(v) else 0.0)) for n, v in pairs]
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    keep = [n for n, v in pairs[:2] if v >= 0.55]  # show top 1–2 if decent
+    return " · ".join(keep) if keep else ""
+
+def _summary_line(r):
+    name = str(r.get("Horse","")).strip()
+    dn   = float(r.get("WinningDNA", 0.0))
+    parts = []
+    # dominant attributes
+    dom = _top_traits(r)
+    if dom:
+        parts.append(f"{dom}")
+    # shape context
+    if SCI >= 0.6 and abs(RSI) >= 1.2:
+        parts.append("ran with race shape" if (np.sign(RSI)*(r["LP01"]-r["MC01"]) >= 0) else "ran against race shape")
+    # compact sentence
+    return f"{name}: DNA {dn:.2f}/10 — " + (", ".join(parts) if parts else "balanced profile.")
+
+WD["DNA_TopTraits"] = WD.apply(_top_traits, axis=1)
+WD["DNA_Summary"]   = WD.apply(_summary_line, axis=1)
+
+# ---- render table ----
+show_cols = [
+    "Horse","WinningDNA",
+    "EZ01","MC01","LP01","LL01","SOS01",
+    "DNA_TopTraits"
+]
+for c in show_cols:
+    if c not in WD.columns: WD[c] = np.nan
+
+WD_view = WD.sort_values(["WinningDNA","Accel",gr_col], ascending=[False, False, False])[show_cols]
+st.dataframe(WD_view, use_container_width=True)
+
+# ---- small per-horse paragraph summaries ----
+with st.expander("Race Pulse — per-horse summaries"):
+    for _, r in WD.sort_values("WinningDNA", ascending=False).iterrows():
+        st.write("• " + r["DNA_Summary"])
+# ---- footnote ----
+w_note = ", ".join([f"{k} {W[k]:.2f}" for k in ["EZ","MC","LP","LL","SOS"]])
+st.caption(f"Weights — EZ/F200 fades with distance; LL grows. Shape nudges applied via RSI×SCI. Final weights: {w_note}.")
+# ======================= /Winning DNA Matrix =======================
     
         # ======================= Hidden Horses (v2, shape-aware) =======================
 st.markdown("## Hidden Horses v2 (Shape-aware)")
