@@ -1688,14 +1688,23 @@ else:
 
 st.markdown("## Winning DNA Matrix")
 
-# ---- Inputs expected (fallbacks if absent) --------------------------------
-# WD: per-horse metrics DataFrame containing at least:
-#   ["Horse", "F200_idx", "tsSPI", "Accel", <gr_col>, "SOS01"(optional)]
-# race_distance_input: current race distance (m)
-# gr_col: name of grind column (e.g., "Grind_CG" or "Grind")
+# ---- Auto-detect grind column safely ----
+if "metrics" in globals() and hasattr(metrics, "attrs"):
+    gr_col = metrics.attrs.get("GR_COL", None)
+else:
+    gr_col = None
 
-gr_col = metrics.attrs.get("GRIND_CG", "Grind") if "metrics" in globals() else globals().get("gr_col", "Grind")
-assert gr_col in WD.columns, f"Winning DNA needs grind column '{gr_col}' in WD."
+# fallback options in case GR_COL not set
+if not gr_col or gr_col not in WD.columns:
+    for cand in ["Grind_CG", "Grind", "GrindAdj", "GrindCorrected"]:
+        if cand in WD.columns:
+            gr_col = cand
+            break
+
+# if still missing, just log a gentle message and skip gracefully
+if gr_col not in WD.columns:
+    st.warning("Winning DNA: no grind column found in WD (expected 'Grind_CG' or 'Grind').")
+    st.stop()
 
 # ---- (A) Weights (uses your W if present; else distance-aware defaults) ---
 def _ez_weight_from_distance(d_m: float) -> float:
