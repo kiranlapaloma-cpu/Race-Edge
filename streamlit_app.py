@@ -1684,250 +1684,168 @@ else:
                            file_name="pace_curve.png", mime="image/png")
         st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 
-# ======================= Winning DNA Matrix — distance-aware (EZ/MC/LP/LL + SOS) =======================
+# =============== Winning DNA Matrix — Report Card (DROP-IN) ===============
+
 st.markdown("## Winning DNA Matrix")
 
-WD = metrics.copy()
-gr_col = metrics.attrs.get("GR_COL", "Grind")
-D_m    = float(race_distance_input)
-RSI    = float(metrics.attrs.get("RSI", 0.0))      # + = slow-early, - = fast-early
-SCI    = float(metrics.attrs.get("SCI", 0.0))      # 0..1 (consensus/strength)
+# ---- Inputs expected (fallbacks if absent) --------------------------------
+# WD: per-horse metrics DataFrame containing at least:
+#   ["Horse", "F200_idx", "tsSPI", "Accel", <gr_col>, "SOS01"(optional)]
+# race_distance_input: current race distance (m)
+# gr_col: name of grind column (e.g., "Grind_CG" or "Grind")
 
-# ---- helpers ----
-def _lerp(a, b, t): 
-    return a + (b - a) * float(max(0.0, min(1.0, t)))
+gr_col = metrics.attrs.get("GR_COL", "Grind") if "metrics" in globals() else globals().get("gr_col", "Grind")
+assert gr_col in WD.columns, f"Winning DNA needs grind column '{gr_col}' in WD."
 
-def _score01(idx_val, lo=98.0, hi=104.0):
-    """Map index ~[98..104] to 0..1 with clamping; safe for NaN."""
-    try:
-        x = float(idx_val)
-        if not np.isfinite(x): return 0.0
-        return float(max(0.0, min(1.0, (x - lo) / (hi - lo))))
-    except Exception:
-        return 0.0
+# ---- (A) Weights (uses your W if present; else distance-aware defaults) ---
+def _ez_weight_from_distance(d_m: float) -> float:
+    # 1200→0.20, 1400→0.15, 1600→0.10, 1800→0.07, 2000→0.05, 2400+→0.03 (linear steps)
+    d = float(d_m or 1400)
+    if d <= 1200: return 0.20
+    if d <= 1400: return 0.15
+    if d <= 1600: return 0.10
+    if d <= 1800: return 0.07
+    if d <= 2000: return 0.05
+    return 0.03
 
-def _wdna_base_weights(distance_m: float) -> dict:
-    """
-    Return base weights for EZ/MC/LP/LL that sum to 0.85 (SOS is fixed 0.15).
-    Knot table (your spec):
-      Dist:   EZ   MC   LP   LL   (sum=0.85)
-      1000:  0.25 0.21 0.28 0.11
-      1100:  0.22 0.22 0.27 0.14
-      1200:  0.20 0.22 0.25 0.18
-      1400:  0.15 0.24 0.24 0.22
-      1600:  0.10 0.26 0.23 0.26
-      1800:  0.06 0.28 0.22 0.29
-      2000+: 0.03 0.30 0.20 0.32
-    """
-    dm = float(distance_m)
-    # clamp regimes
-    if dm <= 1000: 
-        return {"EZ":0.25,"MC":0.21,"LP":0.28,"LL":0.11}
-    if dm >= 2000:
-        return {"EZ":0.03,"MC":0.30,"LP":0.20,"LL":0.32}
+if "W" in globals() and isinstance(W, dict) and all(k in W for k in ["EZ","MC","LP","LL","SOS"]):
+    weights = dict(W)  # respect caller’s weights
+else:
+    base = {"MC": 0.22, "LP": 0.25, "LL": 0.18, "SOS": 0.15}  # your earlier split
+    ez = _ez_weight_from_distance(globals().get("race_distance_input", 1400))
+    # spread the remainder proportionally across MC/LP/LL/SOS
+    rem = max(0.0, 1.0 - ez)
+    scale = rem / sum(base.values())
+    weights = {"EZ": ez, **{k: v*scale for k, v in base.items()}}
 
-    # piecewise linear interpolation across knots
-    knots = [
-        (1000, {"EZ":0.25,"MC":0.21,"LP":0.28,"LL":0.11}),
-        (1100, {"EZ":0.22,"MC":0.22,"LP":0.27,"LL":0.14}),
-        (1200, {"EZ":0.20,"MC":0.22,"LP":0.25,"LL":0.18}),
-        (1400, {"EZ":0.15,"MC":0.24,"LP":0.24,"LL":0.22}),
-        (1600, {"EZ":0.10,"MC":0.26,"LP":0.23,"LL":0.26}),
-        (1800, {"EZ":0.06,"MC":0.28,"LP":0.22,"LL":0.29}),
-        (2000, {"EZ":0.03,"MC":0.30,"LP":0.20,"LL":0.32}),
-    ]
-    # find segment
-    for (a_dm, a_w), (b_dm, b_w) in zip(knots, knots[1:]):
-        if a_dm <= dm <= b_dm:
-            t = (dm - a_dm) / (b_dm - a_dm)
-            return {
-                "EZ": _lerp(a_w["EZ"], b_w["EZ"], t),
-                "MC": _lerp(a_w["MC"], b_w["MC"], t),
-                "LP": _lerp(a_w["LP"], b_w["LP"], t),
-                "LL": _lerp(a_w["LL"], b_w["LL"], t),
-            }
-    # fallback (should not hit)
-    return {"EZ":0.20,"MC":0.22,"LP":0.25,"LL":0.18}
+W = weights  # keep for captions
 
-def _apply_shape_nudges(w: dict, rsi: float, sci: float) -> dict:
-    """
-    Gentle nudges by RSI sign, scaled by SCI. Re-normalises to 0.85 total.
-      FAST-early (RSI<0): +0.01*SCI to EZ & LP, -0.01*SCI split from LL/MC
-      SLOW-early (RSI>0): +0.01*SCI to LL & MC, -0.01*SCI split from EZ/LP
-    """
-    w = w.copy()
-    mag = 0.01 * max(0.0, min(1.0, sci))
-    if rsi < -1e-9:  # fast-early
-        give = mag
-        take_each = give / 2.0
-        w["EZ"] += give; w["LP"] += give
-        w["LL"] = max(0.0, w["LL"] - take_each)
-        w["MC"] = max(0.0, w["MC"] - take_each)
-    elif rsi > 1e-9:  # slow-early
-        give = mag
-        take_each = give / 2.0
-        w["LL"] += give; w["MC"] += give
-        w["EZ"] = max(0.0, w["EZ"] - take_each)
-        w["LP"] = max(0.0, w["LP"] - take_each)
+# ---- (B) Build/ensure pillars --------------------------------------------
+need_cols = ["Horse", "F200_idx", "tsSPI", "Accel", gr_col]
+missing = [c for c in need_cols if c not in WD.columns]
+if missing:
+    st.info(f"Winning DNA: missing columns {missing}; cannot render.")
+else:
+    X = WD.copy()
+    for c in ["F200_idx", "tsSPI", "Accel", gr_col]:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
 
-    s = sum(w.values()) or 1.0
-    # renormalise to 0.85 (SOS is fixed 0.15 outside this)
-    return {k: (v / s) * 0.85 for k, v in w.items()}
+    # SOS01 fallback if not provided: robust blend → 0..1 via q5–q95
+    if "SOS01" not in X.columns:
+        def _winsor(s):
+            q1, q99 = np.nanpercentile(s.dropna(), [1,99]) if s.notna().any() else (s.median(), s.median())
+            return s.clip(q1, q99)
+        ts_w = _winsor(X["tsSPI"]); ac_w = _winsor(X["Accel"]); gr_w = _winsor(X[gr_col])
+        def _rz(s):
+            mu, mad = np.nanmedian(s), np.nanmedian(np.abs(s - np.nanmedian(s)))
+            sd = 1.4826*mad if mad > 0 else 1.0
+            return (s - mu) / sd
+        sos_raw = 0.45*_rz(ts_w) + 0.35*_rz(ac_w) + 0.20*_rz(gr_w)
+        q5, q95 = np.nanpercentile(sos_raw.dropna(), [5,95]) if sos_raw.notna().any() else (0,1)
+        denom = max(q95 - q5, 1e-6)
+        X["SOS01"] = ((sos_raw - q5) / denom).clip(0, 1)
+    else:
+        X["SOS01"] = pd.to_numeric(X["SOS01"], errors="coerce").clip(0, 1)
 
-def _wdna_weights(distance_m: float, rsi: float, sci: float) -> dict:
-    base = _wdna_base_weights(distance_m)
-    shaped = _apply_shape_nudges(base, rsi, sci)
-    shaped["SOS"] = 0.15  # fixed
-    # final safety normalisation to 1.00
-    S = sum(shaped.values()) or 1.0
-    return {k: v / S for k, v in shaped.items()}
-
-# ---- component strengths (0..1) ----
-for c in ["F200_idx","tsSPI","Accel",gr_col]:
-    if c not in WD.columns:
-        WD[c] = np.nan
-
-WD["EZ01"] = WD["F200_idx"].map(_score01)    # Early Zip
-WD["MC01"] = WD["tsSPI"].map(_score01)       # Mid Control
-WD["LP01"] = WD["Accel"].map(_score01)       # Late Punch
-WD["LL01"] = WD[gr_col].map(_score01)        # Lasting Lift
-
-# ---- SOS (0..1) using the same robust z-blend idea as Hidden Horses ----
-def _sos01_series(df: pd.DataFrame) -> pd.Series:
-    # winsorise & robust z on sectionals
-    ts = winsorize(pd.to_numeric(df["tsSPI"], errors="coerce"))
-    ac = winsorize(pd.to_numeric(df["Accel"], errors="coerce"))
-    gr = winsorize(pd.to_numeric(df[gr_col], errors="coerce"))
-
-    def rz(s):
-        mu, sd = np.nanmedian(s), mad_std(s)
-        sd = sd if (np.isfinite(sd) and sd > 0) else 1.0
-        return (s - mu) / sd
-
-    raw = 0.45*rz(ts) + 0.35*rz(ac) + 0.20*rz(gr)
-    q5, q95 = np.nanpercentile(raw.dropna(), [5, 95]) if raw.notna().any() else (0.0, 1.0)
-    denom = max(q95 - q5, 1.0)
-    return ((raw - q5) / denom).clip(0.0, 1.0)
-
-WD["SOS01"] = _sos01_series(WD)
-
-# ---- weights for this race ----
-W = _wdna_weights(D_m, RSI, SCI)   # dict with EZ/MC/LP/LL/SOS summing to 1.0
-
-# ---- composite Winning DNA score (0..10) ----
-WD["WinningDNA"] = 10.0 * (
-    W["EZ"]  * WD["EZ01"].fillna(0.0)  +
-    W["MC"]  * WD["MC01"].fillna(0.0)  +
-    W["LP"]  * WD["LP01"].fillna(0.0)  +
-    W["LL"]  * WD["LL01"].fillna(0.0)  +
-    W["SOS"] * WD["SOS01"].fillna(0.0)
-)
-WD["WinningDNA"] = WD["WinningDNA"].clip(0.0, 10.0).round(2)
-
-# ===== Winning DNA — Report Card render (drop-in) =====
-
-# --- (1) optional: dynamic field scaling for pillars (q10–q90 → 0..1) ---
-DYNAMIC_SCALING = True
-if DYNAMIC_SCALING:
-    def rescale_q(s: pd.Series) -> pd.Series:
+    # ---- (C) Field-relative scaling (q10–q90 → 0..1) ----------------------
+    def _rescale_q(s: pd.Series) -> pd.Series:
         s = pd.to_numeric(s, errors="coerce")
-        q10, q90 = np.nanpercentile(s.dropna(), [10, 90]) if s.notna().any() else (98.0, 104.0)
+        if not s.notna().any(): return s*0
+        q10, q90 = np.nanpercentile(s.dropna(), [10, 90])
         rng = max(q90 - q10, 1e-6)
         return ((s - q10) / rng).clip(0, 1)
-    WD["EZ01"]  = rescale_q(WD["F200_idx"])
-    WD["MC01"]  = rescale_q(WD["tsSPI"])
-    WD["LP01"]  = rescale_q(WD["Accel"])
-    WD["LL01"]  = rescale_q(WD[gr_col])
-    # keep SOS01 as is (already 0..1), but gently re-frame if super tight:
-    if WD["SOS01"].notna().any():
-        q10, q90 = np.nanpercentile(WD["SOS01"].dropna(), [10, 90])
-        rng = max(q90 - q10, 1e-6)
-        WD["SOS01"] = ((WD["SOS01"] - q10) / rng).clip(0, 1)
 
-# Recompute DNA on the re-scaled pillars (weights W from above stay the same)
-WD["WinningDNA"] = 10.0 * (
-    W["EZ"]  * WD["EZ01"].fillna(0.0)  +
-    W["MC"]  * WD["MC01"].fillna(0.0)  +
-    W["LP"]  * WD["LP01"].fillna(0.0)  +
-    W["LL"]  * WD["LL01"].fillna(0.0)  +
-    W["SOS"] * WD["SOS01"].fillna(0.0)
-)
-WD["WinningDNA"] = WD["WinningDNA"].clip(0, 10).round(2)
+    X["EZ01"]  = _rescale_q(X["F200_idx"])
+    X["MC01"]  = _rescale_q(X["tsSPI"])
+    X["LP01"]  = _rescale_q(X["Accel"])
+    X["LL01"]  = _rescale_q(X[gr_col])
+    # SOS already 0..1; small reframe to match spread
+    X["SOS01"] = _rescale_q(X["SOS01"])
 
-# --- (2) letter grades + tidy columns ---
-def grade(x: float) -> str:
-    # 10-pt scale → letters
-    if x >= 9.2: return "A+"
-    if x >= 8.6: return "A"
-    if x >= 8.0: return "A-"
-    if x >= 7.4: return "B+"
-    if x >= 6.8: return "B"
-    if x >= 6.2: return "B-"
-    if x >= 5.6: return "C+"
-    if x >= 5.0: return "C"
-    if x >= 4.4: return "C-"
-    return "D"
-WD["Grade"] = WD["WinningDNA"].apply(grade)
+    # ---- (D) DNA score (0..10) & grades ----------------------------------
+    X["WinningDNA"] = 10.0 * (
+        W["EZ"]  * X["EZ01"].fillna(0.0)  +
+        W["MC"]  * X["MC01"].fillna(0.0)  +
+        W["LP"]  * X["LP01"].fillna(0.0)  +
+        W["LL"]  * X["LL01"].fillna(0.0)  +
+        W["SOS"] * X["SOS01"].fillna(0.0)
+    )
+    X["WinningDNA"] = X["WinningDNA"].clip(0, 10).round(2)
 
-# progress values (0..10 for DNA, 0..1 for pillars)
-WD["DNA_10"] = WD["WinningDNA"]
-WD["EZ_p"]   = WD["EZ01"].fillna(0.0)
-WD["MC_p"]   = WD["MC01"].fillna(0.0)
-WD["LP_p"]   = WD["LP01"].fillna(0.0)
-WD["LL_p"]   = WD["LL01"].fillna(0.0)
-WD["SOS_p"]  = WD["SOS01"].fillna(0.0)
+    def _grade(x: float) -> str:
+        if x >= 9.2: return "A+"
+        if x >= 8.6: return "A"
+        if x >= 8.0: return "A-"
+        if x >= 7.4: return "B+"
+        if x >= 6.8: return "B"
+        if x >= 6.2: return "B-"
+        if x >= 5.6: return "C+"
+        if x >= 5.0: return "C"
+        if x >= 4.4: return "C-"
+        return "D"
+    X["Grade"] = X["WinningDNA"].apply(_grade)
 
-# --- (3) table with progress bars & badges ---
-from streamlit import column_config as cc
+    # Top traits (two best pillars per horse)
+    def _badges(r):
+        parts = {
+            "Early Zip": r["EZ01"],
+            "Mid Control": r["MC01"],
+            "Late Punch": r["LP01"],
+            "Lasting Lift": r["LL01"],
+            "Orchestration": r["SOS01"],
+        }
+        top2 = sorted(parts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)[:2]
+        return " · ".join([k for k,_ in top2])
+    X["DNA_TopTraits"] = X.apply(_badges, axis=1)
 
-table_cols = [
-    "Horse", "Grade", "DNA_10",
-    "EZ_p", "MC_p", "LP_p", "LL_p", "SOS_p",
-    "DNA_TopTraits"
-]
-WD_view = WD.sort_values(["DNA_10","LP_p","MC_p"], ascending=[False, False, False])[table_cols]
+    # ---- (E) Table with progress columns ----------------------------------
+    from streamlit import column_config as cc
 
-st.dataframe(
-    WD_view,
-    use_container_width=True,
-    column_config={
-        "DNA_10": cc.ProgressColumn("Winning DNA", help="0–10", min_value=0, max_value=10, format="%.2f"),
-        "EZ_p":   cc.ProgressColumn("Early Zip (F200)",     min_value=0.0, max_value=1.0, format="%.0f%%"),
-        "MC_p":   cc.ProgressColumn("Mid Control (tsSPI)",  min_value=0.0, max_value=1.0, format="%.0f%%"),
-        "LP_p":   cc.ProgressColumn("Late Punch (Accel)",   min_value=0.0, max_value=1.0, format="%.0f%%"),
-        "LL_p":   cc.ProgressColumn("Lasting Lift (Grind)", min_value=0.0, max_value=1.0, format="%.0f%%"),
-        "SOS_p":  cc.ProgressColumn("Orchestration (SOS)",  min_value=0.0, max_value=1.0, format="%.0f%%"),
-        "DNA_TopTraits": cc.TextColumn("Badges", help="Top 1–2 strengths this race")
-    },
-    hide_index=True
-)
+    X["DNA_10"] = X["WinningDNA"]
+    X["EZ_p"]   = X["EZ01"].fillna(0.0)
+    X["MC_p"]   = X["MC01"].fillna(0.0)
+    X["LP_p"]   = X["LP01"].fillna(0.0)
+    X["LL_p"]   = X["LL01"].fillna(0.0)
+    X["SOS_p"]  = X["SOS01"].fillna(0.0)
 
-# --- (4) compact report cards for top-5 ---
-st.markdown("### Report Cards (Top 5)")
-top5 = WD.sort_values("DNA_10", ascending=False).head(5)
-for i, (_, r) in enumerate(top5.iterrows(), start=1):
-    colL, colR = st.columns([3, 5])
-    with colL:
-        st.markdown(f"**{i}. {r['Horse']}**")
-        st.metric("Winning DNA", f"{r['DNA_10']:.2f}/10", help="Composite of Early Zip, Mid Control, Late Punch, Lasting Lift, SOS")
-        st.write(f"**Grade:** {r['Grade']}  \n**Badges:** {r['DNA_TopTraits'] or '—'}")
-    with colR:
-        # mini-bars using progress columns replicated via st.markdown
-        st.progress(float(r["EZ_p"]))
-        st.caption("Early Zip (F200)")
-        st.progress(float(r["MC_p"]))
-        st.caption("Mid Control (tsSPI)")
-        st.progress(float(r["LP_p"]))
-        st.caption("Late Punch (Accel)")
-        st.progress(float(r["LL_p"]))
-        st.caption("Lasting Lift (Grind)")
-        st.progress(float(r["SOS_p"]))
-        st.caption("Orchestration (SOS)")
+    table_cols = ["Horse","Grade","DNA_10","EZ_p","MC_p","LP_p","LL_p","SOS_p","DNA_TopTraits"]
+    view = X.sort_values(["DNA_10","LP_p","MC_p"], ascending=[False, False, False])[table_cols]
 
-# footnote with weights
-w_note = ", ".join([f"{k} {W[k]:.2f}" for k in ["EZ","MC","LP","LL","SOS"]])
-st.caption(f"Scaled by field quantiles (q10–q90) for fair spread · Final weights: {w_note}.")
-# ===== /report card render =====
+    st.dataframe(
+        view,
+        use_container_width=True,
+        column_config={
+            "DNA_10": cc.ProgressColumn("Winning DNA", help="0–10", min_value=0, max_value=10, format="%.2f"),
+            "EZ_p":   cc.ProgressColumn("Early Zip (F200)",     min_value=0.0, max_value=1.0, format="%.0f%%"),
+            "MC_p":   cc.ProgressColumn("Mid Control (tsSPI)",  min_value=0.0, max_value=1.0, format="%.0f%%"),
+            "LP_p":   cc.ProgressColumn("Late Punch (Accel)",   min_value=0.0, max_value=1.0, format="%.0f%%"),
+            "LL_p":   cc.ProgressColumn("Lasting Lift (Grind)", min_value=0.0, max_value=1.0, format="%.0f%%"),
+            "SOS_p":  cc.ProgressColumn("Orchestration (SOS)",  min_value=0.0, max_value=1.0, format="%.0f%%"),
+            "DNA_TopTraits": cc.TextColumn("Badges")
+        },
+        hide_index=True
+    )
+
+    # ---- (F) Top-6 report cards -------------------------------------------
+    st.markdown("### Report Cards (Top 6)")
+    topN = X.sort_values("DNA_10", ascending=False).head(6)
+    for i, (_, r) in enumerate(topN.iterrows(), start=1):
+        c1, c2 = st.columns([3, 5])
+        with c1:
+            st.markdown(f"**{i}. {r['Horse']}**")
+            st.metric("Winning DNA", f"{r['DNA_10']:.2f}/10")
+            st.write(f"**Grade:** {r['Grade']}  \n**Badges:** {r['DNA_TopTraits'] or '—'}")
+        with c2:
+            st.progress(float(r["EZ_p"]));  st.caption("Early Zip (F200)")
+            st.progress(float(r["MC_p"]));  st.caption("Mid Control (tsSPI)")
+            st.progress(float(r["LP_p"]));  st.caption("Late Punch (Accel)")
+            st.progress(float(r["LL_p"]));  st.caption("Lasting Lift (Grind)")
+            st.progress(float(r["SOS_p"])); st.caption("Orchestration (SOS)")
+
+    # ---- (G) Footnote ------------------------------------------------------
+    w_note = ", ".join([f"{k} {W[k]:.2f}" for k in ["EZ","MC","LP","LL","SOS"]])
+    st.caption(f"Field-relative scaling (q10–q90) applied. Final weights: {w_note}.")
+# =========================== /Winning DNA ==================================
     
         # ======================= Hidden Horses (v2, shape-aware) =======================
 st.markdown("## Hidden Horses v2 (Shape-aware)")
