@@ -1684,6 +1684,161 @@ else:
                            file_name="pace_curve.png", mime="image/png")
         st.caption(f"Top-8 plotted: {top8_rule}. Finish segment included explicitly.")
 
+# ======================= Winning DNA Matrix (WDM) =======================
+st.markdown("## Winning DNA Matrix — What Actually Won the Race")
+
+_wdm = metrics.copy()
+if _dm := _wdm is None or len(_wdm) == 0:
+    st.info("No data to compute Winning DNA.")
+else:
+    # ---------- Setup & safe numerics ----------
+    gr_col = _wdm.attrs.get("GR_COL", "Grind")
+    need = {"Accel", "tsSPI", gr_col}
+    for c in need:
+        if c not in _wdm.columns:
+            _wdm[c] = np.nan
+    for c in list(need):
+        _wdm[c] = pd.to_numeric(_wdm[c], errors="coerce")
+
+    N = int(len(_wdm))
+    SMALL = N <= 6
+
+    # ---------- robust 0–10 scaler (race-local) ----------
+    def _score_0_10(series, *, soft=False):
+        s = pd.to_numeric(series, errors="coerce")
+        mu = float(np.nanmedian(s))
+        sd = float(mad_std(s - mu))
+        if not np.isfinite(sd) or sd <= 0:
+            # fallback: percent rank to [0..10]
+            r = s.rank(pct=True, method="average")
+            return (10.0 * r).clip(0.0, 10.0)
+        k = 1.5 if (SMALL or soft) else 1.8
+        z = (s - mu) / sd
+        return (5.0 + k * z).clip(0.0, 10.0)
+
+    # ---------- core components (0–10) ----------
+    Accel_10 = _score_0_10(_wdm["Accel"])
+    Mid_10   = _score_0_10(_wdm["tsSPI"])         # race control / mid efficiency
+    Grind_10 = _score_0_10(_wdm[gr_col])
+
+    # ---------- SOS (0–10) ----------
+    if "SOS" in _wdm.columns:
+        SOS_10 = (5.0 * pd.to_numeric(_wdm["SOS"], errors="coerce")).clip(0.0, 10.0)
+    else:
+        # light fallback: quick orchestration index (same recipe as HH v2)
+        ts_w = winsorize(_wdm["tsSPI"])
+        ac_w = winsorize(_wdm["Accel"])
+        gr_w = winsorize(_wdm[gr_col])
+        def _rz(s):
+            mu = float(np.nanmedian(s)); sd = float(mad_std(pd.to_numeric(s, errors="coerce") - mu))
+            return (pd.to_numeric(s, errors="coerce") - mu) / (sd if np.isfinite(sd) and sd > 0 else 1.0)
+        SOS_raw = 0.45*_rz(ts_w) + 0.35*_rz(ac_w) + 0.20*_rz(gr_w)
+        q5, q95 = np.nanpercentile(SOS_raw, [5,95]) if np.isfinite(SOS_raw).any() else (0.0, 1.0)
+        denom = max(q95 - q5, 1.0)
+        SOS_10 = (10.0 * (SOS_raw - q5) / denom).clip(0.0, 10.0)
+
+    # ---------- ASI² (0–10) ----------
+    if "ASI2" in _wdm.columns:
+        ASI2 = pd.to_numeric(_wdm["ASI2"], errors="coerce")
+    else:
+        acc_med = pd.to_numeric(_wdm["Accel"], errors="coerce").median(skipna=True)
+        grd_med = pd.to_numeric(_wdm[gr_col], errors="coerce").median(skipna=True)
+        bias = (acc_med - 100.0) - (grd_med - 100.0)
+        B = min(1.0, abs(bias) / 4.0)
+        S = pd.to_numeric(_wdm["Accel"], errors="coerce") - pd.to_numeric(_wdm[gr_col], errors="coerce")
+        ASI2 = (B * (np.where(bias >= 0, -S, S)).clip(min=0.0) / 5.0)
+    ASI2_10 = (10.0 * (ASI2 / 1.2)).clip(0.0, 10.0)
+
+    # ---------- Shape Fit (0–10) ----------
+    RSI = float(_wdm.attrs.get("RSI", 0.0))
+    SCI = float(_wdm.attrs.get("SCI", 0.5))
+    if "RS_Component" in _wdm.columns:
+        RS_comp = pd.to_numeric(_wdm["RS_Component"], errors="coerce")
+    else:
+        RS_comp = pd.to_numeric(_wdm["Accel"], errors="coerce") - pd.to_numeric(_wdm["tsSPI"], errors="coerce")
+    align = np.tanh((np.sign(RSI) * (RS_comp/6.0)).fillna(0.0))  # [-1,1]
+    strength = (0.60 + 0.40 * max(0.0, min(1.0, SCI))) * min(1.0, abs(RSI)/10.0)
+    RSI_fit_10 = (5.0 + 4.0 * align * strength).clip(0.0, 10.0)
+
+    # ---------- WPI composite (0–10) ----------
+    WPI = (
+        0.25*Accel_10 +
+        0.20*Grind_10 +
+        0.20*Mid_10   +
+        0.15*SOS_10   +
+        0.10*ASI2_10  +
+        0.10*RSI_fit_10
+    ).clip(0.0, 10.0).round(1)
+
+    # ---------- Race Pulse (1–2 lines) ----------
+    dLM_med = float(np.nanmedian(pd.to_numeric(_wdm["Accel"], errors="coerce") - pd.to_numeric(_wdm["tsSPI"], errors="coerce")))
+    dLG_med = float(np.nanmedian(pd.to_numeric(_wdm[gr_col], errors="coerce") - pd.to_numeric(_wdm["Accel"], errors="coerce")))
+    shape = _wdm.attrs.get("SHAPE_TAG", "EVEN")
+    collapse = float(_wdm.attrs.get("CollapseSeverity", 0.0))
+    # verbal bits
+    early = "slow-early" if RSI > 1.2 else ("fast-early" if RSI < -1.2 else "even-tempo")
+    finish = "sprint-home" if dLG_med < -0.8 else ("attritional late" if dLG_med > 0.8 else "balanced finish")
+    clause = "Acceleration decided it" if dLM_med > 0.8 else ("Early pressure set the tone" if dLM_med < -0.8 else "Even mid-race control mattered")
+    fra = f" (SCI {SCI:.2f})"
+    col_note = f"; noticeable field fade" if collapse >= 3.0 else ""
+    race_pulse = f"*Race Pulse:* {early} / {finish} (RSI {RSI:+.2f}{fra}). {clause}{col_note}."
+
+    st.markdown(race_pulse)
+
+    # ---------- Per-horse one-liner ----------
+    def _profile_row(i, a10, m10, g10, sos10, asi10, fit10):
+        strengths = {
+            "acceleration": float(a10),
+            "finish grind": float(g10),
+            "mid control":  float(m10),
+            "orchestration (SOS)": float(sos10),
+        }
+        top2 = sorted(strengths.items(), key=lambda kv: kv[1], reverse=True)[:2]
+        bits = []
+        for k, v in top2:
+            if v >= 6.5: bits.append(k)
+        if not bits:
+            bits = [top2[0][0]]  # at least one descriptor
+
+        shape_txt = ("benefited from race shape" if fit10 >= 6.5
+                     else ("ran against shape" if fit10 <= 3.5 else "neutral to shape"))
+        tough_txt = "bias-tough" if asi10 >= 6.5 else None
+        # polish wording
+        core = " & ".join(bits).replace("finish grind", "sustained finish").replace("mid control", "mid-race control")
+        extras = [shape_txt] + ([tough_txt] if tough_txt else [])
+        return f"{core}; " + ", ".join(extras) + "."
+
+    profile = [
+        _profile_row(i, a, m, g, s, u, f)
+        for i, (a, m, g, s, u, f) in enumerate(zip(Accel_10, Mid_10, Grind_10, SOS_10, ASI2_10, RSI_fit_10))
+    ]
+
+    # ---------- Build table ----------
+    out = pd.DataFrame({
+        "Horse": _wdm.get("Horse", pd.Series([""]*N, index=_wdm.index)),
+        "Accel": Accel_10.round(1),
+        "tsSPI": Mid_10.round(1),
+        "Grind" if gr_col=="Grind" else gr_col: Grind_10.round(1),
+        "SOS":   SOS_10.round(1),
+        "ASI²":  ASI2_10.round(1),
+        "ShapeFit": RSI_fit_10.round(1),
+        "WPI":   WPI,
+        "Profile": profile,
+        "Finish_Pos": _wdm.get("Finish_Pos", np.nan)
+    })
+
+    # tidy column order / label
+    show_cols = ["Horse","Accel","tsSPI",("Grind" if gr_col=="Grind" else gr_col),"SOS","ASI²","ShapeFit","WPI","Profile"]
+    # sort: WPI desc then finish asc if present
+    if "Finish_Pos" in out.columns:
+        out = out.sort_values(["WPI","Finish_Pos"], ascending=[False, True])
+    else:
+        out = out.sort_values(["WPI"], ascending=[False])
+
+    st.dataframe(out[show_cols], use_container_width=True, hide_index=True)
+    st.caption("WPI blends acceleration, staying power, mid-race control, orchestration (SOS), bias toughness (ASI²) and shape fit — all on a 0–10 race-local scale.")
+# ======================= /Winning DNA Matrix =======================
+
     
         # ======================= Hidden Horses (v2, shape-aware) =======================
 st.markdown("## Hidden Horses v2 (Shape-aware)")
