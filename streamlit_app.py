@@ -2871,7 +2871,7 @@ def build_race_pdf(metrics,
     if prof:            meta_line.append(f"Profile: <b>{prof}</b>")
     if meta_line:
         story.append(Paragraph(" · ".join(meta_line), P))
-    story.append(Spacer(1, 6))
+    story.append(PageBreak())
 
     # PI going meta (if available)
     pi_meta = metrics.attrs.get("PI_GOING_META", {})
