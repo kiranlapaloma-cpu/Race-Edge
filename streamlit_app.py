@@ -1405,85 +1405,35 @@ if pi_meta:
         st.caption(f"Going: {g} — PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
         st.caption("RSI: + = slow-early (late favoured), − = fast-early (early favoured).  RS_Component per horse uses the same axis.  🔵 with shape · 🔴 against shape.")
 
-# ======================= GCI → Lengths Converter (optional insight) =======================
-with st.expander("📏 GCI → Lengths Conversion (Context Insight)"):
-    df = metrics.copy()
+# ======================= GCI → Lengths (distance-based, no margins) =======================
+with st.expander("📏 GCI → Lengths (distance-based)"):
+    Dm = float(race_distance_input)
+    going = (metrics.attrs.get("GOING") or "Good") if "GOING" in metrics.attrs else "Good"
 
-    # --- pick GCI series (prefer RS-adjusted if available) ---
-    gci_col = "GCI_RS" if "GCI_RS" in df.columns and df["GCI_RS"].notna().any() else "GCI"
-    if gci_col not in df.columns or not df[gci_col].notna().any() or "RaceTime_s" not in df.columns:
-        st.caption("Not enough data to estimate GCI → lengths for this race.")
-    else:
-        # --- seconds behind winner (SBW) ---
-        rt = pd.to_numeric(df["RaceTime_s"], errors="coerce")
-        if not rt.notna().any():
-            st.caption("Not enough valid race times to estimate conversion.")
-        else:
-            sbw = rt - float(rt.min())
-            gci = pd.to_numeric(df[gci_col], errors="coerce")
-            mask = sbw.notna() & gci.notna()
-            x_sec = sbw[mask].to_numpy()              # seconds behind winner
-            y_gci = gci[mask].to_numpy()              # GCI (or GCI_RS)
+    # Core distance curve (your preferred scale)
+    def lengths_per_gci(dm: float) -> float:
+        if dm <= 1100: return 1.6   # sharp sprints
+        if dm <= 1300: return 1.8
+        if dm <= 1500: return 2.0
+        if dm <= 1700: return 2.2
+        if dm <= 2000: return 2.4
+        if dm <= 2400: return 2.6
+        return 2.7                   # extreme trips
 
-            # --- distance-aware seconds-per-length ---
-            Dm = float(race_distance_input)
-            def _sec_per_len(dm: float) -> float:
-                if dm <= 1200: return 0.17
-                if dm <= 1400: return 0.18
-                if dm <= 1600: return 0.20
-                if dm <= 1800: return 0.21
-                if dm <= 2000: return 0.22
-                if dm <= 2400: return 0.24
-                return 0.23
-            spl = _sec_per_len(Dm)
+    # Optional: subtle going modulation (kept tiny; can remove if you want 100% fixed)
+    def going_tweak(base: float, going_str: str) -> float:
+        g = str(going_str).strip().title()
+        if g == "Firm":  return base * 0.95  # speed = fewer lengths per class point
+        if g == "Heavy": return base * 1.05  # grind = more lengths per class point
+        return base  # Good/Soft default to neutral (or set Soft to 1.02 if you wish)
 
-            # --- fixed fallback: distance → lengths per 1.0 GCI ---
-            def _fallback_len_per_gci(dm: float) -> float:
-                if dm <= 1200: return 1.6
-                if dm <= 1400: return 1.8
-                if dm <= 1600: return 2.0
-                if dm <= 1800: return 2.2
-                if dm <= 2000: return 2.4
-                return 2.6
+    base_len = lengths_per_gci(Dm)
+    adj_len  = going_tweak(base_len, going)
+    adj_len  = float(max(1.0, min(4.0, adj_len)))  # gentle sanity clamp
 
-            method = "race-specific regression"
-            r2 = np.nan
-            len_per_gci = None
-
-            # --- try simple linear fit: GCI ~ a + b * SBW ---
-            # (b is dGCI/dSec; convert to lengths/GCI = (sec/length) / |dGCI/dSec|)
-            try:
-                if x_sec.size >= 4 and np.nanstd(x_sec) > 1e-6 and np.nanstd(y_gci) > 1e-6:
-                    b, a = np.polyfit(x_sec, y_gci, 1)  # y = a + b*x
-                    # R^2
-                    y_hat = a + b * x_sec
-                    ss_res = float(np.sum((y_gci - y_hat) ** 2))
-                    ss_tot = float(np.sum((y_gci - np.mean(y_gci)) ** 2)) if np.isfinite(np.mean(y_gci)) else np.nan
-                    r2 = 1.0 - (ss_res / ss_tot) if (np.isfinite(ss_tot) and ss_tot > 0) else np.nan
-
-                    if np.isfinite(b) and abs(b) > 1e-6 and (not np.isfinite(r2) or r2 >= 0.25):
-                        sec_per_gci = 1.0 / abs(b)
-                        len_per_gci = spl / sec_per_gci
-                    else:
-                        method = "distance fallback"
-                        len_per_gci = _fallback_len_per_gci(Dm)
-                else:
-                    method = "distance fallback"
-                    len_per_gci = _fallback_len_per_gci(Dm)
-            except Exception:
-                method = "distance fallback"
-                len_per_gci = _fallback_len_per_gci(Dm)
-
-            # --- tidy output ---
-            len_per_gci = float(max(0.5, min(4.0, len_per_gci)))  # gentle sanity clamp
-            band = f"{int(Dm)}m"
-            st.write(f"**In this {band} race, 1.0 GCI ≈ {len_per_gci:.2f} lengths.**")
-            extra = f"Method: {method}"
-            if np.isfinite(r2):
-                extra += f" · Fit R²={r2:.2f}"
-            extra += f" · Seconds/length≈{spl:.2f}s"
-            st.caption(extra)
-# ======================= /GCI → Lengths Converter =======================
+    st.write(f"**Rule of thumb:** in a {int(Dm)}m race, **1.0 GCI ≈ {adj_len:.2f} lengths**.")
+    st.caption(f"Distance-only mapping (no margins). Going tweak applied: {going}.")
+# ======================= /GCI → Lengths =======================
 
 # ======================= Ahead of Handicap (Single-Race, Field-Aware) =======================
 st.markdown("## Ahead of Handicap — Single Race Field Context")
