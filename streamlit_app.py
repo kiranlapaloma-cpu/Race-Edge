@@ -1438,35 +1438,43 @@ else:
     st.caption(f"Source: **{gci_col}** (pure stats; no class labels).")
 # =================== /Race Class Summary ===================
 
-# ======================= GCI → Lengths (distance-based, no margins) =======================
-with st.expander("📏 GCI → Lengths (distance-based)"):
-    Dm = float(race_distance_input)
-    going = (metrics.attrs.get("GOING") or "Good") if "GOING" in metrics.attrs else "Good"
+# ======================= PI → Lengths Estimator (compact) =======================
+st.markdown("---")
+st.markdown("### PI → Lengths Estimator")
 
-    # Core distance curve (your preferred scale)
-    def lengths_per_gci(dm: float) -> float:
-        if dm <= 1100: return 1.6   # sharp sprints
-        if dm <= 1300: return 1.8
-        if dm <= 1500: return 2.0
-        if dm <= 1700: return 2.2
-        if dm <= 2000: return 2.4
-        if dm <= 2400: return 2.6
-        return 2.7                   # extreme trips
+# Formula: lengths per 1.0 PI at distance D (m)
+def lengths_per_pi(distance_m: float) -> float:
+    # Baseline 3.5L @1000m, ~4.0L @1200m, grows ~linearly with distance
+    L = 3.5 + 0.00125 * (float(distance_m) - 1000.0)
+    return float(np.clip(L, 2.5, 8.5))  # soft safety clamp
 
-    # Optional: subtle going modulation (kept tiny; can remove if you want 100% fixed)
-    def going_tweak(base: float, going_str: str) -> float:
-        g = str(going_str).strip().title()
-        if g == "Firm":  return base * 0.95  # speed = fewer lengths per class point
-        if g == "Heavy": return base * 1.05  # grind = more lengths per class point
-        return base  # Good/Soft default to neutral (or set Soft to 1.02 if you wish)
+colA, colB = st.columns([1,1])
+with colA:
+    D_for_pi = st.number_input("Distance for conversion (m)", min_value=800, max_value=3600,
+                               value=int(race_distance_input), step=50)
+with colB:
+    dPI = st.number_input("ΔPI between horses (winner − rival)", value=1.0, step=0.1, format="%.1f")
 
-    base_len = lengths_per_gci(Dm)
-    adj_len  = going_tweak(base_len, going)
-    adj_len  = float(max(1.0, min(4.0, adj_len)))  # gentle sanity clamp
+L_per_PI = lengths_per_pi(D_for_pi)
+est_margin = dPI * L_per_PI
 
-    st.write(f"**Rule of thumb:** in a {int(Dm)}m race, **1.0 GCI ≈ {adj_len:.2f} lengths**.")
-    st.caption(f"Distance-only mapping (no margins). Going tweak applied: {going}.")
-# ======================= /GCI → Lengths =======================
+# Friendly readout
+lead_word = "ahead" if est_margin >= 0 else "behind"
+st.metric(
+    label="Estimated margin from PI gap",
+    value=f"{abs(est_margin):.2f} lengths",
+    delta=f"{L_per_PI:.2f} L per 1.0 PI @ {D_for_pi}m"
+)
+st.caption("Rule of thumb: ~4.0L/PI at 1200m, ~5.0L/PI at 1600m, ~6.0L/PI at 2000m (scaled linearly).")
+
+# Quick handy table for common gaps at this distance
+gaps = np.array([0.5, 1.0, 1.5, 2.0])
+tbl = pd.DataFrame({
+    "ΔPI": gaps,
+    f"Lengths @ {D_for_pi}m": np.round(gaps * L_per_PI, 2)
+})
+st.dataframe(tbl, use_container_width=True, hide_index=True)
+# ======================= /PI → Lengths Estimator =======================
 
 # ======================= Ahead of Handicap (Single-Race, Field-Aware) =======================
 st.markdown("## Ahead of Handicap — Single Race Field Context")
