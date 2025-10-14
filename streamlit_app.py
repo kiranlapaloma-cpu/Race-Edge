@@ -1363,7 +1363,7 @@ show_cols = [
     "F200_idx","tsSPI","Accel","Grind","Grind_CG",
     "EARLY_idx","LATE_idx",
     "GrindAdjPts","DeltaG",
-    "PI","GCI","GCI_RS","Horse",
+    "PI","GCI","GCI_RS",
     "RSI","RS_Component","RSI_Cue"
 ]
 
