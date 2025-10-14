@@ -1366,6 +1366,14 @@ show_cols = [
     "PI","GCI","GCI_RS",
     "RSI","RS_Component","RSI_Cue"
 ]
+st.dataframe(
+    metrics[show_cols],
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Horse": st.column_config.TextColumn("Horse", pinned="left")
+    }
+)
 
 # ---- make the column pick robust (no KeyError if some are missing) ----
 tmp = metrics.copy()
