@@ -1405,6 +1405,39 @@ if pi_meta:
         st.caption(f"Going: {g} — PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
         st.caption("RSI: + = slow-early (late favoured), − = fast-early (early favoured).  RS_Component per horse uses the same axis.  🔵 with shape · 🔴 against shape.")
 
+# ======================= Race Class Summary (pure stats) =======================
+st.markdown("## Race Class Summary")
+
+# Prefer GCI_RS, fall back to GCI
+gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else "GCI"
+s = pd.to_numeric(metrics.get(gci_col, pd.Series(dtype=float)), errors="coerce").dropna()
+
+if s.empty:
+    st.info("No valid GCI values found for this race.")
+else:
+    mean_v   = float(s.mean())
+    med_v    = float(s.median())
+    # Robust spread stats (raw MAD, not 1.4826 scaled; and IQR)
+    mad_raw  = float(np.nanmedian(np.abs(s - med_v)))
+    try:
+        q75, q25 = np.nanpercentile(s, 75), np.nanpercentile(s, 25)
+        iqr_v    = float(q75 - q25)
+    except Exception:
+        iqr_v    = float("nan")
+
+    c1, c2, c3, c4 = st.columns([1,1,1,1])
+    with c1:
+        st.metric("Mean GCI", f"{mean_v:.2f}")
+    with c2:
+        st.metric("Median GCI", f"{med_v:.2f}")
+    with c3:
+        st.metric("Spread (MAD)", f"{mad_raw:.2f}")
+    with c4:
+        st.metric("IQR", f"{iqr_v:.2f}" if np.isfinite(iqr_v) else "—")
+
+    st.caption(f"Source: **{gci_col}** (pure stats; no class labels).")
+# =================== /Race Class Summary ===================
+
 # ======================= GCI → Lengths (distance-based, no margins) =======================
 with st.expander("📏 GCI → Lengths (distance-based)"):
     Dm = float(race_distance_input)
