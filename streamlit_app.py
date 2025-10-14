@@ -1438,37 +1438,6 @@ else:
     st.caption(f"Source: **{gci_col}** (pure stats; no class labels).")
 # =================== /Race Class Summary ===================
 
-# ======================= PI → Lengths Estimator (compact) =======================
-st.markdown("---")
-st.markdown("### PI → Lengths Estimator")
-
-# Formula: lengths per 1.0 PI at distance D (m)
-def lengths_per_pi(distance_m: float) -> float:
-    # Baseline 3.5L @1000m, ~4.0L @1200m, grows ~linearly with distance
-    L = 3.5 + 0.00125 * (float(distance_m) - 1000.0)
-    return float(np.clip(L, 2.5, 8.5))  # soft safety clamp
-
-colA, colB = st.columns([1,1])
-with colA:
-    D_for_pi = st.number_input("Distance for conversion (m)", min_value=800, max_value=3600,
-                               value=int(race_distance_input), step=50)
-with colB:
-    dPI = st.number_input("ΔPI between horses (winner − rival)", value=1.0, step=0.1, format="%.1f")
-
-L_per_PI = lengths_per_pi(D_for_pi)
-est_margin = dPI * L_per_PI
-
-# Friendly readout
-lead_word = "ahead" if est_margin >= 0 else "behind"
-st.metric(
-    label="Estimated margin from PI gap",
-    value=f"{abs(est_margin):.2f} lengths",
-    delta=f"{L_per_PI:.2f} L per 1.0 PI @ {D_for_pi}m"
-)
-st.caption("Rule of thumb: ~4.0L/PI at 1200m, ~5.0L/PI at 1600m, ~6.0L/PI at 2000m (scaled linearly).")
-
-# ======================= /PI → Lengths Estimator =======================
-
 # ======================= Ahead of Handicap (Single-Race, Field-Aware) =======================
 st.markdown("## Ahead of Handicap — Single Race Field Context")
 
@@ -1526,6 +1495,38 @@ AH_view = AH.sort_values(["AHS","Finish_Pos"], ascending=[False, True])[ah_cols]
 st.dataframe(AH_view, use_container_width=True)
 st.caption("AH = Ahead-of-Handicap (single race). Centre = trimmed median PI; spread = MAD σ; FSI mildly rewards late balance.")
 # ======================= End Ahead of Handicap =======================
+
+# ======================= PI → Lengths Estimator (compact) =======================
+st.markdown("---")
+st.markdown("### PI → Lengths Estimator")
+
+# Formula: lengths per 1.0 PI at distance D (m)
+def lengths_per_pi(distance_m: float) -> float:
+    # Baseline 3.5L @1000m, ~4.0L @1200m, grows ~linearly with distance
+    L = 3.5 + 0.00125 * (float(distance_m) - 1000.0)
+    return float(np.clip(L, 2.5, 8.5))  # soft safety clamp
+
+colA, colB = st.columns([1,1])
+with colA:
+    D_for_pi = st.number_input("Distance for conversion (m)", min_value=800, max_value=3600,
+                               value=int(race_distance_input), step=50)
+with colB:
+    dPI = st.number_input("ΔPI between horses (winner − rival)", value=1.0, step=0.1, format="%.1f")
+
+L_per_PI = lengths_per_pi(D_for_pi)
+est_margin = dPI * L_per_PI
+
+# Friendly readout
+lead_word = "ahead" if est_margin >= 0 else "behind"
+st.metric(
+    label="Estimated margin from PI gap",
+    value=f"{abs(est_margin):.2f} lengths",
+    delta=f"{L_per_PI:.2f} L per 1.0 PI @ {D_for_pi}m"
+)
+st.caption("Rule of thumb: ~4.0L/PI at 1200m, ~5.0L/PI at 1600m, ~6.0L/PI at 2000m (scaled linearly).")
+
+# ======================= /PI → Lengths Estimator =======================
+
 # ======================= End of Batch 2 =======================
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
 from matplotlib.patches import Rectangle
