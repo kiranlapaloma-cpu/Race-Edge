@@ -1380,14 +1380,7 @@ display_df = display_df.assign(_FinishSort=_finish_sort).sort_values(
     ["PI","_FinishSort"], ascending=[False, True]
 ).drop(columns=["_FinishSort"])
 
-st.dataframe(
-    metrics[show_cols],
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Horse": st.column_config.TextColumn("Horse", pinned="left")
-    }
-)
+st.dataframe(metrics[show_cols], use_container_width=True)
 
 # Now (optionally) backfill RSI/exposure cue columns from attrs if they were missing
 if "RSI" in metrics.attrs and display_df["RSI"].isna().all():
