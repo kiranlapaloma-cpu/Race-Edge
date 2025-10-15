@@ -1496,36 +1496,100 @@ st.dataframe(AH_view, use_container_width=True)
 st.caption("AH = Ahead-of-Handicap (single race). Centre = trimmed median PI; spread = MAD σ; FSI mildly rewards late balance.")
 # ======================= End Ahead of Handicap =======================
 
-# ======================= PI → Lengths Estimator (compact) =======================
-st.markdown("---")
-st.markdown("### PI → Lengths Estimator")
+# ======================= PI ↔ Lengths ↔ kg Converter (distance-aware) =======================
+st.markdown("## PI ↔ Lengths ↔ kg — distance-aware converter")
 
-# Formula: lengths per 1.0 PI at distance D (m)
-def lengths_per_pi(distance_m: float) -> float:
-    # Baseline 3.5L @1000m, ~4.0L @1200m, grows ~linearly with distance
-    L = 3.5 + 0.00125 * (float(distance_m) - 1000.0)
-    return float(np.clip(L, 2.5, 8.5))  # soft safety clamp
+# ---- Tunable curves (edit knots, not formulas) ----
+# 1 PI point ⇒ these many lengths, by trip (drag accumulates with distance)
+_PIPOINT_TO_LENGTHS_KNOTS = [
+    (1000, 3.6),
+    (1200, 4.0),   # your chosen anchor
+    (1400, 4.3),
+    (1600, 4.6),
+    (1800, 4.8),
+    (2000, 5.0),   # your earlier intuition
+    (2400, 5.5),
+    (3200, 6.0),
+]
 
-colA, colB = st.columns([1,1])
+# 1 kg ⇒ these many lengths, by trip (longer = more lengths per kg)
+_LENGTHS_PER_KG_KNOTS = [
+    (1000, 0.90),
+    (1200, 1.00),
+    (1400, 1.10),
+    (1600, 1.20),
+    (1800, 1.30),
+    (2000, 1.40),
+    (2400, 1.50),
+    (3200, 1.60),
+]
+
+def _interp_knots(dm: float, knots: list[tuple[float, float]]) -> float:
+    dm = float(dm)
+    # clamp ends
+    if dm <= knots[0][0]: return float(knots[0][1])
+    if dm >= knots[-1][0]: return float(knots[-1][1])
+    # piecewise linear interpolation
+    for (da, va), (db, vb) in zip(knots, knots[1:]):
+        if da <= dm <= db:
+            t = (dm - da) / (db - da) if db > da else 0.0
+            return float(va + (vb - va) * t)
+    return float(knots[-1][1])
+
+def lengths_per_pi_point(distance_m: float) -> float:
+    return _interp_knots(distance_m, _PIPOINT_TO_LENGTHS_KNOTS)
+
+def lengths_per_kg(distance_m: float) -> float:
+    return _interp_knots(distance_m, _LENGTHS_PER_KG_KNOTS)
+
+# ---- UI ----
+colA, colB, colC = st.columns([1.2, 1, 1])
 with colA:
-    D_for_pi = st.number_input("Distance for conversion (m)", min_value=800, max_value=3600,
-                               value=int(race_distance_input), step=50)
+    dist_m = st.number_input("Race distance (m)", min_value=800, max_value=3600, step=50,
+                             value=int(race_distance_input) if 'race_distance_input' in globals() else 1600)
 with colB:
-    dPI = st.number_input("ΔPI between horses (winner − rival)", value=1.0, step=0.1, format="%.1f")
+    pi_diff = st.number_input("PI difference (A − B)", value=1.0, step=0.1, format="%.2f")
+with colC:
+    kg_diff = st.number_input("Weight difference (A − B, kg)", value=0.0, step=0.5, format="%.2f")
 
-L_per_PI = lengths_per_pi(D_for_pi)
-est_margin = dPI * L_per_PI
+# ---- Core conversions ----
+L_per_PI = lengths_per_pi_point(dist_m)
+L_per_kg = lengths_per_kg(dist_m)
 
-# Friendly readout
-lead_word = "ahead" if est_margin >= 0 else "behind"
-st.metric(
-    label="Estimated margin from PI gap",
-    value=f"{abs(est_margin):.2f} lengths",
-    delta=f"{L_per_PI:.2f} L per 1.0 PI @ {D_for_pi}m"
+# Forward: PI → lengths → kg
+len_from_pi = pi_diff * L_per_PI
+kg_from_pi  = len_from_pi / L_per_kg if L_per_kg > 0 else 0.0
+
+# Reverse: kg → lengths → PI
+len_from_kg = kg_diff * L_per_kg
+pi_from_kg  = (len_from_kg / L_per_PI) if L_per_PI > 0 else 0.0
+
+# ---- Display (simple report-card tiles) ----
+box1, box2, box3 = st.columns(3)
+with box1:
+    st.metric("1 PI point ⇒ lengths", f"{L_per_PI:.2f} L", help="Distance-scaled: more at longer trips.")
+with box2:
+    st.metric("1 kg ⇒ lengths", f"{L_per_kg:.2f} L", help="Drag accumulates with distance.")
+with box3:
+    st.caption(f"Calibrated by knots; edit `_PIPOINT_TO_LENGTHS_KNOTS` / `_LENGTHS_PER_KG_KNOTS` to retune.")
+
+st.markdown("#### Convert")
+c1, c2 = st.columns(2)
+with c1:
+    st.subheader("From PI")
+    st.write(f"**PI Δ = {pi_diff:.2f}** at **{dist_m}m** ≈ **{len_from_pi:.2f} lengths**")
+    st.write(f"…equivalent to **{kg_from_pi:.2f} kg** (at {L_per_kg:.2f} L/kg)")
+
+with c2:
+    st.subheader("From kg")
+    st.write(f"**Weight Δ = {kg_diff:.2f} kg** at **{dist_m}m** ≈ **{len_from_kg:.2f} lengths**")
+    st.write(f"…equivalent to **{pi_from_kg:.2f} PI points** (at {L_per_PI:.2f} L/PI)")
+
+st.caption(
+    "Notes: PI measures realised performance efficiency; these converters map that to race margins and "
+    "weight using distance-aware drag curves. Curves are intentionally smooth and editable via the knot tables."
 )
-st.caption("Rule of thumb: ~4.0L/PI at 1200m, ~5.0L/PI at 1600m, ~6.0L/PI at 2000m (scaled linearly).")
-
-# ======================= /PI → Lengths Estimator =======================
+# ======================= /PI ↔ Lengths ↔ kg Converter =======================
 
 # ======================= End of Batch 2 =======================
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
