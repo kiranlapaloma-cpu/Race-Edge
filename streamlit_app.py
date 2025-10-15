@@ -1525,13 +1525,6 @@ st.metric(
 )
 st.caption("Rule of thumb: ~4.0L/PI at 1200m, ~5.0L/PI at 1600m, ~6.0L/PI at 2000m (scaled linearly).")
 
-# Quick handy table for common gaps at this distance
-gaps = np.array([0.5, 1.0, 1.5, 2.0])
-tbl = pd.DataFrame({
-    "ΔPI": gaps,
-    f"Lengths @ {D_for_pi}m": np.round(gaps * L_per_PI, 2)
-})
-st.dataframe(tbl, use_container_width=True, hide_index=True)
 # ======================= /PI → Lengths Estimator =======================
 
 # ======================= End of Batch 2 =======================
