@@ -1438,98 +1438,36 @@ else:
     st.caption(f"Source: **{gci_col}** (pure stats; no class labels).")
 # =================== /Race Class Summary ===================
 
-# ======================= PI Handicap Line — Neat Horse Labels =======================
-st.markdown("## PI Handicap Line — Who Beat the Handicap?")
+# ======================= PI → Lengths Estimator (compact) =======================
+st.markdown("---")
+st.markdown("### PI → Lengths Estimator")
 
-try:
-    df_plot = metrics.copy()
+# Formula: lengths per 1.0 PI at distance D (m)
+def lengths_per_pi(distance_m: float) -> float:
+    # Baseline 3.5L @1000m, ~4.0L @1200m, grows ~linearly with distance
+    L = 3.5 + 0.00125 * (float(distance_m) - 1000.0)
+    return float(np.clip(L, 2.5, 8.5))  # soft safety clamp
 
-    # --- Check & clean ---
-    if "PI" not in df_plot.columns:
-        st.info("PI Handicap Line: PI column not found.")
-    else:
-        df_plot["PI"] = pd.to_numeric(df_plot["PI"], errors="coerce")
-        df_plot = df_plot.dropna(subset=["PI"]).copy()
+colA, colB = st.columns([1,1])
+with colA:
+    D_for_pi = st.number_input("Distance for conversion (m)", min_value=800, max_value=3600,
+                               value=int(race_distance_input), step=50)
+with colB:
+    dPI = st.number_input("ΔPI between horses (winner − rival)", value=1.0, step=0.1, format="%.1f")
 
-        # Sort by finishing position or PI
-        if "Finish_Pos" in df_plot.columns and df_plot["Finish_Pos"].notna().any():
-            df_plot = df_plot.sort_values("Finish_Pos")
-        else:
-            df_plot = df_plot.sort_values("PI", ascending=False)
+L_per_PI = lengths_per_pi(D_for_pi)
+est_margin = dPI * L_per_PI
 
-        # --- Setup ---
-        HANDICAP_LINE = 5.00
-        BAND = 0.25
-        def color_for(pi):
-            if pi >= HANDICAP_LINE + BAND: return "#27ae60"  # green
-            if pi <= HANDICAP_LINE - BAND: return "#c0392b"  # red
-            return "#f1c40f"                                 # yellow
+# Friendly readout
+lead_word = "ahead" if est_margin >= 0 else "behind"
+st.metric(
+    label="Estimated margin from PI gap",
+    value=f"{abs(est_margin):.2f} lengths",
+    delta=f"{L_per_PI:.2f} L per 1.0 PI @ {D_for_pi}m"
+)
+st.caption("Rule of thumb: ~4.0L/PI at 1200m, ~5.0L/PI at 1600m, ~6.0L/PI at 2000m (scaled linearly).")
 
-        df_plot["Color"] = df_plot["PI"].apply(color_for)
-
-        horses = df_plot["Horse"].astype(str).tolist()
-        pis = df_plot["PI"].tolist()
-        colors = df_plot["Color"].tolist()
-
-        # --- Fairness summary ---
-        pi_median = float(np.nanmedian(pis))
-        pi_mad = float(np.nanmedian(np.abs(pis - pi_median)))
-        fairness_spread = 1.4826 * pi_mad
-
-        # --- Draw chart ---
-        fig_w = max(8.5, len(horses) * 0.5)
-        fig, ax = plt.subplots(figsize=(fig_w, 5.0), layout="constrained")
-
-        # Handicap line + to-mark band
-        ax.axhline(HANDICAP_LINE, color="#7f8c8d", lw=2.0, ls="--", alpha=0.85, zorder=0)
-        ax.fill_between(
-            [-0.5, len(horses) - 0.5],
-            HANDICAP_LINE - BAND, HANDICAP_LINE + BAND,
-            color="#f1c40f", alpha=0.10, zorder=0
-        )
-
-        # Scatter points
-        ax.scatter(range(len(horses)), pis, s=70, c=colors,
-                   edgecolor="black", linewidth=0.6, alpha=0.95, zorder=3)
-
-        # X-axis labels (angled & spaced neatly)
-        ax.set_xticks(range(len(horses)))
-        ax.set_xticklabels(
-            horses,
-            rotation=35,
-            ha="right",
-            va="top",
-            fontsize=8.5,
-            rotation_mode="anchor"
-        )
-
-        # Aesthetic polish
-        ax.set_ylabel("Performance Index (PI)")
-        ax.set_title("PI Handicap Line — 5.00 = Ran to Mark", fontsize=12, fontweight="bold", pad=10)
-        ax.grid(True, linestyle=":", alpha=0.25)
-        ax.set_ylim(min(pis) - 0.4, max(pis) + 0.5)
-        ax.tick_params(axis='x', which='major', pad=4)
-
-        # Ensure labels don't overlap on long fields
-        for label in ax.get_xticklabels():
-            label.set_horizontalalignment('right')
-
-        st.pyplot(fig)
-
-        # Caption
-        n_green = int((df_plot["PI"] >= HANDICAP_LINE + BAND).sum())
-        n_yellow = int(((df_plot["PI"] > HANDICAP_LINE - BAND) & (df_plot["PI"] < HANDICAP_LINE + BAND)).sum())
-        n_red = int((df_plot["PI"] <= HANDICAP_LINE - BAND).sum())
-        st.caption(
-            f"Field median PI = {pi_median:.2f} · Fairness spread ≈ {fairness_spread:.2f}. "
-            f"Beat handicap: {n_green} · Ran to mark: {n_yellow} · Below mark: {n_red}."
-        )
-
-except Exception as e:
-    st.warning("PI Handicap Line failed to render.")
-    if DEBUG:
-        st.exception(e)
-# ======================= /PI Handicap Line =======================
+# ======================= /PI → Lengths Estimator =======================
 
 # ======================= Ahead of Handicap (Single-Race, Field-Aware) =======================
 st.markdown("## Ahead of Handicap — Single Race Field Context")
@@ -1588,39 +1526,8 @@ AH_view = AH.sort_values(["AHS","Finish_Pos"], ascending=[False, True])[ah_cols]
 st.dataframe(AH_view, use_container_width=True)
 st.caption("AH = Ahead-of-Handicap (single race). Centre = trimmed median PI; spread = MAD σ; FSI mildly rewards late balance.")
 # ======================= End Ahead of Handicap =======================
-
-# ======================= PI → Lengths Estimator (compact) =======================
-st.markdown("---")
-st.markdown("### PI → Lengths Estimator")
-
-# Formula: lengths per 1.0 PI at distance D (m)
-def lengths_per_pi(distance_m: float) -> float:
-    # Baseline 3.5L @1000m, ~4.0L @1200m, grows ~linearly with distance
-    L = 3.5 + 0.00125 * (float(distance_m) - 1000.0)
-    return float(np.clip(L, 2.5, 8.5))  # soft safety clamp
-
-colA, colB = st.columns([1,1])
-with colA:
-    D_for_pi = st.number_input("Distance for conversion (m)", min_value=800, max_value=3600,
-                               value=int(race_distance_input), step=50)
-with colB:
-    dPI = st.number_input("ΔPI between horses (winner − rival)", value=1.0, step=0.1, format="%.1f")
-
-L_per_PI = lengths_per_pi(D_for_pi)
-est_margin = dPI * L_per_PI
-
-# Friendly readout
-lead_word = "ahead" if est_margin >= 0 else "behind"
-st.metric(
-    label="Estimated margin from PI gap",
-    value=f"{abs(est_margin):.2f} lengths",
-    delta=f"{L_per_PI:.2f} L per 1.0 PI @ {D_for_pi}m"
-)
-st.caption("Rule of thumb: ~4.0L/PI at 1200m, ~5.0L/PI at 1600m, ~6.0L/PI at 2000m (scaled linearly).")
-
-# ======================= /PI → Lengths Estimator =======================
-
 # ======================= End of Batch 2 =======================
+
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
 from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
