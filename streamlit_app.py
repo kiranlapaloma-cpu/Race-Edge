@@ -2560,16 +2560,36 @@ XW["xWin"] = XW["xWin"] / (XW["xWin"].sum() or 1.0)
 # ---------- tidy explainers ----------
 def _driver_line(r):
     bits = []
-    if float(r.get("T01_eff",0)) >= 0.55: bits.append("Travel +")
-    if float(r.get("K01",0))     >= 0.55: bits.append("Kick ++")
-    if float(r.get("S01",0))     >= 0.55: bits.append("Sustain +")
-    # shape cue if SCI decent
+
+    # --- Early behaviour from F200 ---
+    f200 = float(r.get("F200_idx", np.nan))
+    if np.isfinite(f200):
+        if f200 >= 101:
+            bits.append("Quick early")
+        elif f200 <= 98:
+            bits.append("Slower away")
+
+    # --- Core sectional pillars ---
+    if float(r.get("T01_eff", 0)) >= 0.55:
+        bits.append("Travel +")
+    if float(r.get("K01", 0)) >= 0.55:
+        bits.append("Kick ++")
+    if float(r.get("S01", 0)) >= 0.55:
+        bits.append("Sustain +")
+
+    # --- Shape cue (only if SCI decent) ---
     if SCI >= 0.6:
-        k = float(-np.sign(RSI) * (float(r.get("Accel",np.nan)) - float(r.get("tsSPI",np.nan))))
+        k = float(-np.sign(RSI) * (float(r.get("Accel", np.nan)) - float(r.get("tsSPI", np.nan))))
         if np.isfinite(k):
-            if k > 0.6:  bits.append("Against shape")
-            elif k < -0.6: bits.append("With shape")
-    if trim_T > 0: bits.append("(slow mid)")
+            if k > 0.6:
+                bits.append("Against shape")
+            elif k < -0.6:
+                bits.append("With shape")
+
+    # --- Midrace trim note ---
+    if trim_T > 0:
+        bits.append("(slow mid)")
+
     return " · ".join(bits)
 
 XW["Drivers"] = XW.apply(_driver_line, axis=1)
