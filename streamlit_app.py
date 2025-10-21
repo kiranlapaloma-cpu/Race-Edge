@@ -2557,6 +2557,22 @@ XW["xWin"] = (exps / sum_exps) * alpha  # shrink slightly by alpha
 # renormalise after shrink so they still sum to 1.00
 XW["xWin"] = XW["xWin"] / (XW["xWin"].sum() or 1.0)
 
+# ---- fair odds conversion ---------------------------------------
+def _to_fractional_odds(p):
+    """Convert probability (0–1) to fractional-style odds like '5.2/1'."""
+    try:
+        p = float(p)
+        if p <= 0: return "-"
+        dec = 1.0 / p
+        frac = dec - 1.0
+        return f"{frac:.1f}/1"
+    except Exception:
+        return "-"
+
+xwin_df["Odds (≈fair)"] = xwin_df["xWin"].apply(
+    lambda x: _to_fractional_odds(x / 100.0)
+)
+
 # ---------- tidy explainers ----------
 def _driver_line(r):
     bits = []
@@ -2595,7 +2611,7 @@ def _driver_line(r):
 XW["Drivers"] = XW.apply(_driver_line, axis=1)
 
 # ---------- render ----------
-view = XW[["Horse","xWin","Drivers"]].copy()
+view = ["Horse", "xWin", "Odds (≈fair)", "Drivers"]
 view = view.sort_values("xWin", ascending=False).reset_index(drop=True)
 view["xWin"] = (100.0 * view["xWin"]).round(1)
 
