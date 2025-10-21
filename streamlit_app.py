@@ -3009,6 +3009,156 @@ st.dataframe(AM_view, use_container_width=True)
 
 # ... end of Ability Matrix render (plot + AM_view table) ...
 
+# ======================= EER — Energy Efficiency Ratio (drop-in) =======================
+st.markdown("## EER — Energy Efficiency Ratio")
+
+EER = metrics.copy()
+gr_col = metrics.attrs.get("GR_COL", "Grind")
+STEP   = float(metrics.attrs.get("STEP", 100))   # metres per split step if you have per-100/200/300 splits
+RSI    = float(metrics.attrs.get("RSI", 0.0))    # + = slow-early, − = fast-early
+SCI    = float(metrics.attrs.get("SCI", 0.0))    # 0..1
+
+# ---------- helpers ----------
+def _to_num(s): 
+    try:
+        v=float(s); 
+        return v if np.isfinite(v) else np.nan
+    except: 
+        return np.nan
+
+def _clip(v, lo, hi):
+    try:
+        v=float(v)
+        return min(max(v, lo), hi)
+    except:
+        return np.nan
+
+def _idx(v):
+    v=_to_num(v)
+    return v if np.isfinite(v) else np.nan
+
+# ---------- ensure inputs ----------
+for c in ["tsSPI","Accel",gr_col,"RaceTime_s","Horse"]:
+    if c not in EER.columns:
+        EER[c] = np.nan
+
+# ---------- physics EER (if we have any late split times) ----------
+# peak sectional speed from the fastest of last 300/200/100 (if present)
+split_cols = [c for c in ["300_Time","200_Time","100_Time"] if c in EER.columns]
+def _peak_speed_row(r):
+    spds=[]
+    for c in split_cols:
+        t=_to_num(r.get(c))
+        if np.isfinite(t) and t>0:
+            spds.append(STEP / t)  # m/s for that step
+    return max(spds) if spds else np.nan
+
+EER["_peak_spd"] = EER.apply(_peak_speed_row, axis=1)
+
+# average race speed (m/s) if distance & total time exist
+race_dist_m = None
+try:
+    race_dist_m = float(race_distance_input)
+except:
+    pass
+
+if race_dist_m is not None and "RaceTime_s" in EER.columns:
+    EER["_avg_spd"] = race_dist_m / pd.to_numeric(EER["RaceTime_s"], errors="coerce")
+else:
+    EER["_avg_spd"] = np.nan
+
+# physics EER% = 100 * AvgSpeed / PeakSectionSpeed
+EER["EER_phys"] = 100.0 * (EER["_avg_spd"] / EER["_peak_spd"])
+EER.loc[~np.isfinite(EER["EER_phys"]), "EER_phys"] = np.nan
+
+# ---------- index EER (always available if indices exist) ----------
+# Uses your indices around 100: efficient = (travel+sustain)/peak
+ts = pd.to_numeric(EER["tsSPI"], errors="coerce")
+ac = pd.to_numeric(EER["Accel"], errors="coerce")
+gr = pd.to_numeric(EER[gr_col], errors="coerce")
+
+peak_idx = np.maximum(ac, ts)
+base_idx = (ts + gr) / 2.0
+with np.errstate(invalid="ignore", divide="ignore"):
+    EER["EER_idx"] = 100.0 * (base_idx / peak_idx)
+
+# ---------- shape-aware micro-adjust (KSI proxy) ----------
+# positive → ran against shape; negative → with shape (mild reward/penalty)
+ksi_raw = -np.sign(RSI) * (ac - ts)
+ksi01   = np.tanh((ksi_raw / 6.0).fillna(0.0))  # ~[-1..+1]
+# Up to +2% if strongly against shape and consensus is high; −1% with shape
+shape_mult = 1.0 + (0.02 * np.clip(ksi01, 0, 1) * SCI) - (0.01 * np.clip(-ksi01, 0, 1) * SCI)
+
+# ---------- combine physics & index views ----------
+# If we have a physics read, blend 60/40; else use index view
+have_phys = EER["EER_phys"].notna()
+EER["EER_core"] = np.where(have_phys,
+                           0.60*EER["EER_phys"] + 0.40*EER["EER_idx"],
+                           EER["EER_idx"])
+
+# trim out silly tails and apply shape multiplier
+EER["EER"] = (EER["EER_core"].clip(70.0, 110.0) * shape_mult).clip(70.0, 110.0).round(1)
+
+# ---------- tiers ----------
+def _tier(e):
+    e=_to_num(e)
+    if not np.isfinite(e): return ""
+    if e >= 96.0: return "🏆 Ultra-Efficient"
+    if e >= 92.0: return "🔥 Highly Efficient"
+    if e >= 88.0: return "🟡 Solid"
+    return "⚠️ Inefficient"
+
+EER["Tier"] = EER["EER"].map(_tier)
+
+# ---------- notes / quick read ----------
+ts_med = np.nanmedian(ts)
+slow_mid = np.isfinite(ts_med) and ts_med < 100.0
+
+def _note(r):
+    bits=[]
+    a=_idx(r.get("Accel")); t=_idx(r.get("tsSPI")); g=_idx(r.get(gr_col))
+    e=_idx(r.get("EER"));   k=_idx(r.get("ksi_raw")) if "ksi_raw" in r else np.nan
+
+    # profile hints
+    if np.isfinite(a) and np.isfinite(t) and (a - t) >= 2.5:
+        bits.append("early overexertion")
+    if np.isfinite(g) and np.isfinite(a) and (g - a) >= 2.0:
+        bits.append("late load / stamina")
+    if slow_mid: 
+        bits.append("slow mid (trim)")
+
+    # shape cue
+    kr = -np.sign(RSI) * ((a if np.isfinite(a) else 100) - (t if np.isfinite(t) else 100))
+    if SCI >= 0.6 and np.isfinite(kr):
+        if kr > 0.8:  bits.append("against shape (bonus)")
+        elif kr < -0.8: bits.append("with shape (caveat)")
+
+    return " · ".join(bits).strip()
+
+EER["Notes"] = EER.apply(_note, axis=1)
+
+# ---------- render ----------
+view_cols = ["Horse","EER","Tier","tsSPI","Accel",gr_col]
+EER_view = EER.copy()
+for c in view_cols:
+    if c not in EER_view.columns: EER_view[c] = np.nan
+
+EER_view = EER_view.sort_values(["EER","Accel",gr_col], ascending=[False,False,False])[view_cols]
+EER_view = EER_view.rename(columns={gr_col:"Grind"})
+st.dataframe(
+    EER_view.style.format({"EER":"{:.1f}","tsSPI":"{:.1f}","Accel":"{:.1f}","Grind":"{:.1f}"}),
+    use_container_width=True
+)
+
+with st.expander("EER notes"):
+    st.caption(
+        "EER estimates how efficiently a horse distributed energy: 100% ≈ perfectly balanced. "
+        "High EER (≥92) = professional, sustainable effort; low EER (<88) = inefficient burst/fade. "
+        "If available, physics EER (avg speed ÷ peak split) is blended with an index EER ((tsSPI+Grind)/2 ÷ max(Accel,tsSPI)). "
+        "Mild shape awareness via RSI×SCI is applied; slow mids lightly trim ‘Travel’. Ranges clipped to 70–110%."
+    )
+# ======================= /EER =======================
+
 # ===================== CeilingCore v1.0 — One-Run Class Ceiling Engine =====================
 # Replaces RIE/NRCI. Uses only single-race data: GCI (or GCI RS), RSI/SCI, sectionals, and within-race medians.
 # No database. No wind. Shape-aware. Mass-based race class anchor.
