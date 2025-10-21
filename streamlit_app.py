@@ -2559,25 +2559,25 @@ XW["xWin"] = XW["xWin"] / (XW["xWin"].sum() or 1.0)
 
 # ---- fair odds conversion ---------------------------------------
 def _to_fractional_odds(p):
-    """Convert probability (0–1) to fractional-style odds like '5.2/1'."""
+    """Convert prob p (0..1) to fractional-style odds like '5.2/1'."""
     try:
         p = float(p)
-        if p <= 0: return "-"
-        dec = 1.0 / p
-        frac = dec - 1.0
+        if p <= 0:  # impossible
+            return "-"
+        dec = 1.0 / p          # decimal odds including stake
+        frac = dec - 1.0       # fractional part
         return f"{frac:.1f}/1"
     except Exception:
         return "-"
 
-xwin_df["Odds (≈fair)"] = xwin_df["xWin"].apply(
-    lambda x: _to_fractional_odds(x / 100.0)
-)
+# attach fair odds to the same frame we're using (XW)
+XW["Odds (≈fair)"] = XW["xWin"].apply(_to_fractional_odds)
 
 # ---------- tidy explainers ----------
 def _driver_line(r):
     bits = []
 
-    # --- Early behaviour from F200 ---
+    # Early behaviour from F200
     f200 = float(r.get("F200_idx", np.nan))
     if np.isfinite(f200):
         if f200 >= 101:
@@ -2585,7 +2585,7 @@ def _driver_line(r):
         elif f200 <= 98:
             bits.append("Slower away")
 
-    # --- Core sectional pillars ---
+    # Core sectional pillars
     if float(r.get("T01_eff", 0)) >= 0.55:
         bits.append("Travel +")
     if float(r.get("K01", 0)) >= 0.55:
@@ -2593,16 +2593,14 @@ def _driver_line(r):
     if float(r.get("S01", 0)) >= 0.55:
         bits.append("Sustain +")
 
-    # --- Shape cue (only if SCI decent) ---
+    # Shape cue (only if SCI decent)
     if SCI >= 0.6:
         k = float(-np.sign(RSI) * (float(r.get("Accel", np.nan)) - float(r.get("tsSPI", np.nan))))
         if np.isfinite(k):
-            if k > 0.6:
-                bits.append("Against shape")
-            elif k < -0.6:
-                bits.append("With shape")
+            if k > 0.6:   bits.append("Against shape")
+            elif k < -0.6: bits.append("With shape")
 
-    # --- Midrace trim note ---
+    # Midrace trim note
     if trim_T > 0:
         bits.append("(slow mid)")
 
@@ -2611,8 +2609,18 @@ def _driver_line(r):
 XW["Drivers"] = XW.apply(_driver_line, axis=1)
 
 # ---------- render ----------
-view = ["Horse", "xWin", "Odds (≈fair)", "Drivers"]
-view = view.sort_values("xWin", ascending=False).reset_index(drop=True)
+cols = ["Horse", "xWin", "Odds (≈fair)", "Drivers"]
+for c in cols:
+    if c not in XW.columns:
+        XW[c] = np.nan
+
+view = (
+    XW[cols]
+    .sort_values("xWin", ascending=False)
+    .reset_index(drop=True)
+    .copy()
+)
+# show xWin as %
 view["xWin"] = (100.0 * view["xWin"]).round(1)
 
 st.dataframe(
@@ -2626,7 +2634,6 @@ with st.expander("xWin settings & notes"):
         f"xWin uses distance/going-aware weights ({w_note}), RSI×SCI for shape, a light stability term, a tiny PI prior, "
         f"and a learned-style temperature τ={tau:.2f} (field {N}). Probabilities are softly shrunk for tiny fields."
     )
-# ======================= /xWin =======================
 
 # ======================= Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict) =======================
 st.markdown("---")
