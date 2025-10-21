@@ -1647,109 +1647,159 @@ else:
         st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
         st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
 
-# ======================= Sectional Shape Interpreter (drop-in) =======================
-st.markdown("### Sectional Shape — Interpreter")
+# ======================= Sectional Shape — Interpreter v2 (median-relative, next-up) =======================
+st.markdown("## Sectional Shape — Interpreter")
 
-GR_COL = metrics.attrs.get("GR_COL","Grind")
-RSI    = float(metrics.attrs.get("RSI", 0.0))    # + = slow-early, − = fast-early
-SCI    = float(metrics.attrs.get("SCI", 0.0))    # 0..1 consensus/strength
+GR_COL = metrics.attrs.get("GR_COL", "Grind")
+RSI    = float(metrics.attrs.get("RSI", 0.0))   # + slow-early (late favoured), - fast-early (early favoured)
+SCI    = float(metrics.attrs.get("SCI", 0.0))   # 0..1 (shape confidence)
+D_m    = float(race_distance_input)
 
-need_cols = {"Horse","Accel",GR_COL,"tsSPI","PI"}
-if not need_cols.issubset(metrics.columns):
-    st.info("Interpreter: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
+need_cols = {"Horse", "tsSPI", "Accel", GR_COL, "PI"}
+if not need_cols.issubset(metrics.columns) or len(metrics)==0:
+    st.warning("Interpreter: missing columns: " + ", ".join(sorted(need_cols - set(metrics.columns))))
 else:
-    # Recreate the working frame to match the Shape Map inputs
-    _df = metrics.loc[:, ["Horse","Accel",GR_COL,"tsSPI","PI"]].copy()
-    for c in ["Accel",GR_COL,"tsSPI","PI"]:
-        _df[c] = pd.to_numeric(_df[c], errors="coerce")
-    _df = _df.dropna(subset=["Accel",GR_COL,"tsSPI"])
-    if _df.empty:
-        st.info("Interpreter: not enough data.")
+    df = metrics.loc[:, ["Horse", "tsSPI", "Accel", GR_COL, "PI"]].copy()
+    df["Horse"] = df["Horse"].astype(str)
+    for c in ["tsSPI","Accel",GR_COL,"PI"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # ----- median-relative deltas (prevents 'everyone SW' when the whole field is slow) -----
+    med_ts = float(np.nanmedian(df["tsSPI"]))
+    med_ac = float(np.nanmedian(df["Accel"]))
+    med_gr = float(np.nanmedian(df[GR_COL]))
+    df["ΔAccel"]  = df["Accel"]  - med_ac
+    df["ΔGrind"]  = df[GR_COL]   - med_gr
+    df["ΔtsSPI"]  = df["tsSPI"]  - med_ts
+
+    # ----- quadrant labelling (relative) -----
+    def _quad(a, g):
+        if a>=0 and g>=0: return "NE"
+        if a<0  and g>=0: return "NW"
+        if a>=0 and g<0 : return "SE"
+        return "SW"
+    df["Quadrant"] = [ _quad(a,g) for a,g in zip(df["ΔAccel"], df["ΔGrind"]) ]
+
+    # counts for header
+    q_counts = df["Quadrant"].value_counts().to_dict()
+    q_head = " · ".join([f"{k}: {q_counts.get(k,0)}" for k in ("NE","NW","SE","SW")])
+
+    # ----- tempo line -----
+    tempo = "slow-early (late favoured)" if RSI>+0.6 else ("fast-early (early favoured)" if RSI<-0.6 else "evenish")
+    st.caption(f"Tempo: {tempo} (RSI {RSI:+.2f}, SCI {SCI:.2f}) · Quadrants: {q_head}")
+
+    # ===== “Top movers” (Accel/Grind combined magnitude) =====
+    df["MoveMag"] = np.hypot(df["ΔAccel"].fillna(0), df["ΔGrind"].fillna(0))
+    tops = (df
+            .sort_values("MoveMag", ascending=False)
+            .head(6)
+            .loc[:, ["Horse","ΔAccel","ΔGrind","Quadrant"]]
+           )
+    def _move_note(r):
+        # simple phrasing
+        if r["Quadrant"]=="NE": return "Burst & Sustain (quickened and stayed)"
+        if r["Quadrant"]=="NW": return "Grind Moves (kept finding late)"
+        if r["Quadrant"]=="SE": return "Burst (flash then faded)"
+        return "Under Pressure (never picked up)"
+    tops["Note"] = tops.apply(_move_note, axis=1)
+    tops = tops.rename(columns={"ΔAccel":"ΔA", "ΔGrind":"ΔG"})
+    st.markdown("**Top movers (Accel/Grind combined):**")
+    st.dataframe(tops.style.format({"ΔA":"{:+.1f}","ΔG":"{:+.1f}"}), use_container_width=True)
+
+    # ===== “Shape victims” (ran *against* the prevailing flow but still showed late) =====
+    # KSI proxy: >0 means against shape; <0 with shape
+    ksi_raw = -np.sign(RSI) * (df["Accel"] - df["tsSPI"])
+    df["KSI_proxy"] = ksi_raw
+    # keep those clearly against shape (threshold ~0.8) with some late signal
+    victims = df[(df["KSI_proxy"]>0.8) & (df["ΔGrind"]>0.0)].copy()
+    victims = victims.sort_values(["KSI_proxy","ΔGrind"], ascending=[False,False])
+    if len(victims):
+        v_view = victims.loc[:, ["Horse","KSI_proxy","ΔGrind","ΔAccel","Quadrant"]]
+        st.markdown("**Shape victims (ran against flow but found late):**")
+        st.dataframe(v_view.style.format({"KSI_proxy":"{:.2f}","ΔGrind":"{:+.1f}","ΔAccel":"{:+.1f}"}),
+                     use_container_width=True)
+
+    # ===== Next-Up Potential (ranked) =====
+    # Ingredients (0..1-ish):
+    #  • NE/NW quadrant preference (late strength helpful unless sprint)
+    #  • Against-shape bonus scales with SCI
+    #  • Median-relative Accel/Grind balance (don’t over-reward only one)
+    #  • Mild PI anchor (under-par but good shape = improver)
+    dm = float(D_m)
+    # distance preference: more weight for LL in stays, LP in sprints
+    if dm <= 1200:
+        wA, wG = 0.55, 0.45  # sprints: burst matters a touch more
+    elif dm >= 2000:
+        wA, wG = 0.40, 0.60  # staying: lasting lift matters more
     else:
-        # deltas vs 100
-        _df["AΔ"]  = _df["Accel"] - 100.0
-        _df["GΔ"]  = _df[GR_COL]  - 100.0
-        _df["TΔ"]  = _df["tsSPI"] - 100.0
-        _df["Mag"] = np.hypot(_df["AΔ"], _df["GΔ"])  # overall move size
+        t = (dm-1200)/800.0
+        wA = 0.55*(1-t) + 0.40*t
+        wG = 0.45*(1-t) + 0.60*t
 
-        # Quadrants
-        def _quad(ax, gy):
-            if ax >= 0 and gy >= 0: return "NE"
-            if ax <  0 and gy >= 0: return "NW"
-            if ax >= 0 and gy <  0: return "SE"
-            return "SW"
-        _df["Q"] = [_quad(a, g) for a, g in zip(_df["AΔ"], _df["GΔ"])]
+    # normalise deltas to ~0..1 scale
+    def _norm01(s, R=4.0):  # ~4 idx pts ~ 1σ
+        s = pd.to_numeric(s, errors="coerce")
+        return np.clip((s/R), -1.5, 1.5)  # keep within [-1.5..1.5]
+    A01 = _norm01(df["ΔAccel"]).fillna(0.0)
+    G01 = _norm01(df["ΔGrind"]).fillna(0.0)
+    # balanced burst+sustain
+    balance = np.minimum(A01.clip(0,None), G01.clip(0,None))  # reward when BOTH are >0
 
-        quad_names = {
-            "NE": "Burst & Sustain (quickened and stayed)",
-            "NW": "Grind Moves (kept finding late)",
-            "SE": "Flash & Fade (hit a run then faded)",
-            "SW": "Under Pressure (never picked up)"
-        }
+    # against-shape term (+ with SCI), with-shape mild damp
+    ksip = np.tanh((df["KSI_proxy"].fillna(0.0))/6.0)  # ~[-1..+1]
+    shp = (0.50*SCI*np.clip(ksip,0,1)) - (0.15*SCI*np.clip(-ksip,0,1))
 
-        # Tempo read
-        tempo = "evenish"
-        if abs(RSI) >= 1.0 and SCI >= 0.5:
-            tempo = "fast-early" if RSI < 0 else "slow-early"
+    # mild PI anchor (under-par but with positive shape profile = improver)
+    PI = pd.to_numeric(df["PI"], errors="coerce")
+    pi_med = float(np.nanmedian(PI))
+    pi_sd  = mad_std(PI) if np.isfinite(mad_std(PI)) and mad_std(PI)>0 else 1.0
+    pi_term = np.clip((pi_med - PI)/max(1.0, pi_sd), -0.8, 0.8) * 0.10  # small
 
-        # Counts and quick context
-        counts = _df["Q"].value_counts().to_dict()
-        q_line = " · ".join([f"{q}: {counts.get(q,0)}" for q in ["NE","NW","SE","SW"]])
+    # trip friction damp if your HH block attached a TFS_plus
+    tfs = None
+    try:
+        if 'hh' in locals() and "TFS_plus" in hh.columns:
+            tfs = df.merge(hh[["Horse","TFS_plus"]], on="Horse", how="left")["TFS_plus"]
+            tfs = pd.to_numeric(tfs, errors="coerce").fillna(0.0)
+    except Exception:
+        pass
+    if tfs is None:
+        tfs = pd.Series(0.0, index=df.index)
+    tfs_damp = -np.minimum(0.20, np.maximum(0.0, (tfs-0.2)/0.5))  # up to -0.20
 
-        st.write(
-            f"**Tempo:** {tempo} (RSI {RSI:+.1f}, SCI {SCI:.2f}) · "
-            f"**Quadrants:** {q_line}"
-        )
+    # compose Next-Up Potential (0..10)
+    core = (wA*A01.clip(0,None) + wG*G01.clip(0,None) + 0.60*balance)
+    nxt  = 10.0 * np.clip(core + shp + pi_term + tfs_damp, 0.0, 1.0)
 
-        # Top movers by combined magnitude (top 5)
-        top5 = _df.sort_values("Mag", ascending=False).head(5)
-        if len(top5) > 0:
-            st.write("**Top movers (Accel/Grind combined):**")
-            for _, r in top5.iterrows():
-                qn = quad_names.get(r["Q"], r["Q"])
-                st.write(
-                    f"• {r['Horse']}: AΔ {r['AΔ']:+.1f}, GΔ {r['GΔ']:+.1f} — {qn}"
-                )
+    out = df.assign(
+        NextUp=nxt.round(2),
+        Why=np.where(balance>0.10, "Burst+Sustain",
+             np.where((A01>0.10)&(G01<=0), "Burst-only",
+             np.where((G01>0.10)&(A01<=0), "Sustain-only", "Neutral"))),
+        AgainstShape=np.where(ksip>0.4, "Yes" if SCI>=0.5 else "Maybe",
+                       np.where(ksip<-0.4, "With shape", "Neutral"))
+    )
 
-        # Per-horse concise one-liner
-        def _shape_tag(row):
-            # shape cue: positive → against prevailing shape
-            ksi = -np.sign(RSI) * (row["Accel"] - row["tsSPI"])
-            if SCI < 0.6 or not np.isfinite(ksi):
-                return ""
-            if   ksi >  0.8: return " (against shape)"
-            elif ksi < -0.8: return " (with shape)"
-            return ""
+    # tiers
+    def _tier(s):
+        if s>=8.0: return "🏆 High"
+        if s>=6.0: return "🔥 Strong"
+        if s>=4.5: return "🟡 Notable"
+        return ""
+    out["Tier"] = out["NextUp"].map(_tier)
 
-        def _profile(row):
-            a, g, t = row["AΔ"], row["GΔ"], row["TΔ"]
-            # thresholds (gentle)
-            hi, lo = 0.8, -0.8
-            if a >= hi and g >= hi:   return "elite combo"
-            if a >= hi and g <  lo:   return "flash then faded"
-            if a <  lo and g >= hi:   return "ground it out late"
-            if abs(a) < 0.5 and abs(g) < 0.5: return "balanced"
-            if a >= hi:  return "power kick"
-            if g >= hi:  return "stayed on well"
-            if a <= lo and g <= lo: return "no finish"
-            return "mixed signals"
+    cols = ["Horse", "NextUp", "Tier", "Why", "AgainstShape", "Quadrant", "ΔAccel", "ΔGrind"]
+    out_view = (out.sort_values(["NextUp","ΔGrind","ΔAccel"], ascending=[False,False,False])
+                   .loc[:, cols])
+    st.markdown("**Next-Up Potential (ranked)** — higher = better setup for next run")
+    st.dataframe(out_view.style.format({"ΔAccel":"{:+.1f}","ΔGrind":"{:+.1f}","NextUp":"{:.2f}"}),
+                 use_container_width=True)
 
-        st.write("**Per-horse readout:**")
-        for _, r in _df.sort_values(["Q","Mag"], ascending=[True,False]).iterrows():
-            tag = _shape_tag(r)
-            st.write(
-                f"• {r['Horse']}: {quad_names.get(r['Q'], r['Q'])}"
-                f" — {_profile(r)}{tag}."
-            )
-
-        with st.expander("What the quadrants mean"):
-            st.markdown(
-                "- **NE – Burst & Sustain:** Accelerated and kept lifting; premium profile.\n"
-                "- **NW – Grind Moves:** Didn’t flash, but finished strongly; suited by stiffer tests.\n"
-                "- **SE – Flash & Fade:** Turned it on, then emptied; better if tempo/trip eases.\n"
-                "- **SW – Under Pressure:** Couldn’t quicken or sustain; needs an angle (fitness, trip, headgear)."
-            )
-# ======================= /Sectional Shape Interpreter =======================
+    # friendly one-liner summary
+    fav = "late" if RSI>0.6 else ("early" if RSI<-0.6 else "balanced")
+    st.caption(f"Field read: {fav}; median-relative interpreter with shape-victim highlight. "
+               f"Next-Up blends burst+sustain balance, against-shape bonus (scaled by SCI), mild PI anchor, and trip-friction damp.")
+# ======================= /Sectional Shape — Interpreter v2 =======================
 # ======================= Pace Curve — field average (black) + Top 10 finishers =======================
 st.markdown("## Pace Curve — field average (black) + Top 10 finishers")
 pace_png = None
