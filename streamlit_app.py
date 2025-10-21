@@ -1647,12 +1647,12 @@ else:
         st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
         st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
 
-# ======================= Sectional Shape — Interpreter v2 (median-relative, next-up) =======================
+# ======================= Sectional Shape — Interpreter v2.1 (Accurate Distance-Weighted) =======================
 st.markdown("## Sectional Shape — Interpreter")
 
 GR_COL = metrics.attrs.get("GR_COL", "Grind")
-RSI    = float(metrics.attrs.get("RSI", 0.0))   # + slow-early (late favoured), - fast-early (early favoured)
-SCI    = float(metrics.attrs.get("SCI", 0.0))   # 0..1 (shape confidence)
+RSI    = float(metrics.attrs.get("RSI", 0.0))
+SCI    = float(metrics.attrs.get("SCI", 0.0))
 D_m    = float(race_distance_input)
 
 need_cols = {"Horse", "tsSPI", "Accel", GR_COL, "PI"}
@@ -1664,7 +1664,7 @@ else:
     for c in ["tsSPI","Accel",GR_COL,"PI"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # ----- median-relative deltas (prevents 'everyone SW' when the whole field is slow) -----
+    # ----- median-relative deltas -----
     med_ts = float(np.nanmedian(df["tsSPI"]))
     med_ac = float(np.nanmedian(df["Accel"]))
     med_gr = float(np.nanmedian(df[GR_COL]))
@@ -1672,90 +1672,76 @@ else:
     df["ΔGrind"]  = df[GR_COL]   - med_gr
     df["ΔtsSPI"]  = df["tsSPI"]  - med_ts
 
-    # ----- quadrant labelling (relative) -----
+    # ----- quadrant labelling -----
     def _quad(a, g):
         if a>=0 and g>=0: return "NE"
         if a<0  and g>=0: return "NW"
         if a>=0 and g<0 : return "SE"
         return "SW"
     df["Quadrant"] = [ _quad(a,g) for a,g in zip(df["ΔAccel"], df["ΔGrind"]) ]
-
-    # counts for header
     q_counts = df["Quadrant"].value_counts().to_dict()
     q_head = " · ".join([f"{k}: {q_counts.get(k,0)}" for k in ("NE","NW","SE","SW")])
 
-    # ----- tempo line -----
     tempo = "slow-early (late favoured)" if RSI>+0.6 else ("fast-early (early favoured)" if RSI<-0.6 else "evenish")
     st.caption(f"Tempo: {tempo} (RSI {RSI:+.2f}, SCI {SCI:.2f}) · Quadrants: {q_head}")
 
-    # ===== “Top movers” (Accel/Grind combined magnitude) =====
-    df["MoveMag"] = np.hypot(df["ΔAccel"].fillna(0), df["ΔGrind"].fillna(0))
-    tops = (df
-            .sort_values("MoveMag", ascending=False)
-            .head(6)
-            .loc[:, ["Horse","ΔAccel","ΔGrind","Quadrant"]]
-           )
+    # ===== Top movers =====
+    df["MoveMag"] = np.hypot(df["ΔAccel"], df["ΔGrind"])
+    tops = df.sort_values("MoveMag", ascending=False).head(6)
     def _move_note(r):
-        # simple phrasing
-        if r["Quadrant"]=="NE": return "Burst & Sustain (quickened and stayed)"
-        if r["Quadrant"]=="NW": return "Grind Moves (kept finding late)"
-        if r["Quadrant"]=="SE": return "Burst (flash then faded)"
+        q = r["Quadrant"]
+        if q=="NE": return "Burst & Sustain (quickened and stayed)"
+        if q=="NW": return "Grind Moves (kept finding late)"
+        if q=="SE": return "Burst (flash then faded)"
         return "Under Pressure (never picked up)"
     tops["Note"] = tops.apply(_move_note, axis=1)
-    tops = tops.rename(columns={"ΔAccel":"ΔA", "ΔGrind":"ΔG"})
     st.markdown("**Top movers (Accel/Grind combined):**")
-    st.dataframe(tops.style.format({"ΔA":"{:+.1f}","ΔG":"{:+.1f}"}), use_container_width=True)
+    st.dataframe(tops[["Horse","ΔAccel","ΔGrind","Quadrant","Note"]]
+                 .style.format({"ΔAccel":"{:+.1f}","ΔGrind":"{:+.1f}"}),
+                 use_container_width=True)
 
-    # ===== “Shape victims” (ran *against* the prevailing flow but still showed late) =====
-    # KSI proxy: >0 means against shape; <0 with shape
+    # ===== Shape victims =====
     ksi_raw = -np.sign(RSI) * (df["Accel"] - df["tsSPI"])
     df["KSI_proxy"] = ksi_raw
-    # keep those clearly against shape (threshold ~0.8) with some late signal
     victims = df[(df["KSI_proxy"]>0.8) & (df["ΔGrind"]>0.0)].copy()
     victims = victims.sort_values(["KSI_proxy","ΔGrind"], ascending=[False,False])
     if len(victims):
-        v_view = victims.loc[:, ["Horse","KSI_proxy","ΔGrind","ΔAccel","Quadrant"]]
         st.markdown("**Shape victims (ran against flow but found late):**")
-        st.dataframe(v_view.style.format({"KSI_proxy":"{:.2f}","ΔGrind":"{:+.1f}","ΔAccel":"{:+.1f}"}),
+        st.dataframe(victims[["Horse","KSI_proxy","ΔGrind","ΔAccel","Quadrant"]]
+                     .style.format({"KSI_proxy":"{:.2f}","ΔGrind":"{:+.1f}","ΔAccel":"{:+.1f}"}),
                      use_container_width=True)
 
-    # ===== Next-Up Potential (ranked) =====
-    # Ingredients (0..1-ish):
-    #  • NE/NW quadrant preference (late strength helpful unless sprint)
-    #  • Against-shape bonus scales with SCI
-    #  • Median-relative Accel/Grind balance (don’t over-reward only one)
-    #  • Mild PI anchor (under-par but good shape = improver)
-    dm = float(D_m)
-    # distance preference: more weight for LL in stays, LP in sprints
-    if dm <= 1200:
-        wA, wG = 0.55, 0.45  # sprints: burst matters a touch more
-    elif dm >= 2000:
-        wA, wG = 0.40, 0.60  # staying: lasting lift matters more
+    # ===== Next-Up Potential =====
+    # ---- accurate distance-weighted coefficients ----
+    if D_m <= 1200:
+        wA, wG, wB = 0.58, 0.42, 0.60
+    elif D_m <= 1500:
+        wA, wG, wB = 0.52, 0.48, 0.60
+    elif D_m <= 1800:
+        wA, wG, wB = 0.46, 0.54, 0.62
+    elif D_m <= 2200:
+        wA, wG, wB = 0.42, 0.58, 0.64
     else:
-        t = (dm-1200)/800.0
-        wA = 0.55*(1-t) + 0.40*t
-        wG = 0.45*(1-t) + 0.60*t
+        wA, wG, wB = 0.38, 0.62, 0.66
 
-    # normalise deltas to ~0..1 scale
-    def _norm01(s, R=4.0):  # ~4 idx pts ~ 1σ
+    def _norm01(s, R=4.0):
         s = pd.to_numeric(s, errors="coerce")
-        return np.clip((s/R), -1.5, 1.5)  # keep within [-1.5..1.5]
-    A01 = _norm01(df["ΔAccel"]).fillna(0.0)
-    G01 = _norm01(df["ΔGrind"]).fillna(0.0)
-    # balanced burst+sustain
-    balance = np.minimum(A01.clip(0,None), G01.clip(0,None))  # reward when BOTH are >0
+        return np.clip(s / R, -1.5, 1.5)
+    A01 = _norm01(df["ΔAccel"])
+    G01 = _norm01(df["ΔGrind"])
+    balance = np.minimum(A01.clip(0,None), G01.clip(0,None))
 
-    # against-shape term (+ with SCI), with-shape mild damp
-    ksip = np.tanh((df["KSI_proxy"].fillna(0.0))/6.0)  # ~[-1..+1]
-    shp = (0.50*SCI*np.clip(ksip,0,1)) - (0.15*SCI*np.clip(-ksip,0,1))
+    # ---- shape bonus / penalty (asymmetric) ----
+    ksi01 = np.tanh(df["KSI_proxy"].fillna(0.0) / 6.0)
+    shape_term = (0.50 * SCI * np.clip(ksi01,0,1)) - (0.15 * SCI * np.clip(-ksi01,0,1))
 
-    # mild PI anchor (under-par but with positive shape profile = improver)
+    # ---- mild PI anchor ----
     PI = pd.to_numeric(df["PI"], errors="coerce")
-    pi_med = float(np.nanmedian(PI))
+    pi_med = np.nanmedian(PI)
     pi_sd  = mad_std(PI) if np.isfinite(mad_std(PI)) and mad_std(PI)>0 else 1.0
-    pi_term = np.clip((pi_med - PI)/max(1.0, pi_sd), -0.8, 0.8) * 0.10  # small
+    pi_term = np.clip((pi_med - PI)/pi_sd, -0.8, 0.8) * 0.10
 
-    # trip friction damp if your HH block attached a TFS_plus
+    # ---- trip friction damp ----
     tfs = None
     try:
         if 'hh' in locals() and "TFS_plus" in hh.columns:
@@ -1765,41 +1751,41 @@ else:
         pass
     if tfs is None:
         tfs = pd.Series(0.0, index=df.index)
-    tfs_damp = -np.minimum(0.20, np.maximum(0.0, (tfs-0.2)/0.5))  # up to -0.20
+    if D_m <= 1400:  cap = 0.22
+    elif D_m <= 2000: cap = 0.18
+    else: cap = 0.15
+    tfs_damp = -np.minimum(cap, np.maximum(0.0, (tfs - 0.2)/0.5))
 
-    # compose Next-Up Potential (0..10)
-    core = (wA*A01.clip(0,None) + wG*G01.clip(0,None) + 0.60*balance)
-    nxt  = 10.0 * np.clip(core + shp + pi_term + tfs_damp, 0.0, 1.0)
+    # ---- core score ----
+    core = wA*A01.clip(0,None) + wG*G01.clip(0,None) + wB*balance
+    nxt  = 10.0 * np.clip(core + shape_term + pi_term + tfs_damp, 0.0, 1.0)
 
     out = df.assign(
         NextUp=nxt.round(2),
-        Why=np.where(balance>0.10, "Burst+Sustain",
-             np.where((A01>0.10)&(G01<=0), "Burst-only",
-             np.where((G01>0.10)&(A01<=0), "Sustain-only", "Neutral"))),
-        AgainstShape=np.where(ksip>0.4, "Yes" if SCI>=0.5 else "Maybe",
-                       np.where(ksip<-0.4, "With shape", "Neutral"))
+        Why=np.where(balance>0.10,"Burst+Sustain",
+             np.where((A01>0.10)&(G01<=0),"Burst-only",
+             np.where((G01>0.10)&(A01<=0),"Sustain-only","Neutral"))),
+        AgainstShape=np.where(ksi01>0.4,"Yes" if SCI>=0.5 else "Maybe",
+                       np.where(ksi01<-0.4,"With shape","Neutral"))
     )
 
-    # tiers
-    def _tier(s):
-        if s>=8.0: return "🏆 High"
-        if s>=6.0: return "🔥 Strong"
-        if s>=4.5: return "🟡 Notable"
+    def _tier(v):
+        if v>=8.0:  return "🏆 High"
+        if v>=6.0:  return "🔥 Strong"
+        if v>=4.7:  return "🟡 Notable"
         return ""
     out["Tier"] = out["NextUp"].map(_tier)
 
-    cols = ["Horse", "NextUp", "Tier", "Why", "AgainstShape", "Quadrant", "ΔAccel", "ΔGrind"]
-    out_view = (out.sort_values(["NextUp","ΔGrind","ΔAccel"], ascending=[False,False,False])
-                   .loc[:, cols])
-    st.markdown("**Next-Up Potential (ranked)** — higher = better setup for next run")
-    st.dataframe(out_view.style.format({"ΔAccel":"{:+.1f}","ΔGrind":"{:+.1f}","NextUp":"{:.2f}"}),
+    view_cols = ["Horse","NextUp","Tier","Why","AgainstShape","Quadrant","ΔAccel","ΔGrind"]
+    st.markdown("**Next-Up Potential (ranked)** — higher = better next-run setup")
+    st.dataframe(out.sort_values(["NextUp","ΔGrind","ΔAccel"], ascending=[False,False,False])[view_cols]
+                 .style.format({"ΔAccel":"{:+.1f}","ΔGrind":"{:+.1f}","NextUp":"{:.2f}"}),
                  use_container_width=True)
 
-    # friendly one-liner summary
     fav = "late" if RSI>0.6 else ("early" if RSI<-0.6 else "balanced")
-    st.caption(f"Field read: {fav}; median-relative interpreter with shape-victim highlight. "
-               f"Next-Up blends burst+sustain balance, against-shape bonus (scaled by SCI), mild PI anchor, and trip-friction damp.")
-# ======================= /Sectional Shape — Interpreter v2 =======================
+    st.caption(f"Field read: {fav}; distance-accurate weighting, median baselines, and SCI-scaled shape bonus. "
+               f"Next-Up tiers blend Burst+Sustain balance, shape resistance, mild PI improver term, and trip friction damp.")
+# ======================= /Sectional Shape — Interpreter v2.1 =======================
 # ======================= Pace Curve — field average (black) + Top 10 finishers =======================
 st.markdown("## Pace Curve — field average (black) + Top 10 finishers")
 pace_png = None
