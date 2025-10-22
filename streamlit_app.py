@@ -3650,32 +3650,31 @@ else:
         master_summary_df = out_num.copy()
 # ======================= /Master Summary (5-model, 2dp) =======================
 
-# ======================= PDF — Master Summary only =======================
+# ======================= PDF — Master Summary only (2dp, no Energy) =======================
 import io
 from datetime import datetime
 
 try:
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Flowable
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-except Exception as _e:
+    from reportlab.lib.enums import TA_LEFT
+except Exception:
     st.warning("PDF export needs the 'reportlab' package. Add 'reportlab' to requirements.txt.")
-    _e = None
 
-def _fmt(v, fmt="{:.1f}", empty=""):
+def _fmt2(v, sign=False):
     try:
-        if v is None or (isinstance(v, float) and not np.isfinite(v)):
-            return empty
-        return fmt.format(float(v))
+        x = float(v)
     except Exception:
-        return str(v) if v is not None else empty
+        return ""
+    return f"{x:+.2f}" if sign else f"{x:.2f}"
 
-def build_master_summary_pdf(summary_df, race_title=None, subtitle=None, topn=5, energy_caption=None):
+def build_master_summary_pdf_2dp_no_energy(summary_df, race_title=None, subtitle=None, topn=5):
     """
-    summary_df: master_summary_df with columns
-      [Horse, FollowScore, Consensus, PI, GCI, Ahead of Hcap, Winning DNA, Hidden, Energy Eff]
+    summary_df columns expected (numeric): 
+      Horse, FollowScore, Consensus, PI, GCI, Ahead of Hcap, Winning DNA, Hidden
+    Everything is formatted to 2 decimals; 'Consensus' shown as int.
     """
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -3683,43 +3682,43 @@ def build_master_summary_pdf(summary_df, race_title=None, subtitle=None, topn=5,
         pagesize=landscape(A4),
         leftMargin=24, rightMargin=24, topMargin=28, bottomMargin=24
     )
+
     styles = getSampleStyleSheet()
-    H = ParagraphStyle("H", parent=styles["Heading1"], alignment=TA_LEFT, fontSize=18, leading=22, spaceAfter=8)
-    SH = ParagraphStyle("SH", parent=styles["Heading2"], alignment=TA_LEFT, fontSize=12, leading=14, spaceAfter=6)
-    CAP = ParagraphStyle("CAP", parent=styles["Normal"], fontSize=8, textColor=colors.grey, spaceBefore=4)
-    P = ParagraphStyle("P", parent=styles["Normal"], fontSize=9, leading=12)
-    Psmall = ParagraphStyle("Ps", parent=styles["Normal"], fontSize=8, leading=10)
+    H   = ParagraphStyle("H",   parent=styles["Heading1"], alignment=TA_LEFT, fontSize=18, leading=22, spaceAfter=8)
+    SH  = ParagraphStyle("SH",  parent=styles["Heading2"], alignment=TA_LEFT, fontSize=12, leading=14, spaceAfter=6)
+    P   = ParagraphStyle("P",   parent=styles["Normal"],   fontSize=9,  leading=12)
+    Psm = ParagraphStyle("Ps",  parent=styles["Normal"],   fontSize=8,  leading=10)
+    CAP = ParagraphStyle("CAP", parent=styles["Normal"],   fontSize=8,  leading=10, textColor=colors.grey)
 
     story = []
 
-    # Header
     title = race_title or "Race Edge — Master Summary"
-    sub = subtitle or datetime.now().strftime("Generated %Y-%m-%d %H:%M")
+    sub   = subtitle or datetime.now().strftime("Generated %Y-%m-%d %H:%M")
     story.append(Paragraph(title, H))
     story.append(Paragraph(sub, P))
     story.append(Spacer(1, 6))
 
-    # Consensus table (limit rows to keep one page clean)
-    cols = ["Horse","FollowScore","Consensus","PI","GCI","Ahead of Hcap","Winning DNA","Hidden","Energy Eff"]
+    # ---------- Table (no Energy) ----------
+    cols = ["Horse","FollowScore","Consensus","PI","GCI","Ahead of Hcap","Winning DNA","Hidden"]
     df = summary_df.loc[:, [c for c in cols if c in summary_df.columns]].copy()
-    # build rows
-    head = ["Horse","Follow","Con","PI","GCI","Ahead Hcap","Win DNA","Hidden","Energy"]
-    data = [head]
+
+    # Build header + rows with 2dp formatting
+    header = ["Horse","Follow","Con","PI","GCI","Ahead Hcap","Win DNA","Hidden"]
+    data = [header]
     for _, r in df.iterrows():
         data.append([
             str(r.get("Horse","")),
-            _fmt(r.get("FollowScore"), "{:.1f}"),
+            _fmt2(r.get("FollowScore"), sign=False),
             str(int(r.get("Consensus"))) if pd.notna(r.get("Consensus")) else "",
-            str(r.get("PI","")),
-            str(r.get("GCI","")),
-            str(r.get("Ahead of Hcap","")),
-            str(r.get("Winning DNA","")),
-            str(r.get("Hidden","")),
-            str(r.get("Energy Eff","")),
+            _fmt2(r.get("PI")),
+            _fmt2(r.get("GCI")),
+            _fmt2(r.get("Ahead of Hcap"), sign=True),
+            _fmt2(r.get("Winning DNA")),
+            _fmt2(r.get("Hidden")),
         ])
 
-    tbl = Table(data, colWidths=[110, 45, 32, 40, 40, 60, 55, 45, 55])
-    tbl.setStyle(TableStyle([
+    table = Table(data, colWidths=[120, 50, 32, 45, 45, 65, 55, 50])
+    table.setStyle(TableStyle([
         ("FONT", (0,0), (-1,-1), "Helvetica"),
         ("FONTSIZE", (0,0), (-1,0), 9),
         ("FONTSIZE", (0,1), (-1,-1), 9),
@@ -3730,45 +3729,47 @@ def build_master_summary_pdf(summary_df, race_title=None, subtitle=None, topn=5,
         ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#444444")),
         ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.lightgrey]),
     ]))
-    story.append(Paragraph("Consensus table (higher = stronger next-up case)", SH))
-    story.append(tbl)
-    if energy_caption:
-        story.append(Paragraph(energy_caption, CAP))
 
+    story.append(Paragraph("Consensus table (higher = stronger next-up case)", SH))
+    story.append(table)
     story.append(Spacer(1, 10))
 
-    # Top-5 cards
+    # ---------- Top-5 bullets (2dp everywhere) ----------
     story.append(Paragraph("Horses to Follow (Top 5)", SH))
+    medals = ["🥇","🥈","🥉","🏅","🏅"]
     show = min(topn, len(df))
     for i in range(show):
         r = df.iloc[i]
-        medal = ["🥇","🥈","🥉","🏅","🏅"][i] if i < 5 else "•"
-        head_line = f"{medal} <b>{r['Horse']}</b> — FollowScore {_fmt(r['FollowScore'],'{:.1f}')} (consensus {int(r['Consensus'])}/6)"
+        head_line = (
+            f"{medals[i]} <b>{str(r['Horse'])}</b> — "
+            f"FollowScore {_fmt2(r['FollowScore'])} (consensus {int(r['Consensus'])}/5)"
+        )
         story.append(Paragraph(head_line, P))
+
         bullets = []
-        if "PI" in df.columns and r["PI"]: bullets.append(f"PI <b>{r['PI']}</b>")
-        if "GCI" in df.columns and r["GCI"]: bullets.append(f"GCI <b>{r['GCI']}</b>")
-        if "Ahead of Hcap" in df.columns and r["Ahead of Hcap"]: bullets.append(f"Ahead of handicap <b>{r['Ahead of Hcap']}</b>")
-        if "Winning DNA" in df.columns and r["Winning DNA"]: bullets.append(f"Winning DNA <b>{r['Winning DNA']}</b>")
-        if "Hidden" in df.columns and r["Hidden"]: bullets.append(f"Hidden <b>{r['Hidden']}</b>")
-        if "Energy Eff" in df.columns and r["Energy Eff"]: bullets.append(f"Energy efficiency <b>{r['Energy Eff']}</b>")
-        if not bullets: bullets.append("Multi-model positive profile")
-        story.append(Paragraph(" • " + " • ".join(bullets), Psmall))
+        if pd.notna(r.get("PI")):             bullets.append(f"PI <b>{_fmt2(r['PI'])}</b>")
+        if pd.notna(r.get("GCI")):            bullets.append(f"GCI <b>{_fmt2(r['GCI'])}</b>")
+        if pd.notna(r.get("Ahead of Hcap")):  bullets.append(f"Ahead of handicap <b>{_fmt2(r['Ahead of Hcap'], sign=True)}</b>")
+        if pd.notna(r.get("Winning DNA")):    bullets.append(f"Winning DNA <b>{_fmt2(r['Winning DNA'])}</b>")
+        if pd.notna(r.get("Hidden")):         bullets.append(f"Hidden <b>{_fmt2(r['Hidden'])}</b>")
+        if not bullets:                       bullets.append("Multi-model positive profile")
+
+        story.append(Paragraph(" • " + " • ".join(bullets), Psm))
         story.append(Spacer(1, 4))
 
     story.append(Spacer(1, 6))
-    story.append(Paragraph("© 2025 Race Edge Analytics — Master Summary derived from PI, GCI, Ahead-of-Handicap, Winning DNA, Hidden Horses, and Energy Efficiency.", CAP))
+    story.append(Paragraph(
+        "© 2025 Race Edge Analytics — Master Summary derived from PI, GCI, Ahead-of-Handicap, Winning DNA, and Hidden Horses.",
+        CAP
+    ))
 
     doc.build(story)
     return buf.getvalue()
 
-# ---- Streamlit button (Master Summary only) ----
+# ---- Streamlit button: Master Summary PDF (2dp, no Energy) ----
 if "master_summary_df" in locals() and isinstance(master_summary_df, pd.DataFrame) and not master_summary_df.empty:
-    # Race title line (fill with what you have available)
     race_title = None
     try:
-        # try to construct from your app context
-        # e.g., meeting/course/distance/date variables if you have them; fall back if missing
         meeting = locals().get("meeting") or locals().get("course") or ""
         distance = locals().get("race_distance_m") or locals().get("distance_m") or ""
         rdate = locals().get("race_date") or ""
@@ -3776,10 +3777,9 @@ if "master_summary_df" in locals() and isinstance(master_summary_df, pd.DataFram
     except Exception:
         race_title = "Race Edge — Master Summary"
 
-    # energy source caption from the Master Summary block (if we set it)
-    energy_caption = locals().get("energy_source_label", None)
-
-    pdf_bytes = build_master_summary_pdf(master_summary_df, race_title=race_title, subtitle="Master Summary only", topn=5, energy_caption=energy_caption)
+    pdf_bytes = build_master_summary_pdf_2dp_no_energy(
+        master_summary_df, race_title=race_title, subtitle="Master Summary only", topn=5
+    )
     st.download_button(
         "⬇️ Download Master Summary PDF",
         data=pdf_bytes,
@@ -3789,4 +3789,4 @@ if "master_summary_df" in locals() and isinstance(master_summary_df, pd.DataFram
     )
 else:
     st.info("Run the Master Summary first — nothing to export yet.")
-# ======================= /PDF — Master Summary only =======================
+# ======================= /PDF — Master Summary only (2dp, no Energy) =======================
