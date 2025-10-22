@@ -3698,222 +3698,143 @@ else:
         master_summary_df = out.copy()
 # ======================= /Master Summary =======================
 
-# ======== PDF Export v1 (drop-in) ========
-import io, math
+# ======================= PDF — Master Summary only =======================
+import io
 from datetime import datetime
 
 try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Flowable
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
-    from reportlab.lib.units import mm
-    _e_pdf = None
-except Exception as e:
-    _e_pdf = e
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+except Exception as _e:
+    st.warning("PDF export needs the 'reportlab' package. Add 'reportlab' to requirements.txt.")
+    _e = None
 
-def _fmt(x, nd=2):
+def _fmt(v, fmt="{:.1f}", empty=""):
     try:
-        v = float(x)
-        if not math.isfinite(v): return ""
-        return f"{v:.{nd}f}"
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            return empty
+        return fmt.format(float(v))
     except Exception:
-        return str(x) if x is not None else ""
+        return str(v) if v is not None else empty
 
-def _make_table(df, cols, max_rows=12):
-    """Return a ReportLab Table from a pandas dataframe (safe, short)."""
-    if df is None or len(df) == 0:
-        return None
-    use = [c for c in cols if c in df.columns]
-    if not use:
-        return None
-    sub = df[use].head(max_rows).copy()
-    # format numerics lightly
-    for c in use:
-        if str(c).lower() == "horse": continue
-        sub[c] = sub[c].map(lambda v: _fmt(v))
-    data = [use] + sub.values.tolist()
-    tbl = Table(data, hAlign="LEFT")
-    tbl.setStyle(TableStyle([
-        ("FONT", (0,0), (-1,0), "Helvetica-Bold", 9),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#34495e")),
-        ("ALIGN", (0,0), (-1,0), "CENTER"),
-        ("FONT", (0,1), (-1,-1), "Helvetica", 8),
-        ("ALIGN", (1,1), (-1,-1), "RIGHT"),
-        ("LINEBELOW", (0,0), (-1,0), 0.5, colors.black),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.lightgrey]),
-        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.HexColor("#bdc3c7")),
-        ("BOX", (0,0), (-1,-1), 0.5, colors.black),
-    ]))
-    return tbl
-
-def build_race_pdf(metrics,
-                   sectional_df=None,
-                   hh_view=None,
-                   wd_view=None,
-                   dna_summaries=None,
-                   images=None,
-                   race_distance_m=None,
-                   split_step=None) -> bytes:
+def build_master_summary_pdf(summary_df, race_title=None, subtitle=None, topn=5, energy_caption=None):
     """
-    Build a compact PDF and return bytes.
-    Expected:
-      - metrics.attrs used for RSI/SCI/SHAPE_TAG/GOING/RQS/RPS/RACE_PROFILE
-      - sectional_df: your 'display_df' table (Sectional Metrics)
-      - hh_view: Hidden Horses v2 table
-      - wd_view: Winning DNA table
-      - dna_summaries: list of strings (per-horse one-liners), optional
-      - images: dict with {'shape': bytes, 'pace': bytes, 'ability': bytes} optional
+    summary_df: master_summary_df with columns
+      [Horse, FollowScore, Consensus, PI, GCI, Ahead of Hcap, Winning DNA, Hidden, Energy Eff]
     """
-    if 'reportlab' in str(_e_pdf).lower():
-        raise RuntimeError("reportlab is not installed. Add 'reportlab' to requirements.txt")
-
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=16*mm, rightMargin=16*mm, topMargin=16*mm, bottomMargin=16*mm
+        buf,
+        pagesize=landscape(A4),
+        leftMargin=24, rightMargin=24, topMargin=28, bottomMargin=24
     )
-
     styles = getSampleStyleSheet()
-    H1 = styles["Heading1"]; H1.fontSize = 16; H1.spaceAfter = 6
-    H2 = styles["Heading2"]; H2.fontSize = 13; H2.spaceBefore = 6; H2.spaceAfter = 4
-    H3 = styles["Heading3"]; H3.fontSize = 11; H3.spaceBefore = 6; H3.spaceAfter = 2
-    P  = styles["BodyText"]; P.fontSize = 9.2; P.leading = 12
+    H = ParagraphStyle("H", parent=styles["Heading1"], alignment=TA_LEFT, fontSize=18, leading=22, spaceAfter=8)
+    SH = ParagraphStyle("SH", parent=styles["Heading2"], alignment=TA_LEFT, fontSize=12, leading=14, spaceAfter=6)
+    CAP = ParagraphStyle("CAP", parent=styles["Normal"], fontSize=8, textColor=colors.grey, spaceBefore=4)
+    P = ParagraphStyle("P", parent=styles["Normal"], fontSize=9, leading=12)
+    Psmall = ParagraphStyle("Ps", parent=styles["Normal"], fontSize=8, leading=10)
 
     story = []
 
-    # ---------- Header ----------
-    Dm   = int(float(race_distance_m or metrics.attrs.get("DIST", 0)) or 0)
-    step = int(split_step or metrics.attrs.get("STEP", 100))
-    rsi  = float(metrics.attrs.get("RSI", 0.0))
-    sci  = float(metrics.attrs.get("SCI", 0.0))
-    tag  = str(metrics.attrs.get("SHAPE_TAG", "EVEN"))
-    going = str(metrics.attrs.get("GOING", "Good"))
-    rqs  = metrics.attrs.get("RQS", None)
-    rps  = metrics.attrs.get("RPS", None)
-    prof = str(metrics.attrs.get("RACE_PROFILE", ""))
-
-    story.append(Paragraph(f"Race Edge Report", H1))
-    hdr_line = f"Distance: <b>{Dm} m</b>  |  Splits: <b>{step}m</b>  |  Shape: <b>{tag}</b>  |  RSI: <b>{rsi:+.2f}</b>  |  SCI: <b>{sci:.2f}</b>  |  Going: <b>{going}</b>"
-    story.append(Paragraph(hdr_line, P))
-    meta_line = []
-    if rqs is not None: meta_line.append(f"RQS <b>{float(rqs):.1f}</b>/100")
-    if rps is not None: meta_line.append(f"RPS <b>{float(rps):.1f}</b>/100")
-    if prof:            meta_line.append(f"Profile: <b>{prof}</b>")
-    if meta_line:
-        story.append(Paragraph(" · ".join(meta_line), P))
+    # Header
+    title = race_title or "Race Edge — Master Summary"
+    sub = subtitle or datetime.now().strftime("Generated %Y-%m-%d %H:%M")
+    story.append(Paragraph(title, H))
+    story.append(Paragraph(sub, P))
     story.append(Spacer(1, 6))
 
-    # PI going meta (if available)
-    pi_meta = metrics.attrs.get("PI_GOING_META", {})
-    if pi_meta:
-        moved = []
-        mult = pi_meta.get("multipliers", {})
-        for k in ["Accel","F200_idx","tsSPI","Grind"]:
-            m = mult.get(k, 1.0)
-            if abs(m-1.0) >= 0.005:
-                moved.append(f"{k}×{m:.3f}")
-        if moved:
-            story.append(Paragraph("PI going multipliers: " + ", ".join(moved), P))
-            story.append(Spacer(1, 6))
+    # Consensus table (limit rows to keep one page clean)
+    cols = ["Horse","FollowScore","Consensus","PI","GCI","Ahead of Hcap","Winning DNA","Hidden","Energy Eff"]
+    df = summary_df.loc[:, [c for c in cols if c in summary_df.columns]].copy()
+    # build rows
+    head = ["Horse","Follow","Con","PI","GCI","Ahead Hcap","Win DNA","Hidden","Energy"]
+    data = [head]
+    for _, r in df.iterrows():
+        data.append([
+            str(r.get("Horse","")),
+            _fmt(r.get("FollowScore"), "{:.1f}"),
+            str(int(r.get("Consensus"))) if pd.notna(r.get("Consensus")) else "",
+            str(r.get("PI","")),
+            str(r.get("GCI","")),
+            str(r.get("Ahead of Hcap","")),
+            str(r.get("Winning DNA","")),
+            str(r.get("Hidden","")),
+            str(r.get("Energy Eff","")),
+        ])
 
-    # ---------- Tables ----------
-    story.append(Paragraph("Sectional Metrics — snapshot", H2))
-    sec_cols = ["Horse","PI","GCI_RS","F200_idx","tsSPI","Accel",metrics.attrs.get("GR_COL","Grind")]
-    tbl = _make_table(sectional_df, sec_cols, max_rows=12)
-    story.append(tbl if tbl else Paragraph("No data", P))
-    story.append(PageBreak())
-                              
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Hidden Horses v2 — signals", H2))
-    hh_cols = ["Horse","Tier","HiddenScore","SOS","ASI2","TFS","UEI"]
-    tbl = _make_table(hh_view, hh_cols, max_rows=12)
-    story.append(tbl if tbl else Paragraph("No data", P))
-    story.append(PageBreak())
+    tbl = Table(data, colWidths=[110, 45, 32, 40, 40, 60, 55, 45, 55])
+    tbl.setStyle(TableStyle([
+        ("FONT", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,0), 9),
+        ("FONTSIZE", (0,1), (-1,-1), 9),
+        ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+        ("ALIGN", (0,0), (0,-1), "LEFT"),
+        ("ALIGN", (0,0), (-1,0), "CENTER"),
+        ("LINEBELOW", (0,0), (-1,0), 1, colors.black),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#444444")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.lightgrey]),
+    ]))
+    story.append(Paragraph("Consensus table (higher = stronger next-up case)", SH))
+    story.append(tbl)
+    if energy_caption:
+        story.append(Paragraph(energy_caption, CAP))
 
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Winning DNA — top factors", H2))
-    wd_cols = ["Horse","WinningDNA","EZ01","MC01","LP01","LL01","SOS01"]
-    tbl = _make_table(wd_view, wd_cols, max_rows=12)
-    story.append(tbl if tbl else Paragraph("No data", P))
-    
-    # ---------- Race Pulse (one-liners) ----------
-    if dna_summaries and len(dna_summaries) > 0:
-        story.append(Spacer(1, 8))
-        story.append(Paragraph("Race Pulse — summaries", H2))
-        for line in dna_summaries[:14]:
-            story.append(Paragraph("• " + line, P))
+    story.append(Spacer(1, 10))
 
-    # ---------- Images (optional) ----------
-    img_keys = ["shape","pace","ability"]
-    have_any = images and any(k in images and images[k] for k in img_keys)
-    if have_any:
-        story.append(PageBreak())
-        story.append(Paragraph("Figures", H2))
-        for label, key in [("Sectional Shape Map", "shape"),
-                           ("Pace Curve", "pace"),
-                           ("Ability Matrix", "ability")]:
-            if not images.get(key): 
-                continue
-            try:
-                img = Image(io.BytesIO(images[key]))
-                # ✅ scale dynamically to fit A4 height (~250 mm usable)
-                max_w, max_h = 170*mm, 120*mm
-                img.drawWidth = min(img.imageWidth, max_w)
-                ratio = img.drawWidth / float(img.imageWidth)
-                img.drawHeight = min(img.imageHeight * ratio, max_h)
+    # Top-5 cards
+    story.append(Paragraph("Horses to Follow (Top 5)", SH))
+    show = min(topn, len(df))
+    for i in range(show):
+        r = df.iloc[i]
+        medal = ["🥇","🥈","🥉","🏅","🏅"][i] if i < 5 else "•"
+        head_line = f"{medal} <b>{r['Horse']}</b> — FollowScore {_fmt(r['FollowScore'],'{:.1f}')} (consensus {int(r['Consensus'])}/6)"
+        story.append(Paragraph(head_line, P))
+        bullets = []
+        if "PI" in df.columns and r["PI"]: bullets.append(f"PI <b>{r['PI']}</b>")
+        if "GCI" in df.columns and r["GCI"]: bullets.append(f"GCI <b>{r['GCI']}</b>")
+        if "Ahead of Hcap" in df.columns and r["Ahead of Hcap"]: bullets.append(f"Ahead of handicap <b>{r['Ahead of Hcap']}</b>")
+        if "Winning DNA" in df.columns and r["Winning DNA"]: bullets.append(f"Winning DNA <b>{r['Winning DNA']}</b>")
+        if "Hidden" in df.columns and r["Hidden"]: bullets.append(f"Hidden <b>{r['Hidden']}</b>")
+        if "Energy Eff" in df.columns and r["Energy Eff"]: bullets.append(f"Energy efficiency <b>{r['Energy Eff']}</b>")
+        if not bullets: bullets.append("Multi-model positive profile")
+        story.append(Paragraph(" • " + " • ".join(bullets), Psmall))
+        story.append(Spacer(1, 4))
 
-                story.append(Paragraph(label, H3))
-                story.append(img)
-                story.append(PageBreak())
-            except Exception:
-                # skip bad image
-                pass
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("© 2025 Race Edge Analytics — Master Summary derived from PI, GCI, Ahead-of-Handicap, Winning DNA, Hidden Horses, and Energy Efficiency.", CAP))
 
     doc.build(story)
     return buf.getvalue()
 
-# ---- Streamlit hook (place this block where you want the button) ----
-try:
-    if st.button("Generate PDF report"):
-        if '_e_pdf' in globals() and isinstance(_e_pdf, Exception):
-            st.error("reportlab missing. Add it to requirements.txt.")
-        else:
-            # Collect optional text lines from Winning DNA expander if you created them
-            try:
-                dna_lines = (WD.sort_values("WinningDNA", ascending=False)["DNA_Summary"]
-                               .dropna().astype(str).tolist())
-            except Exception:
-                dna_lines = []
+# ---- Streamlit button (Master Summary only) ----
+if "master_summary_df" in locals() and isinstance(master_summary_df, pd.DataFrame) and not master_summary_df.empty:
+    # Race title line (fill with what you have available)
+    race_title = None
+    try:
+        # try to construct from your app context
+        # e.g., meeting/course/distance/date variables if you have them; fall back if missing
+        meeting = locals().get("meeting") or locals().get("course") or ""
+        distance = locals().get("race_distance_m") or locals().get("distance_m") or ""
+        rdate = locals().get("race_date") or ""
+        race_title = f"Race Edge — Master Summary  {meeting}  {distance}m  {rdate}".strip()
+    except Exception:
+        race_title = "Race Edge — Master Summary"
 
-            # Collect images if present
-            imgs = {}
-            for k, var in [("shape", "shape_map_png"), ("pace", "pace_png"), ("ability", "ability_png")]:
-                try:
-                    if var in globals() and globals()[var] is not None:
-                        imgs[k] = globals()[var]
-                except Exception:
-                    pass
+    # energy source caption from the Master Summary block (if we set it)
+    energy_caption = locals().get("energy_source_label", None)
 
-            # Build and download
-            pdf_bytes = build_race_pdf(
-                metrics,
-                sectional_df=display_df if 'display_df' in globals() else metrics,
-                hh_view=hh_view if 'hh_view' in globals() else None,
-                wd_view=WD_view if 'WD_view' in globals() else (WD if 'WD' in globals() else None),
-                dna_summaries=dna_lines,
-                images=imgs,
-                race_distance_m=race_distance_input,
-                split_step=split_step
-            )
-            st.download_button(
-                "Download PDF",
-                data=pdf_bytes,
-                file_name=f"race_edge_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                mime="application/pdf",
-            )
-except Exception as e:
-    st.error(f"PDF generation failed: {e}")
-# ======== /PDF Export v1 ========
+    pdf_bytes = build_master_summary_pdf(master_summary_df, race_title=race_title, subtitle="Master Summary only", topn=5, energy_caption=energy_caption)
+    st.download_button(
+        "⬇️ Download Master Summary PDF",
+        data=pdf_bytes,
+        file_name="RaceEdge_MasterSummary.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
+else:
+    st.info("Run the Master Summary first — nothing to export yet.")
+# ======================= /PDF — Master Summary only =======================
