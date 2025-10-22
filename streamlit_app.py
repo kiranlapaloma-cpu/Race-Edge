@@ -3505,7 +3505,7 @@ except Exception as e:
     st.error("CeilingCore failed.")
     st.exception(e)
 
-# ======================= Master Summary — Consolidated Model Insight (5-model, 2dp everywhere) =======================
+# ======================= Master Summary — Consolidated Model Insight (5-model, 2dp, bullet fix) =======================
 st.markdown("---")
 st.markdown("## Master Summary — Consolidated Model Insight")
 
@@ -3595,7 +3595,7 @@ else:
         # -------- numeric table for sorting/DF usage --------
         out_num = pd.DataFrame({
             "Horse": M["Horse"],
-            "FollowScore": 100.0*FollowScore,  # keep numeric here
+            "FollowScore": 100.0*FollowScore,  # numeric
             "Consensus": consensus.astype(int),
             "PI": M.get("PI"),
             "GCI": M.get("GCI"),
@@ -3627,28 +3627,34 @@ else:
         # -------- Horses to Follow (Top 5, 2dp in bullets) --------
         st.markdown("### Horses to Follow")
         medals = ["🥇","🥈","🥉","🏅","🏅"]
-        top5 = out_num.head(5)          # use numeric for comparisons, then format in text
-        top5_dis = out_dis.head(5)      # preformatted 2dp strings for bullets
+        top5 = out_num.head(5)
+        top5_dis = out_dis.head(5)
 
-        for i, (r_num, r_dis) in enumerate(zip(top5.itertuples(index=False), top5_dis.itertuples(index=False))):
+        for i in range(len(top5)):
+            r_num = top5.iloc[i]
+            r_dis = top5_dis.iloc[i]
+
             st.markdown(
-                f"**{medals[i]} {r_dis.Horse}** — "
-                f"*FollowScore {float(r_num.FollowScore):.2f} (consensus {int(r_num.Consensus)}/5)*"
+                f"**{medals[i]} {r_dis['Horse']}** — "
+                f"*FollowScore {float(r_num['FollowScore']):.2f} (consensus {int(r_num['Consensus'])}/5)*"
             )
+
             bullets = []
-            if r_dis.PI:            bullets.append(f"PI **{r_dis.PI}**")
-            if r_dis.GCI:           bullets.append(f"GCI **{r_dis.GCI}**")
-            if r_dis._4:            bullets.append(f"Ahead of handicap **{r_dis._4}**")  # Ahead of Hcap
-            if r_dis._5:            bullets.append(f"Winning DNA **{r_dis._5}**")
-            if r_dis.Hidden:        bullets.append(f"Hidden **{r_dis.Hidden}**")
-            if not bullets:         bullets.append("Multi-model positive profile")
+            if r_dis["PI"]:            bullets.append(f"PI **{r_dis['PI']}**")
+            if r_dis["GCI"]:           bullets.append(f"GCI **{r_dis['GCI']}**")
+            if r_dis["Ahead of Hcap"]: bullets.append(f"Ahead of handicap **{r_dis['Ahead of Hcap']}**")
+            if r_dis["Winning DNA"]:   bullets.append(f"Winning DNA **{r_dis['Winning DNA']}**")
+            if r_dis["Hidden"]:        bullets.append(f"Hidden **{r_dis['Hidden']}**")
+            if not bullets: bullets.append("Multi-model positive profile")
             st.markdown("- " + "\n- ".join(bullets))
 
-        st.caption("FollowScore = 0.30·PI + 0.25·GCI + 0.20·AheadHcap + 0.15·WinningDNA + 0.10·Hidden. Consensus = #signals in top quartile within the race (0–5).")
+        st.caption(
+            "FollowScore = 0.30·PI + 0.25·GCI + 0.20·AheadHcap + 0.15·WinningDNA + 0.10·Hidden. "
+            "Consensus = #signals in top quartile within the race (0–5)."
+        )
 
-        # expose numeric summary for PDF/export or further logic
         master_summary_df = out_num.copy()
-# ======================= /Master Summary (5-model, 2dp) =======================
+# ======================= /Master Summary (5-model, 2dp, bullet fix) =======================
 
 # ======================= PDF — Master Summary only (2dp, no Energy) =======================
 import io
