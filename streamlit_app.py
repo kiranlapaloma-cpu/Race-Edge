@@ -3505,7 +3505,7 @@ except Exception as e:
     st.error("CeilingCore failed.")
     st.exception(e)
 
-# ======================= Master Summary — Consolidated Model Insight (No Energy) =======================
+# ======================= Master Summary — Consolidated Model Insight (5-model, 2dp everywhere) =======================
 st.markdown("---")
 st.markdown("## Master Summary — Consolidated Model Insight")
 
@@ -3516,15 +3516,17 @@ def _pick_first_col(df, names):
     low = {c.lower(): c for c in df.columns}
     for n in names:
         if not n: continue
-        if n.lower() in low: return low[n.lower()]
+        k = n.lower()
+        if k in low: return low[k]
     return None
 
 def _r01_rank(s):
     s = pd.to_numeric(s, errors="coerce")
-    if s.notna().sum() <= 1: return pd.Series(0.5, index=s.index)
+    if s.notna().sum() <= 1:  # neutral for singletons/missing
+        return pd.Series(0.5, index=s.index)
     return s.rank(pct=True, method="average").fillna(0.5)
 
-# -------- collect sources --------
+# -------- collect sources (merge by Horse) --------
 sources = []
 for nm in ["metrics","MET","metrics_view","AM_view","XW"]:
     if nm in locals():
@@ -3556,6 +3558,8 @@ else:
         M = base[["Horse"]].copy()
         if col_PI:   M["PI"]  = pd.to_numeric(base[col_PI],  errors="coerce")
         if col_GCI:  M["GCI"] = pd.to_numeric(base[col_GCI], errors="coerce")
+
+        # Ahead-of-handicap: use provided column or derive from GCI vs median within race
         if col_Hcap:
             M["AheadHcap"] = pd.to_numeric(base[col_Hcap], errors="coerce")
         elif col_GCI:
@@ -3563,6 +3567,7 @@ else:
             M["AheadHcap"] = g - np.nanmedian(g)
         else:
             M["AheadHcap"] = np.nan
+
         if col_WDNA: M["WinningDNA"] = pd.to_numeric(base[col_WDNA], errors="coerce")
         if col_HH:   M["Hidden"]     = pd.to_numeric(base[col_HH],  errors="coerce")
 
@@ -3574,55 +3579,76 @@ else:
         s_HH   = _r01_rank(M.get("Hidden"))
 
         # -------- FollowScore (no energy) --------
-        # Total weight = 1.00
+        # Weights sum to 1.00
         w_PI, w_GCI, w_Hcap, w_WDNA, w_HH = 0.30, 0.25, 0.20, 0.15, 0.10
         FollowScore = (
             w_PI*s_PI + w_GCI*s_GCI + w_Hcap*s_Hcap +
             w_WDNA*s_WDNA + w_HH*s_HH
-        ).clip(0.0,1.0)
+        ).clip(0.0, 1.0)
 
         comps = pd.DataFrame({
-            "PI":s_PI, "GCI":s_GCI, "AheadHcap":s_Hcap,
-            "WinningDNA":s_WDNA, "Hidden":s_HH
+            "PI": s_PI, "GCI": s_GCI, "AheadHcap": s_Hcap,
+            "WinningDNA": s_WDNA, "Hidden": s_HH
         })
-        consensus = (comps>=0.75).sum(axis=1)
+        consensus = (comps >= 0.75).sum(axis=1)
 
-        # -------- output table --------
-        out = pd.DataFrame({
-            "Horse":M["Horse"],
-            "FollowScore":(100*FollowScore).round(1),
-            "Consensus":consensus.astype(int),
-            "PI":M.get("PI"),
-            "GCI":M.get("GCI"),
-            "Ahead of Hcap":M.get("AheadHcap"),
-            "Winning DNA":M.get("WinningDNA"),
-            "Hidden":M.get("Hidden")
-        }).sort_values(["FollowScore","Consensus"],ascending=[False,False]).reset_index(drop=True)
+        # -------- numeric table for sorting/DF usage --------
+        out_num = pd.DataFrame({
+            "Horse": M["Horse"],
+            "FollowScore": 100.0*FollowScore,  # keep numeric here
+            "Consensus": consensus.astype(int),
+            "PI": M.get("PI"),
+            "GCI": M.get("GCI"),
+            "Ahead of Hcap": M.get("AheadHcap"),
+            "Winning DNA": M.get("WinningDNA"),
+            "Hidden": M.get("Hidden")
+        }).sort_values(["FollowScore","Consensus"], ascending=[False, False]).reset_index(drop=True)
+
+        # -------- 2dp display copy --------
+        def _fmt2(v, sign=False):
+            v = pd.to_numeric(v, errors="coerce")
+            if pd.isna(v): return ""
+            return f"{v:+.2f}" if sign else f"{v:.2f}"
+
+        out_dis = out_num.copy()
+        out_dis["FollowScore"]   = out_num["FollowScore"].map(lambda v: f"{v:.2f}")
+        out_dis["PI"]            = out_num["PI"].map(_fmt2)
+        out_dis["GCI"]           = out_num["GCI"].map(_fmt2)
+        out_dis["Ahead of Hcap"] = out_num["Ahead of Hcap"].map(lambda v: _fmt2(v, sign=True))
+        out_dis["Winning DNA"]   = out_num["Winning DNA"].map(_fmt2)
+        out_dis["Hidden"]        = out_num["Hidden"].map(_fmt2)
 
         st.markdown("**Consensus table (higher = stronger next-up case)**")
         st.dataframe(
-            out[["Horse","FollowScore","Consensus","PI","GCI","Ahead of Hcap","Winning DNA","Hidden"]]
-              .style.format({"FollowScore":"{:.1f}"}),
+            out_dis[["Horse","FollowScore","Consensus","PI","GCI","Ahead of Hcap","Winning DNA","Hidden"]],
             use_container_width=True, hide_index=True
         )
 
-        # -------- Horses to Follow (Top 5) --------
+        # -------- Horses to Follow (Top 5, 2dp in bullets) --------
         st.markdown("### Horses to Follow")
         medals = ["🥇","🥈","🥉","🏅","🏅"]
-        for i, r in out.head(5).iterrows():
-            st.markdown(f"**{medals[i]} {r['Horse']}** — *FollowScore {r['FollowScore']:.1f} (consensus {int(r['Consensus'])}/5)*")
-            bullets=[]
-            if r.get("PI"): bullets.append(f"PI **{r['PI']:.2f}**")
-            if r.get("GCI"): bullets.append(f"GCI **{r['GCI']:.2f}**")
-            if r.get("Ahead of Hcap"): bullets.append(f"Ahead of handicap **{r['Ahead of Hcap']:+.2f}**")
-            if r.get("Winning DNA"): bullets.append(f"Winning DNA **{r['Winning DNA']:.2f}**")
-            if r.get("Hidden"): bullets.append(f"Hidden **{r['Hidden']:.2f}**")
-            if not bullets: bullets.append("Multi-model positive profile")
+        top5 = out_num.head(5)          # use numeric for comparisons, then format in text
+        top5_dis = out_dis.head(5)      # preformatted 2dp strings for bullets
+
+        for i, (r_num, r_dis) in enumerate(zip(top5.itertuples(index=False), top5_dis.itertuples(index=False))):
+            st.markdown(
+                f"**{medals[i]} {r_dis.Horse}** — "
+                f"*FollowScore {float(r_num.FollowScore):.2f} (consensus {int(r_num.Consensus)}/5)*"
+            )
+            bullets = []
+            if r_dis.PI:            bullets.append(f"PI **{r_dis.PI}**")
+            if r_dis.GCI:           bullets.append(f"GCI **{r_dis.GCI}**")
+            if r_dis._4:            bullets.append(f"Ahead of handicap **{r_dis._4}**")  # Ahead of Hcap
+            if r_dis._5:            bullets.append(f"Winning DNA **{r_dis._5}**")
+            if r_dis.Hidden:        bullets.append(f"Hidden **{r_dis.Hidden}**")
+            if not bullets:         bullets.append("Multi-model positive profile")
             st.markdown("- " + "\n- ".join(bullets))
 
         st.caption("FollowScore = 0.30·PI + 0.25·GCI + 0.20·AheadHcap + 0.15·WinningDNA + 0.10·Hidden. Consensus = #signals in top quartile within the race (0–5).")
-        master_summary_df = out.copy()
-# ======================= /Master Summary (No Energy) =======================
+
+        # expose numeric summary for PDF/export or further logic
+        master_summary_df = out_num.copy()
+# ======================= /Master Summary (5-model, 2dp) =======================
 
 # ======================= PDF — Master Summary only =======================
 import io
