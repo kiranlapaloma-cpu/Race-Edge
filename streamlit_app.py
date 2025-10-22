@@ -3505,11 +3505,11 @@ except Exception as e:
     st.error("CeilingCore failed.")
     st.exception(e)
 
-# ======================= Master Summary — Consolidated Model Insight (EER-aware + Top5) =======================
+# ======================= Master Summary — Consolidated Model Insight (EnergyEff fixed + Top5) =======================
 st.markdown("---")
 st.markdown("## Master Summary — Consolidated Model Insight")
 
-import numpy as np, pandas as pd, inspect
+import numpy as np, pandas as pd
 
 def _pick_first_col(df, candidates):
     if df is None or df.empty: return None
@@ -3522,30 +3522,21 @@ def _pick_first_col(df, candidates):
 
 def _r01_rank(s):
     s = pd.to_numeric(s, errors="coerce")
-    if s.notna().sum() <= 1:  # singletons -> neutral
+    if s.notna().sum() <= 1:
         return pd.Series(0.5, index=s.index)
     return s.rank(pct=True, method="average").fillna(0.5)
 
-# ---- Collect likely sources from locals (broad + EER-aware) ----
+# ---- gather sources
 candidates_sources = []
-preferred_names = ["metrics","MET","metrics_view","AM_view","XW","EER_view","efficiency_view","energy_view"]
-for nm in preferred_names:
+for nm in ["metrics","MET","metrics_view","AM_view","XW"]:
     if nm in locals():
         obj = locals()[nm]
         if isinstance(obj, pd.DataFrame) and not obj.empty:
             candidates_sources.append(obj.copy())
 
-# also sweep ALL locals for any DF that has EER/EER_adj if not already picked up
-for nm, obj in list(locals().items()):
-    if isinstance(obj, pd.DataFrame) and not obj.empty:
-        cols = [c.lower() for c in obj.columns]
-        if ("eer_adj" in cols or "eer" in cols or "energy" in cols) and obj not in candidates_sources:
-            candidates_sources.append(obj.copy())
-
 if not candidates_sources:
-    st.warning("Master Summary: no model tables found.")
+    st.warning("Master Summary: No model tables detected (metrics/AM_view).")
 else:
-    # unify on Horse
     base = None
     for df in candidates_sources:
         hc = _pick_first_col(df, ["Horse","Runner","Name"])
@@ -3555,108 +3546,102 @@ else:
         base = d if base is None else pd.merge(base, d, on="Horse", how="outer")
 
     if base is None or base.empty:
-        st.warning("Master Summary: couldn't unify on 'Horse'.")
+        st.warning("Master Summary: Could not unify on 'Horse'.")
     else:
-        # ---------- pick columns for each contributor ----------
-        col_PI    = _pick_first_col(base, ["PI","PI_v","PI_Score"])
-        col_GCI   = _pick_first_col(base, ["GCI","GCI_RS","GCI_Score"])
-        col_HCAP  = _pick_first_col(base, ["GCI_Hcap","AheadOfHandicap","Ahead_Hcap"])
+        # ----- pick columns
+        col_PI   = _pick_first_col(base, ["PI","PI_v","PI_Score"])
+        col_GCI  = _pick_first_col(base, ["GCI","GCI_RS","GCI_Score"])
+        col_GCI_H= _pick_first_col(base, ["GCI_Hcap","AheadOfHandicap","Ahead_Hcap"])
 
-        col_WDNA  = _pick_first_col(base, ["WinningDNA","IA","IntrinsicAbility","AbilityScore"])
-        col_HH    = _pick_first_col(base, ["HiddenScore","HAI","HiddenAbilities","SleeperScore","Hidden"])
+        col_WDNA= _pick_first_col(base, ["WinningDNA","IA","IntrinsicAbility","AbilityScore"])
+        col_HH  = _pick_first_col(base, ["HiddenScore","HAI","HiddenAbilities","SleeperScore","Hidden"])
 
-        # Energy detection (now EER-aware)
-        col_EER_ADJ = _pick_first_col(base, ["EER_adj","EER-Adj","EER_adj%"])
-        col_EER     = _pick_first_col(base, ["EER"])
-        col_EE      = _pick_first_col(base, [
+        # energy: broaden candidates + proxies
+        energy_candidates = [
             "EnergyEff","Energy Eff","EnergyEfficiency","Energy Efficiency",
             "Efficiency","Energy_Score","EE","EE_Score","EE%"
-        ])
-        # proxies if needed
+        ]
+        col_EE = _pick_first_col(base, energy_candidates)
+
         col_refF = _pick_first_col(base, ["Refined FSP (%)","RefinedFSP","Refined_FSP","RefinedFSP_%","Refined FSP"])
         col_ts   = _pick_first_col(base, ["tsSPI","TSSPI","MidraceSPI","SPI (%)","SPI"])
         col_kick = _pick_first_col(base, ["Kick Index","KickIndex","Kick","KickQ"])
         col_grind= _pick_first_col(base, ["Grind","Finish Split","Finish_Split","FinishSpeed","Finish"])
 
+        # ----- build working frame
         M = base[["Horse"]].copy()
-        if col_PI:   M["PI"]  = pd.to_numeric(base[col_PI],  errors="coerce")
-        if col_GCI:  M["GCI"] = pd.to_numeric(base[col_GCI], errors="coerce")
+        if col_PI  : M["PI"] = pd.to_numeric(base[col_PI], errors="coerce")
+        if col_GCI : M["GCI"] = pd.to_numeric(base[col_GCI], errors="coerce")
 
-        if col_HCAP:
-            M["AheadHcap"] = pd.to_numeric(base[col_HCAP], errors="coerce")
+        if col_GCI_H:
+            M["AheadHcap"] = pd.to_numeric(base[col_GCI_H], errors="coerce")
         elif col_GCI:
-            g = pd.to_numeric(base[col_GCI], errors="coerce")
-            M["AheadHcap"] = g - np.nanmedian(g)
+            g = pd.to_numeric(base[col_GCI], errors="coerce"); med = np.nanmedian(g)
+            M["AheadHcap"] = g - med
         else:
             M["AheadHcap"] = np.nan
 
         if col_WDNA: M["WinningDNA"] = pd.to_numeric(base[col_WDNA], errors="coerce")
-        if col_HH:   M["Hidden"]     = pd.to_numeric(base[col_HH],   errors="coerce")
+        if col_HH  : M["Hidden"]     = pd.to_numeric(base[col_HH],  errors="coerce")
 
-        # ---------- Energy Efficiency source logic ----------
+        # ----- EnergyEff: direct or proxy (and tell the user what was used)
         energy_source_label = None
-        if col_EER_ADJ:
-            M["EnergyEff"] = pd.to_numeric(base[col_EER_ADJ], errors="coerce")
-            energy_source_label = f"Energy source: **{col_EER_ADJ}** (adjusted)"
-        elif col_EER:
-            M["EnergyEff"] = pd.to_numeric(base[col_EER], errors="coerce")
-            energy_source_label = f"Energy source: **{col_EER}**"
-        elif col_EE:
+        if col_EE:
             M["EnergyEff"] = pd.to_numeric(base[col_EE], errors="coerce")
             energy_source_label = f"Energy source: **{col_EE}**"
         else:
             parts = []
             if col_refF: parts.append(pd.to_numeric(base[col_refF], errors="coerce"))
-            if col_ts:   parts.append(pd.to_numeric(base[col_ts],  errors="coerce"))
+            if col_ts  : parts.append(pd.to_numeric(base[col_ts],  errors="coerce"))
             if col_kick: parts.append(pd.to_numeric(base[col_kick], errors="coerce"))
             if col_grind:parts.append(pd.to_numeric(base[col_grind],errors="coerce"))
             if parts:
                 P = pd.concat(parts, axis=1)
-                Pn = P.apply(_r01_rank, axis=0)         # 0..1 per proxy
-                M["EnergyEff"] = Pn.mean(axis=1)        # 0..1 blend
-                used = []
-                if col_refF: used.append(col_refF)
-                if col_ts:   used.append(col_ts)
-                if col_kick: used.append(col_kick)
-                if col_grind:used.append(col_grind)
-                energy_source_label = "Energy source: proxy blend of **" + ", ".join(used) + "**"
+                Pn = P.apply(_r01_rank, axis=0)   # rank-normalise each part 0..1
+                M["EnergyEff"] = Pn.mean(axis=1)  # already 0..1
+                labels = []
+                if col_refF: labels.append(col_refF)
+                if col_ts:   labels.append(col_ts)
+                if col_kick: labels.append(col_kick)
+                if col_grind:labels.append(col_grind)
+                energy_source_label = "Energy source: proxy blend of **" + ", ".join(labels) + "**"
             else:
                 M["EnergyEff"] = np.nan
                 energy_source_label = "Energy source: **none available**"
 
-        # ---------- normalise contributors (0..1 via percentile ranks) ----------
+        # ----- normalise contributors to 0..1
         s_PI   = _r01_rank(M.get("PI"))
         s_GCI  = _r01_rank(M.get("GCI"))
-        s_HCAP = _r01_rank(M.get("AheadHcap"))
+        s_Hcap = _r01_rank(M.get("AheadHcap"))
         s_WDNA = _r01_rank(M.get("WinningDNA"))
         s_HH   = _r01_rank(M.get("Hidden"))
 
         ee_raw = pd.to_numeric(M.get("EnergyEff"), errors="coerce")
-        # If values already look like 0..1, use as-is; else rank-normalise (works for EER on ~70–105 scale)
+        # if many values in [0,1], treat as already 0..1; else rank-normalise
         if ee_raw.notna().sum() and (ee_raw.dropna().between(0.0,1.0).mean() > 0.8):
             s_EE = ee_raw.fillna(0.5)
         else:
             s_EE = _r01_rank(ee_raw)
 
-        # ---------- FollowScore (includes Energy) ----------
-        w_PI, w_GCI, w_HCAP, w_WDNA, w_HH, w_EE = 0.25, 0.20, 0.20, 0.15, 0.12, 0.08
+        # ----- FollowScore (includes EnergyEff)
+        w_PI, w_GCI, w_Hcap, w_WDNA, w_HH, w_EE = 0.25, 0.20, 0.20, 0.15, 0.12, 0.08
         FollowScore = (
             w_PI   * s_PI   +
             w_GCI  * s_GCI  +
-            w_HCAP * s_HCAP +
+            w_Hcap * s_Hcap +
             w_WDNA * s_WDNA +
             w_HH   * s_HH   +
             w_EE   * s_EE
         ).clip(0.0, 1.0)
 
-        # consensus = number of signals in top quartile
+        # ----- consensus count (top quartile across 6 signals)
         comps = pd.DataFrame({
-            "PI": s_PI, "GCI": s_GCI, "AheadHcap": s_HCAP,
-            "WinningDNA": s_WDNA, "Hidden": s_HH, "Energy": s_EE
+            "PI": s_PI, "GCI": s_GCI, "AheadHcap": s_Hcap,
+            "WinningDNA": s_WDNA, "Hidden": s_HH, "EnergyEff": s_EE
         })
         consensus = (comps >= 0.75).sum(axis=1)
 
-        # ---------- output table ----------
+        # ----- output table
         out = pd.DataFrame({
             "Horse": M["Horse"],
             "FollowScore": (100.0 * FollowScore).round(1),
@@ -3666,46 +3651,38 @@ else:
             "Ahead of Hcap": M.get("AheadHcap"),
             "Winning DNA": M.get("WinningDNA"),
             "Hidden": M.get("Hidden"),
-            # show EER_adj/EER numbers verbatim if used; else proxy as %
-            "Energy Eff": None
-        })
+            "Energy Eff": M.get("EnergyEff"),
+        }).sort_values(["FollowScore","Consensus"], ascending=[False, False]).reset_index(drop=True)
 
-        # display formatting for Energy:
-        if col_EER_ADJ or col_EER:
-            en = pd.to_numeric(M["EnergyEff"], errors="coerce")
-            out["Energy Eff"] = en.map(lambda v: f"{v:.1f}" if pd.notna(v) else "")
-        else:
-            en = pd.to_numeric(M["EnergyEff"], errors="coerce")
-            out["Energy Eff"] = en.map(lambda v: f"{(v*100):.1f}%" if pd.notna(v) else "")
+        # friendly formats
+        def _fmt(series, plus=False, dec=2):
+            s = pd.to_numeric(series, errors="coerce")
+            if plus: return s.map(lambda v: f"{v:+.{dec}f}" if pd.notna(v) else "")
+            return s.map(lambda v: f"{v:.{dec}f}" if pd.notna(v) else "")
 
-        # nice formatting for others
-        def _fmt(s, plus=False, dec=2):
-            x = pd.to_numeric(s, errors="coerce")
-            if plus: return x.map(lambda v: f"{v:+.{dec}f}" if pd.notna(v) else "")
-            return x.map(lambda v: f"{v:.{dec}f}" if pd.notna(v) else "")
-
-        out["PI"]            = _fmt(out["PI"])
-        out["GCI"]           = _fmt(out["GCI"])
-        out["Ahead of Hcap"] = _fmt(out["Ahead of Hcap"], plus=True)
-        out["Winning DNA"]   = _fmt(out["Winning DNA"])
-        out["Hidden"]        = _fmt(out["Hidden"])
-
-        Summary = out.sort_values(["FollowScore","Consensus"], ascending=[False, False]).reset_index(drop=True)
+        out["PI"]            = _fmt(out["PI"], dec=2)
+        out["GCI"]           = _fmt(out["GCI"], dec=2)
+        out["Ahead of Hcap"] = _fmt(out["Ahead of Hcap"], plus=True, dec=2)
+        out["Winning DNA"]   = _fmt(out["Winning DNA"], dec=2)
+        out["Hidden"]        = _fmt(out["Hidden"], dec=2)
+        # show Energy Eff as % if already 0..1; else numeric
+        en = pd.to_numeric(M["EnergyEff"], errors="coerce")
+        out["Energy Eff"] = np.where(en.between(0,1, inclusive="both"), (en*100).round(1).astype(str)+"%", _fmt(en, dec=1))
 
         st.markdown("**Consensus table (higher = stronger next-up case)**")
-        st.dataframe(
-            Summary[["Horse","FollowScore","Consensus","PI","GCI","Ahead of Hcap","Winning DNA","Hidden","Energy Eff"]]
-                .style.format({"FollowScore":"{:.1f}"}),
-            use_container_width=True, hide_index=True
-        )
-        st.caption(energy_source_label)
+        st.dataframe(out[["Horse","FollowScore","Consensus","PI","GCI","Ahead of Hcap","Winning DNA","Hidden","Energy Eff"]]
+                     .style.format({"FollowScore":"{:.1f}"}),
+                     use_container_width=True, hide_index=True)
 
-        # ---------- Horses to Follow (Top 5) ----------
+        if energy_source_label:
+            st.caption(energy_source_label)
+
+        # ----- Horses to Follow (Top 5)
         st.markdown("### Horses to Follow")
         TOPN = 5
-        medals = ["🥇","🥈","🥉","🏅","🏅"]
-        for i, row in Summary.head(TOPN).iterrows():
-            st.markdown(f"**{medals[i]} {row['Horse']}** — *FollowScore {row['FollowScore']:.1f} (consensus {int(row['Consensus'])}/6)*")
+        for i, row in out.head(TOPN).iterrows():
+            medal = ["🥇","🥈","🥉","🏅","🏅"][i] if i < 5 else "•"
+            st.markdown(f"**{medal} {row['Horse']}** — *FollowScore {row['FollowScore']:.1f} (consensus {int(row['Consensus'])}/6)*")
             bullets = []
             if row.get("PI"):            bullets.append(f"PI **{row['PI']}**")
             if row.get("GCI"):           bullets.append(f"GCI **{row['GCI']}**")
@@ -3716,9 +3693,9 @@ else:
             if not bullets: bullets.append("Multi-model positive profile")
             st.markdown("- " + "\n- ".join(bullets))
 
-        st.caption("FollowScore = 0.25·PI + 0.20·GCI + 0.20·AheadHcap + 0.15·WinningDNA + 0.12·Hidden + 0.08·Energy. Consensus = #signals in top quartile within the race (0–6).")
+        st.caption("FollowScore = 0.25·PI + 0.20·GCI + 0.20·AheadHcap + 0.15·WinningDNA + 0.12·Hidden + 0.08·EnergyEff. Consensus = #signals in top quartile within the race (0–6).")
 
-        master_summary_df = Summary.copy()
+        master_summary_df = out.copy()
 # ======================= /Master Summary =======================
 
 # ======== PDF Export v1 (drop-in) ========
