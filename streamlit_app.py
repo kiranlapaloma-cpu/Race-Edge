@@ -2333,6 +2333,54 @@ hh_view = hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True,False,Fals
 st.dataframe(hh_view, use_container_width=True)
 st.caption("Hidden Horses v2 — RS-aware tiering enabled · 🔥 ≥7.2/6.0 · 🟡 ≥6.2/5.0.")
 
+# ======================= Shape Delta Index (SDI) =======================
+st.markdown("## Shape Delta Index (SDI)")
+
+# Inputs we need
+RSI = float(metrics.attrs.get("RSI", 0.0))     # + = slow-early (late favoured), − = fast-early (early favoured)
+SCI = float(metrics.attrs.get("SCI", 0.0))     # 0..1 consensus/strength
+
+need = {"Horse", "Accel", "tsSPI"}
+if not need.issubset(metrics.columns) or len(metrics) == 0:
+    st.info("SDI: need columns " + ", ".join(sorted(need)) + ".")
+else:
+    SD = metrics.loc[:, ["Horse", "Accel", "tsSPI"]].copy()
+    SD["Accel"] = pd.to_numeric(SD["Accel"], errors="coerce")
+    SD["tsSPI"] = pd.to_numeric(SD["tsSPI"], errors="coerce")
+    SD = SD.dropna(subset=["Accel","tsSPI"]).reset_index(drop=True)
+
+    # Core SDI: how much a horse's sectionals defied the prevailing shape
+    # Positive => ran against shape bias; Negative => with shape bias
+    sign_rsi = np.sign(RSI)  # +1 slow-early; -1 fast-early; 0 ~ even
+    SD["SDI_raw"] = (SD["Accel"] - SD["tsSPI"]) * sign_rsi
+    SD["SDI"] = SD["SDI_raw"] * max(0.0, min(1.0, SCI))  # reliability weight
+
+    # Banding & notes
+    def _band(v):
+        if not np.isfinite(v): return "", ""
+        if v >= 4.0:   return "🔥 Strongly Against", "Defied race shape (upgrade)"
+        if v >= 2.0:   return "🟢 Against",          "Worked against bias"
+        if v >  -2.0:  return "⚪ Neutral",          "Shape-neutral run"
+        if v >  -4.0:  return "🟠 With",             "Aided by shape"
+        return          "🔴 Strongly With",          "Heavily aided by shape (downgrade)"
+
+    bands, notes = zip(*[_band(v) for v in SD["SDI"].to_numpy()])
+    SD["Band"] = bands
+    SD["Note"] = notes
+
+    # Optional compact context line
+    flow = "evenish" if abs(RSI) < 0.4 else ("slow-early (late favoured)" if RSI > 0 else "fast-early (early favoured)")
+    st.caption(f"Race shape: {flow} · RSI {RSI:+.2f}, SCI {SCI:.2f} (higher = more trustworthy).")
+
+    # Render
+    view_cols = ["Horse", "SDI", "Band", "Note"]
+    SD["SDI"] = SD["SDI"].round(1)
+    SD_view = SD.sort_values("SDI", ascending=False)[view_cols]
+    st.dataframe(SD_view, use_container_width=True)
+
+    st.caption("SDI > +4: strongly against shape (power signal) · −4 or less: strongly with shape (figure flattered).")
+# ======================= /Shape Delta Index =======================
+
 # ======================= Top Horse v2 — Travel • Quicken • Sustain =======================
 st.markdown("## Top Horse v2 — Travel • Quicken • Sustain")
 
