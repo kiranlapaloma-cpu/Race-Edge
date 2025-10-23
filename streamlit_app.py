@@ -2504,46 +2504,55 @@ st.caption(
 )
 # ======================= /Top Horse v2 =======================
 
-# ======================= xWin — Probability to Win (distance/shape aware) =======================
+# ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
 
 XW = metrics.copy()
 gr_col = metrics.attrs.get("GR_COL", "Grind")
 D_m    = float(race_distance_input)
 RSI    = float(metrics.attrs.get("RSI", 0.0))        # + slow-early, − fast-early
-SCI    = float(metrics.attrs.get("SCI", 0.0))        # 0..1 (consensus strength)
-going  = str(metrics.attrs.get("GOING", "Good"))     # from your PI block (Good/Firm/Soft/Heavy)
+SCI    = float(metrics.attrs.get("SCI", 0.0))        # 0..1 (shape consensus)
+going  = str(metrics.attrs.get("GOING", "Good"))
 
 # ---------- helpers ----------
-def _clip01(x):
-    try: return max(0.0, min(1.0, float(x)))
-    except: return 0.0
+def _clip(x, lo, hi):
+    try:
+        x = float(x); 
+        return lo if x < lo else (hi if x > hi else x)
+    except:
+        return lo
 
 def _lerp(a, b, t): 
-    t = max(0.0, min(1.0, float(t)))
+    t = _clip(t, 0.0, 1.0)
     return a + (b - a) * t
 
-def _idx_to01(x, R=4.0):
-    """Map ~[96..104+] around 100 to 0..1 (robust, bounded)."""
-    try:
-        v = float(x)
-        if not np.isfinite(v): return 0.0
-        return _clip01((v - 100.0) / float(R))
-    except:
-        return 0.0
+def _winsor(s: pd.Series, p=0.02):
+    s = pd.to_numeric(s, errors="coerce")
+    lo, hi = s.quantile(p), s.quantile(1-p)
+    return s.clip(lower=lo, upper=hi)
+
+def _robust_z(s: pd.Series):
+    """Median / MAD z-score; clipped to ±3 for stability."""
+    x  = _winsor(pd.to_numeric(s, errors="coerce"))
+    mu = np.nanmedian(x)
+    sd = mad_std(x)
+    if not np.isfinite(sd) or sd <= 0:
+        z = (x - mu) / 1.0
+    else:
+        z = (x - mu) / sd
+    return z.clip(-3.0, 3.0)
 
 def _weights_for_distance(dm):
-    """Distance-aware weights for Travel/Kick/Sustain (sum=1 before going nudges)."""
+    """Distance-aware weights for Travel/Kick/Sustain (sum=1 before going tweak)."""
     dm = float(dm)
-    # knots: (dist, {T,K,S})
     knots = [
-        (1000, dict(T=0.30, K=0.45, S=0.25)),  # dashes: kick heavy
+        (1000, dict(T=0.30, K=0.45, S=0.25)),   # sprints → K heavier
         (1200, dict(T=0.30, K=0.40, S=0.30)),
         (1400, dict(T=0.32, K=0.36, S=0.32)),
         (1600, dict(T=0.34, K=0.32, S=0.34)),
         (1800, dict(T=0.36, K=0.28, S=0.36)),
         (2000, dict(T=0.38, K=0.25, S=0.37)),
-        (2400, dict(T=0.40, K=0.22, S=0.38)),  # staying: sustain heavy
+        (2400, dict(T=0.40, K=0.22, S=0.38)),   # staying → S heavier
     ]
     if dm <= knots[0][0]: return knots[0][1]
     if dm >= knots[-1][0]: return knots[-1][1]
@@ -2554,98 +2563,93 @@ def _weights_for_distance(dm):
     return knots[-1][1]
 
 def _apply_going_nudge(w, going_str, field_n=12):
-    """Mild going-aware nudge (mirrors your PI going flavour). Renormalises to 1."""
+    """Small surface/going tweak; renormalises to 1."""
     w = w.copy()
     scale = min(1.0, max(1, int(field_n)) / 12.0)
     if going_str == "Firm":
-        # firmer → more kick/zip, a touch less sustain
         w["K"] *= (1.00 + 0.04*scale)
         w["T"] *= (1.00 + 0.02*scale)
         w["S"] *= (1.00 - 0.04*scale)
     elif going_str in ("Soft","Heavy"):
-        # softer → more sustain/travel, less pure kick
         amp = 0.05 if going_str == "Soft" else 0.08
         w["S"] *= (1.00 + amp*scale)
         w["T"] *= (1.00 + 0.02*scale)
         w["K"] *= (1.00 - amp*scale)
-    # normalise
-    s = sum(w.values()) or 1.0
-    for k in w: w[k] /= s
+    S = sum(w.values()) or 1.0
+    for k in w: w[k] /= S
     return w
 
-def _robust_sos01(ts, ac, gr):
-    """SOS-like stability (0..1) using your robust z blend; very light."""
-    def rz(s):
-        s2 = winsorize(pd.to_numeric(s, errors="coerce"))
-        mu = np.nanmedian(s2); sd = mad_std(s2)
-        sd = sd if (np.isfinite(sd) and sd > 0) else 1.0
-        return (s2 - mu) / sd
-    try:
-        raw = 0.45*rz(ts) + 0.35*rz(ac) + 0.20*rz(gr)
-        vals = raw.dropna().to_numpy()
-        q5, q95 = np.percentile(vals, [5,95]) if vals.size else (0.0, 1.0)
-        den = max(q95 - q5, 1.0)
-        out = ((raw - q5) / den).clip(0.0, 1.0)
-        return out
-    except Exception:
-        return pd.Series(0.0, index=XW.index)
-
-def _temperature(N, pi, ac, gr, dm):
+def _temperature(N, accel, grind, dm, tfs_plus=None):
     """
-    Race 'temperature' τ for softmax: lower = sharper probs.
-    Uses field size, sectional dispersion, and distance.
+    Race 'temperature' τ for softmax: lower = sharper probs (decisive ability gaps),
+    higher = flatter probs (chaos, bunching, traffic).
     """
     N = max(1, int(N))
-    # dispersion via MAD around medians
+
     def _mad01(s):
         s = pd.to_numeric(s, errors="coerce")
         d = mad_std(s)
         if not np.isfinite(d): return 0.0
-        return float(min(1.0, d / 4.5))  # ~1σ ~ 4–5 idx points → 1.0
-    d_ac = _mad01(ac); d_gr = _mad01(gr)
-    d_pi = _mad01(pi)
+        # ~ 1σ ~ 4–5 idx pts → map near 1.0
+        return float(min(1.0, d / 4.5))
 
-    base = 0.95
-    size_adj = -0.04*np.log1p(N)      # bigger fields → sharper
-    disp_adj = -0.15*(0.5*d_ac + 0.5*d_gr) + 0.06*d_pi  # clearer sectional separation → sharper; chaotic PI → softer
-    dist_adj = 0.04 if dm <= 1100 else (0.00 if dm <= 1800 else -0.02)  # sprints → slightly softer (blinks/position), stays → slightly sharper
+    d_ac  = _mad01(accel)
+    d_gr  = _mad01(grind)
+    base  = 0.95
+    size_adj = -0.04*np.log1p(N)                    # bigger fields → lower τ
+    disp_adj = -0.16*(0.5*d_ac + 0.5*d_gr)          # clear sectional separation → lower τ
+    dist_adj = (0.04 if dm <= 1100 else (0.00 if dm <= 1800 else -0.02))
+    tfs_adj  = 0.0
+    if tfs_plus is not None:
+        # more widespread friction → noisier replays → higher τ
+        tp = pd.to_numeric(tfs_plus, errors="coerce").fillna(0.0)
+        tfs_adj = 0.08 * float(np.clip(np.nanmean(np.maximum(0.0, (tp - 0.2)/0.4)), 0.0, 1.0))
 
-    tau = base + size_adj + disp_adj + dist_adj
-    return float(max(0.55, min(1.15, tau)))
+    tau = base + size_adj + disp_adj + dist_adj + tfs_adj
+    return float(_clip(tau, 0.55, 1.15))
+
+def _to_fractional_odds(p):
+    """p in [0,1] → 'x.y/1' (fair fractional style)."""
+    try:
+        p = float(p)
+        if p <= 0: return "-"
+        dec = 1.0 / p
+        frac = dec - 1.0
+        return f"{frac:.1f}/1"
+    except:
+        return "-"
 
 # ---------- ensure inputs ----------
 for c in ["tsSPI","Accel",gr_col,"F200_idx","PI"]:
     if c not in XW.columns: XW[c] = np.nan
 
-# ---------- pillar 0..1 scores ----------
-XW["T01"] = XW["tsSPI"].map(_idx_to01)       # Travel (pace quality)
-XW["K01"] = XW["Accel"].map(_idx_to01)       # Kick (late punch)
-XW["S01"] = XW[gr_col].map(_idx_to01)        # Sustain (lasting lift)
-XW["SOS01"] = _robust_sos01(XW["tsSPI"], XW["Accel"], XW[gr_col])  # tiny stability
+# ---------- robust sectionals → within-race latent ability (z) ----------
+zT = _robust_z(XW["tsSPI"])   # Travel
+zK = _robust_z(XW["Accel"])   # Kick
+zS = _robust_z(XW[gr_col])    # Sustain
 
-# pace legitimacy guard (if race crawled mid, trim Travel)
+# pace legitimacy guard (if race crawled mid, trim Travel influence a bit)
 ts_med = pd.to_numeric(XW["tsSPI"], errors="coerce").median(skipna=True)
 trim_T = 0.0
 if np.isfinite(ts_med) and ts_med < 100.0:
     trim_T = min(0.20, max(0.0, (100.0 - ts_med) / 10.0))  # up to 20%
-XW["T01_eff"] = XW["T01"] * (1.0 - trim_T)
+zT_eff = zT * (1.0 - trim_T)
 
 # ---------- distance + going weights ----------
 W = _weights_for_distance(D_m)               # {'T','K','S'}
 W = _apply_going_nudge(W, going, field_n=len(XW))
 
-# ---------- shape awareness (KSI proxy) ----------
-# Positive = ran AGAINST the prevailing shape; Negative = with shape
+# ---------- shape de-bias (KSI proxy) ----------
+# Positive when horse ran AGAINST prevailing shape; negative when WITH shape
 ksi_raw = -np.sign(RSI) * (pd.to_numeric(XW["Accel"], errors="coerce") - pd.to_numeric(XW["tsSPI"], errors="coerce"))
-ksi01   = np.tanh((ksi_raw / 6.0).fillna(0.0))  # ~[-1..+1]
-# stronger reward if SCI high; keep penalty milder
-adj_shape_pos = 0.20 * np.clip(ksi01, 0, 1) * SCI   # up to +20%
-adj_shape_neg = -0.10 * np.clip(-ksi01, 0, 1) * SCI # down to −10%
+ksi01   = np.tanh((ksi_raw / 6.0).fillna(0.0))        # ~[-1..+1]
+shape_boost = 0.15 * np.clip(ksi01, 0, 1) * SCI       # up to +15% (against)
+shape_damp  = 0.08 * np.clip(-ksi01, 0, 1) * SCI      # up to −8%  (with)
 
-# ---------- trip friction (if available from Hidden Horses) ----------
+# ---------- trip friction (from Hidden Horses if present) ----------
 tfs_plus = None
 try:
-    if 'hh' in locals() and "TFS_plus" in hh.columns:
+    if 'hh' in locals() and "TFS_plus" in hh.columns and "Horse" in XW.columns:
         tmp = hh[["Horse","TFS_plus"]].copy()
         XW = XW.merge(tmp, on="Horse", how="left")
         tfs_plus = pd.to_numeric(XW["TFS_plus"], errors="coerce").fillna(0.0)
@@ -2653,114 +2657,81 @@ except Exception:
     pass
 if tfs_plus is None:
     tfs_plus = pd.Series(0.0, index=XW.index)
-# distance-slope penalty: a bit harsher in sprints, softer late
-if D_m <= 1400:  tfs_cap = 0.12
+
+# harsher in sprints, softer in staying trips
+if D_m <= 1400:   tfs_cap = 0.12
 elif D_m >= 1800: tfs_cap = 0.08
 else:             tfs_cap = _lerp(0.12, 0.08, (D_m-1400)/400.0)
-adj_tfs = -np.minimum(tfs_cap, np.maximum(0.0, (tfs_plus - 0.2)/0.4))
+tfs_pen = np.minimum(tfs_cap, np.maximum(0.0, (tfs_plus - 0.2)/0.4))
 
-# ---------- core xWin power (pre-softmax) ----------
-# tiny PI prior (anchors chaos lightly)
-PI01 = pd.to_numeric(XW["PI"], errors="coerce")
-PI01 = ((PI01 - np.nanmedian(PI01)) / (mad_std(PI01) if np.isfinite(mad_std(PI01)) and mad_std(PI01)>0 else 1.0)) * 0.08
-PI01 = PI01.fillna(0.0)  # small, around ~[-0.2..+0.2]
+# ---------- core latent score (no history; pure one-run) ----------
+# small optional stability from sectionals dispersion (SOS-like)
+sos = (0.45*zT + 0.35*zK + 0.20*zS).fillna(0.0)
+sos01 = ((sos - np.nanpercentile(sos, 5)) /
+         max(1e-9, (np.nanpercentile(sos,95) - np.nanpercentile(sos,5))))
+sos01 = sos01.clip(0, 1)
 
 core = (
-    W["T"] * XW["T01_eff"].fillna(0.0) +
-    W["K"] * XW["K01"].fillna(0.0)     +
-    W["S"] * XW["S01"].fillna(0.0)     +
-    0.05   * XW["SOS01"].fillna(0.0)   +  # very light stability
-    PI01
+    W["T"] * zT_eff.fillna(0.0) +
+    W["K"] * zK.fillna(0.0)     +
+    W["S"] * zS.fillna(0.0)     +
+    0.05   * sos01.fillna(0.0)  # very light stabiliser
 )
 
-# apply multiplicative shape & trip adjustments at the score level
-adj_mult = (1.0 + adj_shape_pos + adj_shape_neg + adj_tfs).clip(0.75, 1.30)
-power = (core * adj_mult).fillna(0.0)
+# multiplicative de-lucking: reward against-shape, damp with-shape, damp friction
+mult_adj = (1.0 + shape_boost - shape_damp) * (1.0 - tfs_pen)
+power = (core * mult_adj).fillna(0.0)
 
 # ---------- field-size shrink & temperature ----------
-N = int(len(XW.index))
-alpha = N / (N + 6.0)        # same shrink idea you use elsewhere
-tau   = _temperature(N, XW["PI"], XW["Accel"], XW[gr_col], D_m)
-
-# small-field smoothing (avoid overconfidence at N<=6)
+N    = int(len(XW.index))
+tau  = _temperature(N, XW["Accel"], XW[gr_col], D_m, tfs_plus=tfs_plus)
+alpha = N / (N + 6.0)              # small-field shrink (same motif you use elsewhere)
 if N <= 6:
-    power = 0.90 * power
+    power = 0.90 * power           # reduce overconfidence in tiny fields
 
-# ---------- softmax to probabilities ----------
-# scale → logits via /tau, then softmax
-logits = power / max(1e-6, tau)
-mx = float(np.nanmax(logits)) if np.isfinite(logits).any() else 0.0
-exps = np.exp((logits - mx).clip(-50, 50))  # numeric safety
+# ---------- softmax → probabilities ----------
+logits   = power / max(1e-6, tau)
+mx       = float(np.nanmax(logits)) if np.isfinite(logits).any() else 0.0
+exps     = np.exp((logits - mx).clip(-50, 50))
 sum_exps = float(np.nansum(exps)) or 1.0
-XW["xWin"] = (exps / sum_exps) * alpha  # shrink slightly by alpha
-# renormalise after shrink so they still sum to 1.00
-XW["xWin"] = XW["xWin"] / (XW["xWin"].sum() or 1.0)
+probs    = (exps / sum_exps) * alpha
+probs    = probs / (probs.sum() or 1.0)     # renormalise after shrink
 
-# ---- fair odds conversion ---------------------------------------
-def _to_fractional_odds(p):
-    """Convert prob p (0..1) to fractional-style odds like '5.2/1'."""
-    try:
-        p = float(p)
-        if p <= 0:  # impossible
-            return "-"
-        dec = 1.0 / p          # decimal odds including stake
-        frac = dec - 1.0       # fractional part
-        return f"{frac:.1f}/1"
-    except Exception:
-        return "-"
+XW["xWin"] = probs
 
-# attach fair odds to the same frame we're using (XW)
-XW["Odds (≈fair)"] = XW["xWin"].apply(_to_fractional_odds)
-
-# ---------- tidy explainers ----------
+# ---------- tidy drivers ----------
 def _driver_line(r):
     bits = []
-
-    # Early behaviour from F200
+    # early hint
     f200 = float(r.get("F200_idx", np.nan))
     if np.isfinite(f200):
-        if f200 >= 101:
-            bits.append("Quick early")
-        elif f200 <= 98:
-            bits.append("Slower away")
+        if f200 >= 101: bits.append("Quick early")
+        elif f200 <= 98: bits.append("Slower away")
 
-    # Core sectional pillars
-    if float(r.get("T01_eff", 0)) >= 0.55:
-        bits.append("Travel +")
-    if float(r.get("K01", 0)) >= 0.55:
-        bits.append("Kick ++")
-    if float(r.get("S01", 0)) >= 0.55:
-        bits.append("Sustain +")
+    # sectional pillars
+    if float(zT_eff.get(r.name, 0)) >= 0.5: bits.append("Travel +")
+    if float(zK.get(r.name,     0)) >= 0.5: bits.append("Kick ++")
+    if float(zS.get(r.name,     0)) >= 0.5: bits.append("Sustain +")
 
-    # Shape cue (only if SCI decent)
+    # shape cue (only if SCI decent)
     if SCI >= 0.6:
-        k = float(-np.sign(RSI) * (float(r.get("Accel", np.nan)) - float(r.get("tsSPI", np.nan))))
-        if np.isfinite(k):
-            if k > 0.6:   bits.append("Against shape")
-            elif k < -0.6: bits.append("With shape")
+        k = float(ksi01.get(r.name, 0))
+        if k > 0.35:   bits.append("Against shape")
+        elif k < -0.35: bits.append("With shape")
 
-    # Midrace trim note
-    if trim_T > 0:
-        bits.append("(slow mid)")
+    # midrace trim note
+    if trim_T > 0: bits.append("(slow mid)")
 
     return " · ".join(bits)
 
 XW["Drivers"] = XW.apply(_driver_line, axis=1)
 
-# ---------- render ----------
-cols = ["Horse", "xWin", "Odds (≈fair)", "Drivers"]
-for c in cols:
-    if c not in XW.columns:
-        XW[c] = np.nan
-
-view = (
-    XW[cols]
-    .sort_values("xWin", ascending=False)
-    .reset_index(drop=True)
-    .copy()
-)
-# show xWin as %
+# ---------- view ----------
+view = XW.loc[:, ["Horse","xWin","Drivers"]].copy()
 view["xWin"] = (100.0 * view["xWin"]).round(1)
+view["Odds (≈fair)"] = XW["xWin"].apply(lambda p: _to_fractional_odds(p))
+
+view = view.sort_values("xWin", ascending=False).reset_index(drop=True)
 
 st.dataframe(
     view.style.format({"xWin": "{:.1f}%"}),
@@ -2770,9 +2741,11 @@ st.dataframe(
 with st.expander("xWin settings & notes"):
     w_note = ", ".join([f"{k}:{W[k]:.2f}" for k in ["T","K","S"]])
     st.caption(
-        f"xWin uses distance/going-aware weights ({w_note}), RSI×SCI for shape, a light stability term, a tiny PI prior, "
-        f"and a learned-style temperature τ={tau:.2f} (field {N}). Probabilities are softly shrunk for tiny fields."
+        f"xWin = softmax of within-race latent ability (Travel/Kick/Sustain) with distance/going weights ({w_note}), "
+        f"shape de-bias via RSI×SCI, trip friction damp, and a race 'temperature' τ={tau:.2f} from field size & dispersion. "
+        f"Interpretation: chance to win if this same race were replayed 100 times."
     )
+# ======================= /xWin =======================
 
 # ======================= Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict) =======================
 st.markdown("---")
