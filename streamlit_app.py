@@ -354,6 +354,17 @@ def detect_step(df: pd.DataFrame) -> int:
     cnt200 = sum(160 <= d <= 240 for d in diffs)
     return 200 if cnt200 > cnt100 else 100
 
+def normalize_200m_columns(df):
+    df = df.copy()
+    df.columns = [c.strip().replace("\u2013","-").replace("\u2014","-") for c in df.columns]
+    # coerce obvious numeric fields
+    for c in df.columns:
+        if c.endswith("_Time") or c.endswith("_Pos") or c in ("Race Time","800-400","400-Finish","Horse Weight","Weight Allocated","Finish_Time","Finish_Pos"):
+            df[c] = to_num(df[c])
+    if "Finish_Pos" not in df.columns:
+        df["Finish_Pos"] = np.arange(1, len(df) + 1)
+    return df
+
 # ----------------------- File load & preview ------------------------------
 try:
     raw = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
