@@ -340,8 +340,14 @@ def normalize_200m_columns(df):
 
 # ----------------------- File load & preview ------------------------------
 try:
-    raw = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
+    # Use hardened CSV/XLSX reader so '-', '—', 'N/A', etc. become NaN
+    raw = read_race_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
     work, alias_notes = normalize_headers(raw.copy())
+
+    # If the file is a 200 m split file, normalise columns & coerce numeric
+    if any(str(c).endswith("_Time") for c in work.columns):
+        work = normalize_200m_columns(work)
+
     st.success("File loaded.")
 except Exception as e:
     st.error("Failed to read file.")
