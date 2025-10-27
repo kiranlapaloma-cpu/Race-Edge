@@ -6,51 +6,6 @@ import matplotlib.pyplot as plt
 import io, math, re, os, sqlite3, hashlib
 from datetime import datetime
 
-# ======================= NaN/Inf hardening (drop-in) =======================
-import math, json
-pd.options.mode.use_inf_as_na = True
-NA_TOKENS = ["", " ", "-", "–", "—", "NaN", "nan", "N/A", "n/a", None]
-
-def read_race_csv(path_or_buffer, **kw):
-    kw.setdefault("na_values", NA_TOKENS)
-    kw.setdefault("keep_default_na", True)
-    kw.setdefault("dtype", None)
-    return pd.read_csv(path_or_buffer, **kw)
-
-def to_num(s):  # safe numeric coerce
-    return pd.to_numeric(s, errors="coerce")
-
-def sanitize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for c in out.columns:
-        if out[c].dtype == "O":
-            vc = out[c].astype(str).str.replace(r"[^\d\.\-eE]", "", regex=True)
-            try_num = pd.to_numeric(vc, errors="coerce")
-            if try_num.notna().mean() >= 0.5:
-                out[c] = try_num
-    out = out.replace([np.inf, -np.inf], np.nan)
-    out = out.where(pd.notna(out), None)
-    return out
-
-def sanitize_series_for_js(x):
-    def _fix(v):
-        try:
-            f = float(v)
-            return f if math.isfinite(f) else None
-        except Exception:
-            return None
-    return [_fix(v) for v in x]
-
-def safe_json(obj) -> str:
-    return json.dumps(obj, allow_nan=False)
-
-def st_df_safe(df, **kwargs):
-    try:
-        sdf = sanitize_df_for_streamlit(df)
-    except Exception:
-        sdf = df
-    return st.dataframe(sdf, **kwargs)
-# ======================= /NaN/Inf hardening =======================
 # ----------------------- Page config -----------------------
 st.set_page_config(
     page_title="Race Edge — PI v3.2 + Hidden v2 + Ability v2 + CG + Race Shape + DB",
@@ -326,17 +281,6 @@ def detect_step(df: pd.DataFrame) -> int:
     cnt100 = sum(60 <= d <= 140 for d in diffs)
     cnt200 = sum(160 <= d <= 240 for d in diffs)
     return 200 if cnt200 > cnt100 else 100
-
-def normalize_200m_columns(df):
-    df = df.copy()
-    df.columns = [c.strip().replace("\u2013","-").replace("\u2014","-") for c in df.columns]
-    # coerce obvious numeric fields
-    for c in df.columns:
-        if c.endswith("_Time") or c.endswith("_Pos") or c in ("Race Time","800-400","400-Finish","Horse Weight","Weight Allocated","Finish_Time","Finish_Pos"):
-            df[c] = to_num(df[c])
-    if "Finish_Pos" not in df.columns:
-        df["Finish_Pos"] = np.arange(1, len(df) + 1)
-    return df
 
 # ----------------------- File load & preview ------------------------------
 try:
@@ -2389,6 +2333,54 @@ hh_view = hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True,False,Fals
 st.dataframe(hh_view, use_container_width=True)
 st.caption("Hidden Horses v2 — RS-aware tiering enabled · 🔥 ≥7.2/6.0 · 🟡 ≥6.2/5.0.")
 
+# ======================= Shape Delta Index (SDI) =======================
+st.markdown("## Shape Delta Index (SDI)")
+
+# Inputs we need
+RSI = float(metrics.attrs.get("RSI", 0.0))     # + = slow-early (late favoured), − = fast-early (early favoured)
+SCI = float(metrics.attrs.get("SCI", 0.0))     # 0..1 consensus/strength
+
+need = {"Horse", "Accel", "tsSPI"}
+if not need.issubset(metrics.columns) or len(metrics) == 0:
+    st.info("SDI: need columns " + ", ".join(sorted(need)) + ".")
+else:
+    SD = metrics.loc[:, ["Horse", "Accel", "tsSPI"]].copy()
+    SD["Accel"] = pd.to_numeric(SD["Accel"], errors="coerce")
+    SD["tsSPI"] = pd.to_numeric(SD["tsSPI"], errors="coerce")
+    SD = SD.dropna(subset=["Accel","tsSPI"]).reset_index(drop=True)
+
+    # Core SDI: how much a horse's sectionals defied the prevailing shape
+    # Positive => ran against shape bias; Negative => with shape bias
+    sign_rsi = np.sign(RSI)  # +1 slow-early; -1 fast-early; 0 ~ even
+    SD["SDI_raw"] = (SD["Accel"] - SD["tsSPI"]) * sign_rsi
+    SD["SDI"] = SD["SDI_raw"] * max(0.0, min(1.0, SCI))  # reliability weight
+
+    # Banding & notes
+    def _band(v):
+        if not np.isfinite(v): return "", ""
+        if v >= 4.0:   return "🔥 Strongly Against", "Defied race shape (upgrade)"
+        if v >= 2.0:   return "🟢 Against",          "Worked against bias"
+        if v >  -2.0:  return "⚪ Neutral",          "Shape-neutral run"
+        if v >  -4.0:  return "🟠 With",             "Aided by shape"
+        return          "🔴 Strongly With",          "Heavily aided by shape (downgrade)"
+
+    bands, notes = zip(*[_band(v) for v in SD["SDI"].to_numpy()])
+    SD["Band"] = bands
+    SD["Note"] = notes
+
+    # Optional compact context line
+    flow = "evenish" if abs(RSI) < 0.4 else ("slow-early (late favoured)" if RSI > 0 else "fast-early (early favoured)")
+    st.caption(f"Race shape: {flow} · RSI {RSI:+.2f}, SCI {SCI:.2f} (higher = more trustworthy).")
+
+    # Render
+    view_cols = ["Horse", "SDI", "Band", "Note"]
+    SD["SDI"] = SD["SDI"].round(1)
+    SD_view = SD.sort_values("SDI", ascending=False)[view_cols]
+    st.dataframe(SD_view, use_container_width=True)
+
+    st.caption("SDI > +4: strongly against shape (power signal) · −4 or less: strongly with shape (figure flattered).")
+# ======================= /Shape Delta Index =======================
+
 # ======================= Top Horse v2 — Travel • Quicken • Sustain =======================
 st.markdown("## Top Horse v2 — Travel • Quicken • Sustain")
 
@@ -2559,282 +2551,6 @@ st.caption(
     f"Distance weights → {w_note}; SOS stability 0.10; shape via RSI×SCI; trip friction damp via TFS."
 )
 # ======================= /Top Horse v2 =======================
-
-# ======================= V-Profile — Top Speed & Sustain (0–10) =======================
-st.markdown("## V-Profile — Top Speed & Sustain")
-
-VP = metrics.copy()
-GR_COL = metrics.attrs.get("GR_COL", "Grind")
-STEP   = float(metrics.attrs.get("STEP", 100))        # metres per split (fallback)
-D_m    = float(race_distance_input)
-RSI    = float(metrics.attrs.get("RSI", 0.0))
-SCI    = float(metrics.attrs.get("SCI", 0.0))
-GOING  = str(metrics.attrs.get("GOING", "Good"))      # Firm/Good/Soft/Heavy
-
-# --------- helpers ----------
-def _clip(a, lo, hi):
-    try:
-        x=float(a); 
-        return hi if x>hi else (lo if x<lo else x)
-    except: 
-        return lo
-
-def _ema(series, alpha=0.35):
-    s = pd.to_numeric(series, errors="coerce")
-    out = []
-    prev = np.nan
-    for v in s:
-        if not np.isfinite(prev): 
-            prev = v
-        else:
-            prev = alpha*v + (1-alpha)*prev
-        out.append(prev)
-    return pd.Series(out, index=series.index)
-
-def _dist_weights(dm):
-    # blend weight of TopSpeed (TSI) vs Sustain (SSI) → sum 1.0
-    if dm <= 1200:    return 0.65, 0.35
-    if dm >= 1800:    return 0.35, 0.65
-    # linear in between (1400–1600 midpoint → 0.50/0.50)
-    # piecewise interpolate 1200→1800
-    t = _clip((dm-1200.0)/(1800.0-1200.0), 0.0, 1.0)
-    w_tsi = 0.65*(1-t) + 0.35*t
-    w_ssi = 1.0 - w_tsi
-    return w_tsi, w_ssi
-
-def _going_nudge(go):
-    # tiny nudge to weighting philosophy
-    if go == "Firm":     return +0.02, -0.02  # a tad more TSI
-    if go in ("Soft","Heavy"): return -0.03, +0.03  # a tad more SSI
-    return 0.0, 0.0
-
-def _pace_legitimacy_trim(ts_med):
-    # if crawl mid, reduce Vmax impact (fake peaks)
-    if np.isfinite(ts_med) and ts_med < 100.0:
-        return _clip((100.0 - ts_med)/8.0, 0.0, 0.25)  # up to 25%
-    return 0.0
-
-def _quad(x): 
-    x = float(x) if np.isfinite(x) else 0.0
-    return x*x
-
-def _percentile01(col):
-    s = pd.to_numeric(col, errors="coerce")
-    med = np.nanmedian(s)
-    mad = mad_std(s)
-    mad = mad if (np.isfinite(mad) and mad>0) else 1.0
-    z = (s - med)/mad
-    # squash to 0..1 via logistic
-    return (1.0/(1.0 + np.exp(-0.8*z))).clip(0.0, 1.0)
-
-# --------- collect available split times (…_Time columns) ----------
-time_cols = [c for c in VP.columns if isinstance(c, str) and c.endswith("_Time")]
-time_cols_sorted = []
-try:
-    # Sort by the numeric prefix if present (e.g., "300_Time","200_Time","100_Time")
-    def _key(c):
-        try:
-            return int(c.split("_")[0])
-        except:
-            return 9999
-    time_cols_sorted = sorted(time_cols, key=_key, reverse=False)  # early→late if numeric
-except:
-    time_cols_sorted = time_cols
-
-# if too few splits, we’ll gracefully degrade to proxies
-has_splits = len(time_cols_sorted) >= 3
-
-# --------- per-horse speed curve, Vmax, sustain metrics ----------
-Vmax = []
-SustainDur = []   # seconds at near-top
-SustainDist = []  # metres at near-top
-AUC_90_100 = []   # area under (v/Vmax)^p over near-top window
-Onset_m = []      # where the longest stretch begins (m-from-home)
-
-p_power = 2.5  # emphasise very-near-top
-
-# pace legitimacy guard
-ts_med = pd.to_numeric(VP.get("tsSPI"), errors="coerce").median(skipna=True)
-trim_V = _pace_legitimacy_trim(ts_med)
-
-for _, r in VP.iterrows():
-    # gather times (seconds) for this horse
-    times = []
-    for c in time_cols_sorted:
-        v = r.get(c)
-        if pd.isna(v) or float(v) <= 0: 
-            times.append(np.nan)
-        else:
-            times.append(float(v))
-    times = np.array(times, dtype=float)
-
-    if has_splits and np.isfinite(times).sum() >= 3:
-        # compute raw speeds for each split; assume each split covers ~STEP metres
-        spd = np.where((times>0) & np.isfinite(times), STEP/ times, np.nan)
-
-        # light denoise: 3-pt median via EMA effect
-        spd_s = pd.Series(spd).rolling(3, center=True, min_periods=1).median()
-        spd_s = _ema(spd_s, alpha=0.35).to_numpy()
-
-        # Vmax & adaptive near-top threshold
-        vmax = np.nanmax(spd_s) if np.isfinite(spd_s).any() else np.nan
-        if np.isfinite(vmax) and vmax > 0:
-            sigma = np.nanstd(spd_s[np.isfinite(spd_s)])
-            thr = max(0.97*vmax, vmax - 0.6*(sigma if np.isfinite(sigma) else 0.0))
-            near = (spd_s >= thr)
-
-            # longest consecutive near-top window
-            best_len = 0; best_i0 = -1; cur_len = 0; cur_i0 = -1
-            for i, ok in enumerate(near):
-                if ok:
-                    if cur_len == 0: cur_i0 = i
-                    cur_len += 1
-                    if cur_len > best_len:
-                        best_len = cur_len; best_i0 = cur_i0
-                else:
-                    cur_len = 0
-
-            # duration & distance of longest window (use actual times where possible)
-            if best_len > 0:
-                seg_times = times[best_i0:best_i0+best_len]
-                seg_speeds = spd_s[best_i0:best_i0+best_len]
-                dur = float(np.nansum(seg_times))
-                dist = float(np.nansum(np.where(np.isfinite(seg_times), STEP, 0.0)))
-                # AUC on near-top (weight closer to Vmax higher)
-                auc = float(np.nansum(((seg_speeds/ vmax)**p_power) * np.where(np.isfinite(seg_times), seg_times, 0.0)))
-                # onset as metres from home (approx): remaining splits * STEP
-                remain_splits = len(times) - (best_i0 + best_len)
-                onset = float(remain_splits * STEP)
-            else:
-                dur = 0.0; dist = 0.0; auc = 0.0; onset = float(len(times)*STEP)
-
-            Vmax.append(vmax)
-            SustainDur.append(dur)
-            SustainDist.append(dist)
-            AUC_90_100.append(auc)
-            Onset_m.append(onset)
-        else:
-            Vmax.append(np.nan); SustainDur.append(0.0); SustainDist.append(0.0); AUC_90_100.append(0.0); Onset_m.append(np.nan)
-    else:
-        # degrade: use proxies when splits unavailable → we’ll score through percentiles later
-        Vmax.append(np.nan); SustainDur.append(0.0); SustainDist.append(0.0); AUC_90_100.append(0.0); Onset_m.append(np.nan)
-
-VP["Vmax_mps"]     = Vmax
-VP["Sustain_s"]    = SustainDur
-VP["Sustain_m"]    = SustainDist
-VP["AUC_90_100"]   = AUC_90_100
-VP["Onset_from_home_m"] = Onset_m
-
-# --------- substitute proxies if splits are thin ----------
-# (keeps the module usable in any race)
-if not has_splits or np.nanmax(VP["Vmax_mps"]) <= 0:
-    # Vmax proxy: tsSPI level vs field (scale to m/s-ish just for ranking)
-    # We only need relative standing → percentiles below will handle scaling.
-    VP["Vmax_mps"] = pd.to_numeric(VP.get("tsSPI"), errors="coerce")
-
-    # Sustain proxies: Grind & Accel blend + AUC-like from sectionals
-    VP["Sustain_s"]  = (pd.to_numeric(VP.get(GR_COL), errors="coerce") - 98.0).clip(lower=0.0)
-    VP["Sustain_m"]  = VP["Sustain_s"] * (STEP/10.0)
-    VP["AUC_90_100"] = (0.6*pd.to_numeric(VP.get(GR_COL), errors="coerce") + 0.4*pd.to_numeric(VP.get("Accel"), errors="coerce")).fillna(0.0)
-
-# --------- Top Speed Index (TSI) & Sustain Index (SSI) ----------
-# TSI: percentile of Vmax, with pace-legitimacy trim
-TSI_raw = _percentile01(VP["Vmax_mps"])
-TSI = (TSI_raw * (1.0 - trim_V)).clip(0.0, 1.0)
-
-# SSI components: duration, distance, AUC, smoothness & onset bonus
-dur01 = _percentile01(VP["Sustain_s"])
-dst01 = _percentile01(VP["Sustain_m"])
-auc01 = _percentile01(VP["AUC_90_100"])
-
-# Smoothness bonus: prefer low jerk near top → proxy via Accel vs Grind consistency
-acc = pd.to_numeric(VP.get("Accel"), errors="coerce")
-grd = pd.to_numeric(VP.get(GR_COL), errors="coerce")
-sm_raw = -(acc - grd).abs()      # closer = smoother
-sm01   = _percentile01(sm_raw.fillna(sm_raw.median(skipna=True)))
-
-# Earlier onset bonus (harder to do early)
-on_bonus = pd.Series(0.0, index=VP.index)
-if np.isfinite(VP["Onset_from_home_m"]).any():
-    # earlier (bigger metres-from-home) → better
-    on01 = _percentile01(VP["Onset_from_home_m"])
-    on_bonus = 0.08 * on01  # modest cap
-
-SSI = (0.40*dur01 + 0.25*dst01 + 0.25*auc01 + 0.10*sm01 + on_bonus).clip(0.0, 1.0)
-
-# shape headwind/tailwind tiny modifier on SSI (reward sustain against fast-early)
-if RSI < -0.5 and SCI >= 0.6:
-    SSI = (SSI * (1.00 + 0.04)).clip(0.0, 1.0)
-elif RSI > 0.5 and SCI >= 0.6:
-    SSI = (SSI * (1.00 - 0.02)).clip(0.0, 1.0)
-
-# --------- distance & going weights, composite 0..10 ----------
-w_tsi, w_ssi = _dist_weights(D_m)
-nud_t, nud_s = _going_nudge(GOING)
-w_tsi = _clip(w_tsi + nud_t, 0.0, 1.0)
-w_ssi = _clip(w_ssi + nud_s, 0.0, 1.0)
-s_norm = max(1e-6, (w_tsi + w_ssi))
-w_tsi /= s_norm; w_ssi /= s_norm
-
-VP["TSI"] = (100.0 * TSI).round(1)   # 0..100
-VP["SSI"] = (100.0 * SSI).round(1)   # 0..100
-VP["VProfile"] = (10.0 * (w_tsi*TSI + w_ssi*SSI)).clip(0.0, 10.0).round(2)
-
-# --------- flags ----------
-def _flags_row(r):
-    f = []
-    if float(r.get("TSI",0)) >= 85: f.append("Raw Pace Weapon")
-    if float(r.get("SSI",0)) >= 85: f.append("True Sustainer")
-    if float(r.get("TSI",0)) >= 80 and float(r.get("SSI",0)) >= 75: f.append("Dual Threat")
-    # risk/angles
-    if D_m >= 1600 and float(r.get("TSI",0)) >= 85 and float(r.get("SSI",0)) <= 50:
-        f.append("Flash Risk (needs pace or drop trip)")
-    if D_m <= 1200 and float(r.get("SSI",0)) >= float(r.get("TSI",0)) + 15:
-        f.append("Wants Further")
-    return " · ".join(f)
-
-VP["Flags"] = VP.apply(_flags_row, axis=1)
-
-# --------- tidy view ----------
-show_cols = ["Horse","VProfile","TSI","SSI","Vmax_mps","Sustain_s","Sustain_m","Flags"]
-for c in show_cols:
-    if c not in VP.columns: VP[c] = np.nan
-
-VP_view = VP.sort_values(["VProfile","SSI","TSI"], ascending=[False,False,False])[show_cols]
-VP_view = VP_view.rename(columns={
-    "Vmax_mps":"Vmax (m/s)",
-    "Sustain_s":"Sustain (s ≥~95%)",
-    "Sustain_m":"Sustain (m ≥~95%)"
-})
-st.dataframe(VP_view, use_container_width=True)
-
-# --------- concise per-horse lines ----------
-with st.expander("V-Profile — quick takes"):
-    for _, r in VP_view.iterrows():
-        name = str(r.get("Horse","")).strip()
-        vp   = float(r.get("VProfile",0.0))
-        tsi  = float(r.get("TSI",0.0))
-        ssi  = float(r.get("SSI",0.0))
-        vmax = float(r.get("Vmax (m/s)", np.nan))
-        sus  = float(r.get("Sustain (s ≥~95%)", 0.0))
-        flag = str(r.get("Flags",""))
-        parts = [f"{name}: {vp:.2f}/10"]
-        parts.append(f"TSI {tsi:.0f}, SSI {ssi:.0f}")
-        if np.isfinite(vmax):
-            parts.append(f"Vmax ~{vmax:.2f} m/s")
-        if sus >= 0.4:
-            parts.append(f"{sus:.1f}s near-top")
-        if flag:
-            parts.append(f"[{flag}]")
-        st.write("• " + " — ".join(parts))
-
-# Footnote
-st.caption(
-    "V-Profile = distance/going-aware blend of Top-Speed Index (TSI) and Sustain Index (SSI). "
-    "TSI penalised if mid-race crawl; SSI rewards long, smooth time very near top speed and earlier onset. "
-    "Flags: Raw Pace Weapon / True Sustainer / Dual Threat / Flash Risk / Wants Further."
-)
-# ======================= /V-Profile =======================
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
