@@ -6,6 +6,78 @@ import matplotlib.pyplot as plt
 import io, math, re, os, sqlite3, hashlib
 from datetime import datetime
 
+# ======================= NaN/Inf hardening (drop-in) =======================
+import numpy as np, pandas as pd, math, json
+
+# Treat +/-inf as NA in pandas globally
+pd.options.mode.use_inf_as_na = True
+
+# Common NA tokens we see in 200 m files
+NA_TOKENS = ["", " ", "-", "–", "—", "NaN", "nan", "N/A", "n/a", None]
+
+def read_race_csv(path_or_buffer, **kw):
+    """Robust CSV reader for 100m/200m files."""
+    kw.setdefault("na_values", NA_TOKENS)
+    kw.setdefault("keep_default_na", True)
+    kw.setdefault("dtype", None)  # let us coerce later
+    df = pd.read_csv(path_or_buffer, **kw)
+    return df
+
+def to_num(s):
+    """Coerce to float; return np.nan on failure."""
+    return pd.to_numeric(s, errors="coerce")
+
+def sanitize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make DataFrame safe for Streamlit/Arrow/Vega:
+    - Coerce numeric-looking columns to float
+    - Replace inf with NaN
+    - Replace NaN with None (JSON null) for JS serialization
+    - Ensure homogeneous dtypes per column
+    """
+    out = df.copy()
+
+    # 1) identify numeric-ish columns by heuristic
+    for c in out.columns:
+        if out[c].dtype == "O":  # object → try numeric
+            vc = out[c].astype(str).str.replace(r"[^\d\.\-eE]", "", regex=True)
+            try_num = pd.to_numeric(vc, errors="coerce")
+            # if at least half converts, adopt numeric
+            if try_num.notna().mean() >= 0.5:
+                out[c] = try_num
+
+    # 2) kill inf
+    out = out.replace([np.inf, -np.inf], np.nan)
+
+    # 3) Arrow/Vega want nulls, not NaN
+    out = out.where(pd.notna(out), None)
+
+    return out
+
+def sanitize_series_for_js(x):
+    """Return a plain Python list with None instead of NaN/Inf for chart arrays."""
+    def _fix(v):
+        try:
+            f = float(v)
+            if math.isfinite(f):
+                return f
+            return None
+        except Exception:
+            return None
+    return [ _fix(v) for v in x ]
+
+def safe_json(data_obj) -> str:
+    """JSON string with NaN forbidden (will error in py if present)."""
+    return json.dumps(data_obj, allow_nan=False)
+
+# Convenience wrapper for st.dataframe
+def st_df_safe(df, **kwargs):
+    try:
+        sdf = sanitize_df_for_streamlit(df)
+    except Exception:
+        sdf = df  # fall back (better to render something than nothing)
+    return st.dataframe(sdf, **kwargs)
+# ======================= /NaN/Inf hardening =======================
 # ----------------------- Page config -----------------------
 st.set_page_config(
     page_title="Race Edge — PI v3.2 + Hidden v2 + Ability v2 + CG + Race Shape + DB",
