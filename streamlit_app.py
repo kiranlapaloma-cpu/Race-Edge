@@ -6,6 +6,35 @@ import matplotlib.pyplot as plt
 import io, math, re, os, sqlite3, hashlib
 from datetime import datetime
 
+# ======================= Universal Safe Display Patch =======================
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+# Monkey-patch Streamlit’s dataframe function to ignore Styler conflicts & NaN issues
+_orig_dataframe = st.dataframe
+
+def _safe_dataframe(obj, **kwargs):
+    try:
+        # If it's a pandas Styler, render its underlying DataFrame
+        if hasattr(obj, "data") and isinstance(obj.data, pd.DataFrame):
+            return _orig_dataframe(obj.data, **kwargs)
+        # If it's a DataFrame, clean NaN/Inf before display
+        if isinstance(obj, pd.DataFrame):
+            clean = obj.replace([np.inf, -np.inf], np.nan)
+            return _orig_dataframe(clean, **kwargs)
+        return _orig_dataframe(obj, **kwargs)
+    except Exception as e:
+        st.warning(f"⚠️ Display issue caught: {e}")
+        try:
+            return _orig_dataframe(pd.DataFrame(obj), **kwargs)
+        except Exception:
+            st.text(str(obj))
+            return None
+
+# Apply patch
+st.dataframe = _safe_dataframe
+# ======================= /Universal Safe Display Patch =======================
 # ======================= NaN/Inf hardening (drop-in) =======================
 import math, json
 pd.options.mode.use_inf_as_na = True
