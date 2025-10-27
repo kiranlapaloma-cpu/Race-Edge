@@ -6,80 +6,57 @@ import matplotlib.pyplot as plt
 import io, math, re, os, sqlite3, hashlib
 from datetime import datetime
 
-# ======================= Universal Safe Display Patch =======================
-import streamlit as st
-import pandas as pd
+# ==== Global hardening for Streamlit tables/plots ====
 import numpy as np
+import pandas as pd
+import streamlit as st
 
-# Monkey-patch Streamlit’s dataframe function to ignore Styler conflicts & NaN issues
-_orig_dataframe = st.dataframe
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame):
+        return df
+    df = df.replace([np.inf, -np.inf], np.nan)
+    # IMPORTANT: Arrow/JSON cannot carry NaN → turn to None
+    return df.where(pd.notna(df), None)
 
-def _safe_dataframe(obj, **kwargs):
+# Monkey-patch the 3 common renderers so Styler/NaN never leak
+_st_df = st.dataframe
+_st_tbl = st.table
+_st_json = st.json
+
+def _safe_df(obj, **kw):
     try:
-        # If it's a pandas Styler, render its underlying DataFrame
-        if hasattr(obj, "data") and isinstance(obj.data, pd.DataFrame):
-            return _orig_dataframe(obj.data, **kwargs)
-        # If it's a DataFrame, clean NaN/Inf before display
+        if hasattr(obj, "data") and isinstance(obj.data, pd.DataFrame):  # pandas Styler
+            obj = obj.data
         if isinstance(obj, pd.DataFrame):
-            clean = obj.replace([np.inf, -np.inf], np.nan)
-            return _orig_dataframe(clean, **kwargs)
-        return _orig_dataframe(obj, **kwargs)
+            obj = _clean_df(obj)
+        return _st_df(obj, **kw)
     except Exception as e:
-        st.warning(f"⚠️ Display issue caught: {e}")
-        try:
-            return _orig_dataframe(pd.DataFrame(obj), **kwargs)
-        except Exception:
-            st.text(str(obj))
-            return None
+        st.warning(f"Display recovered: {e}")
+        return _st_df(pd.DataFrame(obj), **kw)
 
-# Apply patch
-st.dataframe = _safe_dataframe
-# ======================= /Universal Safe Display Patch =======================
-# ======================= NaN/Inf hardening (drop-in) =======================
-import math, json
-pd.options.mode.use_inf_as_na = True
-NA_TOKENS = ["", " ", "-", "–", "—", "NaN", "nan", "N/A", "n/a", None]
+def _safe_tbl(obj, **kw):
+    if hasattr(obj, "data") and isinstance(obj.data, pd.DataFrame):
+        obj = obj.data
+    if isinstance(obj, pd.DataFrame):
+        obj = _clean_df(obj)
+    return _st_tbl(obj, **kw)
 
-def read_race_csv(path_or_buffer, **kw):
-    kw.setdefault("na_values", NA_TOKENS)
-    kw.setdefault("keep_default_na", True)
-    kw.setdefault("dtype", None)
-    return pd.read_csv(path_or_buffer, **kw)
+def _safe_json(obj, **kw):
+    # Replace numpy NaN/Inf in arbitrary dicts/lists before JSON
+    import math
+    def _norm(v):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)): return None
+        return v
+    def _walk(o):
+        if isinstance(o, dict):  return {k:_walk(v) for k,v in o.items()}
+        if isinstance(o, list):  return [_walk(v) for v in o]
+        return _norm(o)
+    return _st_json(_walk(obj), **kw)
 
-def to_num(s):  # safe numeric coerce
-    return pd.to_numeric(s, errors="coerce")
-
-def sanitize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for c in out.columns:
-        if out[c].dtype == "O":
-            vc = out[c].astype(str).str.replace(r"[^\d\.\-eE]", "", regex=True)
-            try_num = pd.to_numeric(vc, errors="coerce")
-            if try_num.notna().mean() >= 0.5:
-                out[c] = try_num
-    out = out.replace([np.inf, -np.inf], np.nan)
-    out = out.where(pd.notna(out), None)
-    return out
-
-def sanitize_series_for_js(x):
-    def _fix(v):
-        try:
-            f = float(v)
-            return f if math.isfinite(f) else None
-        except Exception:
-            return None
-    return [_fix(v) for v in x]
-
-def safe_json(obj) -> str:
-    return json.dumps(obj, allow_nan=False)
-
-def st_df_safe(df, **kwargs):
-    try:
-        sdf = sanitize_df_for_streamlit(df)
-    except Exception:
-        sdf = df
-    return st.dataframe(sdf, **kwargs)
-# ======================= /NaN/Inf hardening =======================
+st.dataframe = _safe_df
+st.table     = _safe_tbl
+st.json      = _safe_json
+# ==== /Global hardening ====
 # ----------------------- Page config -----------------------
 st.set_page_config(
     page_title="Race Edge — PI v3.2 + Hidden v2 + Ability v2 + CG + Race Shape + DB",
