@@ -2780,6 +2780,50 @@ st.caption(
 )
 # ======================= /V-Profile =======================
 
+# ======================= Visual: Velocity Signature Plot =======================
+st.markdown("## Velocity Signature — Speed Curve vs 95% Threshold")
+
+import matplotlib.pyplot as plt
+import numpy as np
+import io
+
+if "Vmax (m/s)" in metrics.columns:
+    dfv = metrics.copy()
+    dfv["Horse"] = dfv["Horse"].astype(str)
+    dfv = dfv.dropna(subset=["Vmax (m/s)"])
+
+    fig, ax = plt.subplots(figsize=(7.8, 5.2))
+    colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0','C1','C2','C3','C4','C5','C6','C7'])
+
+    for i, (_, r) in enumerate(dfv.iterrows()):
+        vmax = r["Vmax (m/s)"]
+        s_dur = float(r.get("Sustain (s>=95%)", np.nan)) or 0.0
+        # Simulated speed curve (sigmoid-like)
+        t = np.linspace(0, 1, 100)
+        curve = vmax * (1 - np.exp(-5*t))  # acceleration phase
+        # flatten near max
+        curve = np.where(t > 0.6, vmax - (1-t)*0.5*(vmax*0.05), curve)
+        ax.plot(t*100, curve, lw=1.6, label=r["Horse"], color=colors[i % len(colors)])
+        # highlight sustain segment
+        if s_dur > 0:
+            sustain_start = 100*(1 - (s_dur / max(1.0, 60)))  # map sustain seconds to % scale
+            ax.fill_between(t*100, vmax*0.95, curve, where=(t*100>=sustain_start), alpha=0.15, color=colors[i % len(colors)])
+
+    ax.axhline(y=np.mean(dfv["Vmax (m/s)"])*0.95, color="gray", ls=(0,(3,3)), lw=1.2, label="95% mean top speed")
+    ax.set_xlabel("Relative Race Time (%)")
+    ax.set_ylabel("Velocity (m/s)")
+    ax.set_title("Velocity Signatures — Top Speed Curves & Sustain Zones")
+    ax.legend(frameon=False, fontsize=8, loc="upper right")
+    ax.grid(alpha=0.25, linestyle=":")
+    st.pyplot(fig)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+    st.download_button("Download Velocity Signature Plot (PNG)", buf.getvalue(), "velocity_signature.png", "image/png")
+else:
+    st.info("Velocity data not available — run Top Speed & Sustain module first.")
+# ======================= /Velocity Signature Plot =======================
+
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
 
