@@ -507,41 +507,115 @@ def _interp_weights(dm, a_dm, a_w, b_dm, b_w):
         "Grind":    _lerp(a_w["Grind"],    b_w["Grind"],    t),
     }
 
+# --- DROP-IN: New PI distance curve (anchors + linear interpolation) ---
+# Paste this inside your streamlit_app.py (ideally near/above pi_weights_distance_and_context),
+# then update pi_weights_distance_and_context to call _pi_curve_weights_new(distance_m).
+
+def _pi_curve_weights_new(distance_m: float) -> tuple[dict, dict]:
+    """
+    Returns (weights_dict, meta) for the new curve.
+    Weights keys match your PI engine: F200_idx, tsSPI, Accel, Grind.
+    Curve anchors (F200, tsSPI, Accel, Grind):
+      1000: 0.20, 0.20, 0.40, 0.20
+      1200: 0.1667, 0.3333, 0.3333, 0.1667
+      1400: 0.1429, 0.4285, 0.2857, 0.1429
+      1600: 0.1250, 0.5000, 0.2500, 0.1250
+      1800: 0.1111, 0.5556, 0.2222, 0.1111
+      2000: 0.10,   0.60,   0.20,   0.10
+      2200: 0.09,   0.64,   0.18,   0.09
+      2400: 0.0833, 0.6668, 0.1666, 0.0833
+      2600: 0.0777, 0.6892, 0.1554, 0.0777
+      2800: 0.0714, 0.7144, 0.1428, 0.0714
+    """
+    dm = float(distance_m)
+
+    ANCHORS: dict[int, dict[str, float]] = {
+        1000: {"F200_idx": 0.20,   "tsSPI": 0.20,   "Accel": 0.40,   "Grind": 0.20},
+        1200: {"F200_idx": 0.1667, "tsSPI": 0.3333, "Accel": 0.3333, "Grind": 0.1667},
+        1400: {"F200_idx": 0.1429, "tsSPI": 0.4285, "Accel": 0.2857, "Grind": 0.1429},
+        1600: {"F200_idx": 0.1250, "tsSPI": 0.5000, "Accel": 0.2500, "Grind": 0.1250},
+        1800: {"F200_idx": 0.1111, "tsSPI": 0.5556, "Accel": 0.2222, "Grind": 0.1111},
+        2000: {"F200_idx": 0.10,   "tsSPI": 0.60,   "Accel": 0.20,   "Grind": 0.10},
+        2200: {"F200_idx": 0.09,   "tsSPI": 0.64,   "Accel": 0.18,   "Grind": 0.09},
+        2400: {"F200_idx": 0.0833, "tsSPI": 0.6668, "Accel": 0.1666, "Grind": 0.0833},
+        2600: {"F200_idx": 0.0777, "tsSPI": 0.6892, "Accel": 0.1554, "Grind": 0.0777},
+        2800: {"F200_idx": 0.0714, "tsSPI": 0.7144, "Accel": 0.1428, "Grind": 0.0714},
+    }
+
+    def _lerp(a: float, b: float, t: float) -> float:
+        return a + (b - a) * float(t)
+
+    def _renorm(w: dict[str, float]) -> dict[str, float]:
+        s = float(sum(w.values()))
+        if s <= 0:
+            # hard fallback (should never happen)
+            return {"F200_idx": 0.25, "tsSPI": 0.25, "Accel": 0.25, "Grind": 0.25}
+        return {k: float(v) / s for k, v in w.items()}
+
+    # clamp outside anchor range
+    keys = sorted(ANCHORS.keys())
+    if dm <= keys[0]:
+        W = dict(ANCHORS[keys[0]])
+        return _renorm(W), {"curve_band": f"≤{keys[0]}", "anchor_lo": keys[0], "anchor_hi": keys[0], "t": 0.0}
+    if dm >= keys[-1]:
+        W = dict(ANCHORS[keys[-1]])
+        return _renorm(W), {"curve_band": f"≥{keys[-1]}", "anchor_lo": keys[-1], "anchor_hi": keys[-1], "t": 0.0}
+
+    # find surrounding anchors
+    lo = max(k for k in keys if k <= dm)
+    hi = min(k for k in keys if k >= dm)
+    if lo == hi:
+        W = dict(ANCHORS[lo])
+        return _renorm(W), {"curve_band": f"{lo}", "anchor_lo": lo, "anchor_hi": hi, "t": 0.0}
+
+    span = float(hi - lo)
+    t = 0.0 if span <= 0 else (dm - float(lo)) / span
+    t = max(0.0, min(1.0, t))
+
+    w_lo = ANCHORS[lo]
+    w_hi = ANCHORS[hi]
+    W = {
+        "F200_idx": _lerp(w_lo["F200_idx"], w_hi["F200_idx"], t),
+        "tsSPI":    _lerp(w_lo["tsSPI"],    w_hi["tsSPI"],    t),
+        "Accel":    _lerp(w_lo["Accel"],    w_hi["Accel"],    t),
+        "Grind":    _lerp(w_lo["Grind"],    w_hi["Grind"],    t),
+    }
+    W = _renorm(W)
+    return W, {"curve_band": f"{lo}–{hi}", "anchor_lo": lo, "anchor_hi": hi, "t": t}
+
+
+# --- MINIMAL CHANGE: inside your existing pi_weights_distance_and_context(...) ---
+# Replace your current distance-weight block with this call, and keep the rest
+# of the function (going/context modifiers, shape logic, etc.) unchanged.
+
 def pi_weights_distance_and_context(
     distance_m: float,
-    acc_med: float|None,
-    grd_med: float|None,
+    acc_med: float | None,
+    grd_med: float | None,
     going: str = "Good",
     field_n: int | None = None,
     return_meta: bool = False
-) -> dict | tuple[dict, dict]:
-    """
-    Returns PI weights (sum=1). If return_meta=True, also returns a meta dict
-    describing the going multipliers actually applied.
-    Going affects PI weighting ONLY (not indices or GCI).
-    """
+):
+    # 1) NEW distance curve
+    W, meta = _pi_curve_weights_new(distance_m)
 
-    dm = float(distance_m or 1200)
+    # 2) KEEP everything you already do below this point:
+    #    - going multipliers
+    #    - context modifiers (acc_med/grd_med)
+    #    - race-shape/collapse redistribution if present
+    #    - final renormalization
 
-    # ---- Base by distance (your current logic) ----
-    if dm <= 1000:
-        base = {"F200_idx":0.12,"tsSPI":0.35,"Accel":0.36,"Grind":0.17}
-    elif dm < 1100:
-        base = _interp_weights(dm,
-            1000, {"F200_idx":0.12,"tsSPI":0.35,"Accel":0.36,"Grind":0.17},
-            1100, {"F200_idx":0.10,"tsSPI":0.36,"Accel":0.34,"Grind":0.20})
-    elif dm < 1200:
-        base = _interp_weights(dm,
-            1100, {"F200_idx":0.10,"tsSPI":0.36,"Accel":0.34,"Grind":0.20},
-            1200, {"F200_idx":0.08,"tsSPI":0.37,"Accel":0.30,"Grind":0.25})
-    elif dm == 1200:
-        base = {"F200_idx":0.08,"tsSPI":0.37,"Accel":0.30,"Grind":0.25}
-    else:
-        shift = max(0.0, (dm - 1200.0) / 100.0) * 0.01
-        grind = min(0.25 + shift, 0.40)
-        F200, ACC = 0.08, 0.30
-        ts = max(0.0, 1.0 - F200 - ACC - grind)
-        base = {"F200_idx":F200,"tsSPI":ts,"Accel":ACC,"Grind":grind}
+    # ---- example placeholder: keep your current logic here ----
+    # W = apply_going_multipliers(W, going)
+    # W = apply_context_modifiers(W, acc_med, grd_med, field_n)
+    # W = apply_shape_modifiers(W, ...)  # if you do this inside this function
+    # W = renormalize(W)
+    # -----------------------------------------------------------
+
+    if return_meta:
+        meta_out = {"pi_curve": "new_curve_v1", **meta}
+        return W, meta_out
+    return W
 
     # ---- Mild context nudge (your bias step) ----
     if acc_med is not None and grd_med is not None and math.isfinite(acc_med) and math.isfinite(grd_med):
