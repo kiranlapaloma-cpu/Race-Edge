@@ -657,23 +657,21 @@ def pi_weights_distance_and_context(
 
     # ---- Base by distance (your current logic) ----
     if dm <= 1000:
-        base = {"F200_idx":0.12,"tsSPI":0.35,"Accel":0.36,"Grind":0.17}
-    elif dm < 1100:
-        base = _interp_weights(dm,
-            1000, {"F200_idx":0.12,"tsSPI":0.35,"Accel":0.36,"Grind":0.17},
-            1100, {"F200_idx":0.10,"tsSPI":0.36,"Accel":0.34,"Grind":0.20})
-    elif dm < 1200:
-        base = _interp_weights(dm,
-            1100, {"F200_idx":0.10,"tsSPI":0.36,"Accel":0.34,"Grind":0.20},
-            1200, {"F200_idx":0.08,"tsSPI":0.37,"Accel":0.30,"Grind":0.25})
-    elif dm == 1200:
-        base = {"F200_idx":0.08,"tsSPI":0.37,"Accel":0.30,"Grind":0.25}
-    else:
-        shift = max(0.0, (dm - 1200.0) / 100.0) * 0.01
-        grind = min(0.25 + shift, 0.40)
-        F200, ACC = 0.08, 0.30
-        ts = max(0.0, 1.0 - F200 - ACC - grind)
-        base = {"F200_idx":F200,"tsSPI":ts,"Accel":ACC,"Grind":grind}
+        F200, ts, ACC, GR = 0.15, 0.20, 0.40, 0.25
+
+    elif dm <= 1200:
+        F200, ts, ACC, GR = 0.10, 0.30, 0.35, 0.25
+
+    elif dm <= 1400:
+        F200, ts, ACC, GR = 0.10, 0.30, 0.35, 0.25
+
+    elif dm <= 2200:
+        F200, ts, ACC, GR = 0.08, 0.35, 0.35, 0.22
+
+    else:  # 2400–3200
+        F200, ts, ACC, GR = 0.05, 0.40, 0.35, 0.20
+
+    base = {"F200_idx":F200, "tsSPI":ts, "Accel":ACC, "Grind":GR}
 
     # ---- Mild context nudge (your bias step) ----
     if acc_med is not None and grd_med is not None and math.isfinite(acc_med) and math.isfinite(grd_med):
