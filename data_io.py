@@ -1,5 +1,5 @@
 “””
-data_io.py — file loading, header normalisation, split-step detection,
+data_io.py - file loading, header normalisation, split-step detection,
 integrity scanning.  No Streamlit imports here.
 “””
 import re
@@ -8,18 +8,18 @@ import pandas as pd
 
 from utils import as_num
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Header normalisation
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def normalize_headers(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 “””
 Map common column-name variants to canonical forms:
-• ‘<n>_time’ / ‘<n>m_time’ / ‘<n>*split’  →  ‘<n>*Time’
-• ‘finish_time’ / ‘finish_split’ / ‘finish’ →  ‘Finish_Time’
-• ‘finish_pos’                               →  ‘Finish_Pos’
+* ‘<n>_time’ / ‘<n>m_time’ / ‘<n>*split’  →  ‘<n>*Time’
+* ‘finish_time’ / ‘finish_split’ / ‘finish’ →  ‘Finish_Time’
+* ‘finish_pos’                               →  ‘Finish_Pos’
 Returns (df_with_aliases, list_of_alias_notes).
 “””
 notes: list[str] = []
@@ -50,11 +50,11 @@ for lk, orig in lmap.items():
 return df, notes
 ```
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Split-step detection
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def detect_step(df: pd.DataFrame) -> int:
 “”“Return 100 or 200 based on gaps between **Time marker columns.”””
@@ -71,11 +71,11 @@ cnt100 = sum(60 <= d <= 140 for d in diffs)
 cnt200 = sum(160 <= d <= 240 for d in diffs)
 return 200 if cnt200 > cnt100 else 100
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Column helpers
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def collect_markers(df: pd.DataFrame) -> list[int]:
 “”“Return sorted-descending list of numeric markers from *_Time columns.”””
@@ -93,11 +93,11 @@ cols = [f”{m}_Time” for m in range(int(distance_m) - step, step - 1, -step)]
 cols.append(“Finish_Time”)
 return cols
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Integrity scan
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def integrity_scan(
 df: pd.DataFrame,
@@ -125,14 +125,14 @@ bads = [f"{k} ({v} rows)" for k, v in invalid.items() if v > 0]
 if bads:
     msgs.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
 
-return (" • ".join(msgs) or "OK"), missing, invalid
+return (" * ".join(msgs) or "OK"), missing, invalid
 ```
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # File loader
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def load_file(uploaded_file) -> tuple[pd.DataFrame, list[str]]:
 “””
