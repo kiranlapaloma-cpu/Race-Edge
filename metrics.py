@@ -514,7 +514,7 @@ def _align_row(val, rsi_val, eps=0.25):
 
 w["RSI_Align"] = [_align_row(v, rsi) for v in w["RS_Component"]]
 w["RSI_Cue"]   = [
-    "🔵 ➜ with shape" if a > 0 else ("🔴 ⇦ against shape" if a < 0 else "⚪ neutral")
+    "[BLU] _ with shape" if a > 0 else ("[RED] _ against shape" if a < 0 else "[WHT] neutral")
     for a in w["RSI_Align"]
 ]
 
@@ -596,8 +596,8 @@ if not (math.isfinite(rqs) and math.isfinite(rps)):
 return “Unknown”, “#7f8c8d”
 delta = rps - rqs
 if delta >= 18.0:
-return “🔴 Top-Heavy”,      “#e74c3c”
+return “[RED] Top-Heavy”,      “#e74c3c”
 elif rqs >= (rps - 10.0):
-return “🟢 Deep Field”,     “#2ecc71”
+return “[GRN] Deep Field”,     “#2ecc71”
 else:
-return “⚪ Average Profile”, “#95a5a6”
+return “[WHT] Average Profile”, “#95a5a6”
