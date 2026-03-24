@@ -88,7 +88,7 @@ DEFAULT_MODULES = [
 
 st.set_page_config(
 page_title=f”Race Edge v{APP_VERSION}”,
-page_icon=“🏇”,
+page_icon=”[RE]”,
 layout=“wide”,
 initial_sidebar_state=“expanded”,
 )
@@ -117,7 +117,7 @@ st.markdown(”””
 # ____________________________________________________________________________
 
 with st.sidebar:
-st.markdown(f”## 🏇 Race Edge `v{APP_VERSION}`”)
+st.markdown(f”## [RE] Race Edge `v{APP_VERSION}`”)
 st.caption(“PI v3.2 . Race Shape . CG . Hidden v2 . DB”)
 st.divider()
 
@@ -162,7 +162,7 @@ ACTIVE_MODULES = st.multiselect(
     default=DEFAULT_MODULES,
     help="Uncheck modules you don't need to speed up the analysis.",
 )
-if st.button("✅ Enable All"):
+if st.button("[*] Enable All"):
     ACTIVE_MODULES = ALL_MODULES
 
 st.divider()
@@ -185,7 +185,7 @@ DEBUG         = st.toggle("Debug info", value=False)
 # ____________________________________________________________________________
 
 if not up:
-st.markdown(”## Welcome to Race Edge 🏇”)
+st.markdown(”## Welcome to Race Edge [RE]”)
 st.info(“Upload a race CSV / XLSX in the sidebar to begin.”)
 st.markdown(”””
 **Expected columns:**
@@ -207,7 +207,7 @@ st.stop()
 
 try:
 work, alias_notes = load_file(up)
-st.success(f”✔ **{up.name}** loaded - {len(work)} runners”)
+st.success(f”[OK] **{up.name}** loaded - {len(work)} runners”)
 except Exception as e:
 st.error(“Failed to read file.”)
 if DEBUG: st.exception(e)
@@ -219,12 +219,12 @@ st.markdown(f”**Detected split step:** `{split_step} m`”)
 if alias_notes and SHOW_WARNINGS:
 st.info(“Header aliases: “ + “ . “.join(alias_notes))
 
-with st.expander(“📋 Raw data preview”, expanded=False):
+with st.expander(”[>] Raw data preview”, expanded=False):
 st.dataframe(work.head(15), use_container_width=True)
 
 integrity_text, _miss, _bad = integrity_scan(work, race_distance_input, split_step)
 if integrity_text != “OK” and SHOW_WARNINGS:
-st.caption(f”⚠ Integrity: {integrity_text}”)
+st.caption(f”[!] Integrity: {integrity_text}”)
 
 # ____________________________________________________________________________
 
@@ -329,7 +329,7 @@ unsafe_allow_html=True,
 )
 
 if WIND_ON:
-st.info(f”⚠ Wind note: **{WIND_TAG}** - informational only, not modelled.”)
+st.info(f”[!] Wind note: **{WIND_TAG}** - informational only, not modelled.”)
 
 st.divider()
 
@@ -376,11 +376,11 @@ st.dataframe(display_df, use_container_width=True)
 pi_meta = metrics.attrs.get("PI_GOING_META", {})
 if pi_meta:
     mult  = pi_meta.get("multipliers", {})
-    moved = [f"{k}×{mult[k]:.3f}" for k in ["Accel", "F200_idx", "tsSPI", "Grind"]
+    moved = [f"{k}x{mult[k]:.3f}" for k in ["Accel", "F200_idx", "tsSPI", "Grind"]
              if abs(mult.get(k, 1.0) - 1.0) >= 0.005]
     if moved:
         st.caption(f"Going: {pi_meta.get('going','Good')} - PI multipliers: {', '.join(moved)}")
-st.caption("RSI: + slow-early (late favoured) . − fast-early . 🔵 with shape . 🔴 against shape")
+st.caption("RSI: + slow-early (late favoured) . - fast-early . [BLU] with shape . [RED] against shape")
 ```
 
 # ____________________________________________________________________________
@@ -427,7 +427,7 @@ ca, cb, cc = st.columns(3)
 with ca: st.metric(“Field median PI”, f”{result.attrs[‘PI_med’]:.2f}”)
 with cb:
 corr = result.attrs[“corr”]
-st.metric(“Weight↔PI corr”, “n/a” if not np.isfinite(corr) else f”{corr:+.2f}”)
+st.metric(“Weight<->PI corr”, “n/a” if not np.isfinite(corr) else f”{corr:+.2f}”)
 with cc: st.metric(“beta_eff”, f”{result.attrs[‘beta_eff’]:.2f} PI/kg”)
 st.caption(“RanAbove (kg) = how many kg above/below field median a horse effectively ran.”)
 csv = result.to_csv(index=False).encode()
@@ -480,10 +480,10 @@ W_dna = WD.attrs.get(“DNA_WEIGHTS”, {})
 ```
 def _tier_badge(sc):
     if not np.isfinite(sc): return ("", "")
-    if sc >= 8.0: return ("🔥 Prime", "A")
-    if sc >= 7.0: return ("🟢 Live", "B")
-    if sc >= 6.0: return ("⚪ Comp", "C")
-    return ("⚪ Setup", "D")
+    if sc >= 8.0: return ("[HOT] Prime", "A")
+    if sc >= 7.0: return ("[GRN] Live", "B")
+    if sc >= 6.0: return ("[WHT] Comp", "C")
+    return ("[WHT] Setup", "D")
 
 cards = WD.sort_values("WinningDNA", ascending=False).head(6)
 if len(cards) > 0:
@@ -535,7 +535,7 @@ if c in view.columns:
 s_ = pd.Series(np.ravel(view[c].values), index=view.index)
 view[c] = pd.to_numeric(s_, errors=“coerce”).round(2)
 st.dataframe(view, use_container_width=True)
-st.caption(“Sorted: Tier → HiddenScore → PI. 🔥 Top Hidden / 🟡 Notable Hidden.”)
+st.caption(“Sorted: Tier -> HiddenScore -> PI. [HOT] Top Hidden / [YLW] Notable Hidden.”)
 
 # ____________________________________________________________________________
 
@@ -581,14 +581,14 @@ else:
 alpha_ = note.get(“alpha”)
 st.caption(
 f”Trip: **{note.get(‘distance_m’)}m** . “
-f”alpha ≈ **{alpha_:.3f}** . “
+f”alpha ~= **{alpha_:.3f}** . “
 f”Window: **{note.get(‘v400_source’)}**”
 )
 disp_cols = [“Horse”, “Finish_Pos”, “Horse Weight”, “PWR400_v400”, “PWR400”]
 disp_cols = [c for c in disp_cols if c in metrics.columns]
 show_ = metrics.sort_values(“PWR400”, ascending=False)[disp_cols].copy()
 st.dataframe(show_, use_container_width=True)
-st.caption(“PWR400 ≈ 100 = field typical . 110+ = strong late engine under load”)
+st.caption(“PWR400 ~= 100 = field typical . 110+ = strong late engine under load”)
 
 # ____________________________________________________________________________
 
@@ -622,7 +622,7 @@ if active(“R&V (CAR)”):
 st.markdown(”## R&V - Context-Aware Reliability”)
 car_df = context_aware_reliability(metrics, work)
 st.dataframe(car_df, use_container_width=True)
-st.caption(“High CAR → repeatable . Low CAR → fragile / shape-dependent”)
+st.caption(“High CAR -> repeatable . Low CAR -> fragile / shape-dependent”)
 
 # ____________________________________________________________________________
 
@@ -651,7 +651,7 @@ with st.expander("xWin methodology"):
     st.caption(
         f"Softmax of within-race latent ability (Travel/Kick/Sustain). "
         f"Weights: {w_note}. "
-        f"Shape de-bias via RSI×SCI. Trip friction damp. tau = {tau_:.2f}. "
+        f"Shape de-bias via RSIxSCI. Trip friction damp. tau = {tau_:.2f}. "
         f"Interpretation: % chance to win across 100 identical replays."
     )
 ```
@@ -663,7 +663,7 @@ with st.expander("xWin methodology"):
 # ____________________________________________________________________________
 
 st.divider()
-st.markdown(”### 💾 Save Race to Database”)
+st.markdown(”### [DB] Save Race to Database”)
 
 with st.form(“save_form”):
 col_d, col_t, col_n = st.columns(3)
@@ -714,7 +714,7 @@ st.success(msg) if ok else st.error(msg)
 # ____________________________________________________________________________
 
 st.divider()
-st.markdown(”### 🔍 Horse History (from DB)”)
+st.markdown(”### [?] Horse History (from DB)”)
 horse_query = st.text_input(“Search horse name”, value=””,
 placeholder=“e.g. Captain Marvel”)
 if horse_query.strip():
@@ -735,9 +735,9 @@ st.caption(f”{len(hist)} run(s) found for ‘{horse_query}’”)
 # ____________________________________________________________________________
 
 if DEBUG:
-with st.expander(“🔧 Debug - attrs”):
+with st.expander(”[dbg] Debug - attrs”):
 import json
 from utils import sanitize_jsonable
 st.json(sanitize_jsonable(dict(metrics.attrs)))
-with st.expander(“🔧 Debug - metrics columns”):
+with st.expander(”[dbg] Debug - metrics columns”):
 st.write(list(metrics.columns))
