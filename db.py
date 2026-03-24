@@ -1,280 +1,162 @@
 “””
-db.py - SQLite persistence for Race Edge.
-
-Provides:
-
-- init_db(path)          - create/verify schema
-- save_race(conn, …)   - insert race + all performances
-- query_horse(conn, name) - retrieve horse history
-  “””
-  import sqlite3
-  from datetime import datetime
-
+data_io.py - file loading, header normalisation, split-step detection,
+integrity scanning.  No Streamlit imports here.
+“””
+import re
 import numpy as np
 import pandas as pd
 
-from utils import canon_horse, sha1
+from utils import as_num
 
 # –––––––––––––––––––––––
 
-# Schema
+# Header normalisation
 
 # –––––––––––––––––––––––
 
-_SCHEMA = “””
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA foreign_keys=ON;
-
-CREATE TABLE IF NOT EXISTS races(
-race_id        TEXT PRIMARY KEY,
-date           TEXT,
-track          TEXT,
-race_no        INTEGER,
-distance_m     INTEGER NOT NULL,
-split_step     INTEGER CHECK(split_step IN (100,200)) NOT NULL,
-fsr            REAL,
-collapse       REAL,
-shape_tag      TEXT,
-sci            REAL,
-fra_applied    INTEGER,
-going          TEXT,
-app_version    TEXT,
-created_ts     TEXT DEFAULT (datetime(‘now’)),
-src_hash       TEXT
-);
-
-CREATE TABLE IF NOT EXISTS performances(
-perf_id         TEXT PRIMARY KEY,
-race_id         TEXT NOT NULL REFERENCES races(race_id) ON DELETE CASCADE,
-horse           TEXT NOT NULL,
-horse_canon     TEXT NOT NULL,
-finish_pos      INTEGER,
-race_time_s     REAL,
-f200_idx        REAL,
-tsspi           REAL,
-accel           REAL,
-grind           REAL,
-grind_cg        REAL,
-delta_g         REAL,
-finisher_factor REAL,
-grind_adj_pts   REAL,
-pi              REAL,
-pi_rs           REAL,
-gci             REAL,
-gci_rs          REAL,
-hidden          REAL,
-ability         REAL,
-ability_tier    TEXT,
-iai             REAL,
-bal             REAL,
-comp            REAL,
-iai_pct         REAL,
-hid_pct         REAL,
-bal_pct         REAL,
-comp_pct        REAL,
-dir_hint        TEXT,
-confidence      TEXT,
-winning_dna     REAL,
-xwin            REAL,
-pwr400          REAL,
-fatigue_score   REAL,
-car             REAL,
-inserted_ts     TEXT DEFAULT (datetime(‘now’))
-);
-
-CREATE INDEX IF NOT EXISTS idx_perf_horse ON performances(horse_canon);
-CREATE INDEX IF NOT EXISTS idx_perf_race  ON performances(race_id);
-CREATE INDEX IF NOT EXISTS idx_races_date ON races(date);
+def normalize_headers(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 “””
-
-def init_db(path: str) -> tuple[bool, str]:
+Map common column-name variants to canonical forms:
+* ‘<n>_time’ / ‘<n>m_time’ / ‘<n>*split’  ->  ‘<n>*Time’
+* ‘finish_time’ / ‘finish_split’ / ‘finish’ ->  ‘Finish_Time’
+* ‘finish_pos’                               ->  ‘Finish_Pos’
+Returns (df_with_aliases, list_of_alias_notes).
 “””
-Create or verify the database.
-Returns (success, message).
-“””
+notes: list[str] = []
+lmap = {
+c.lower().strip().replace(” “, “*”).replace(”-”, “*”): c
+for c in df.columns
+}
+
+```
+def _alias(src_key: str, alias_col: str):
+    if src_key in lmap and alias_col not in df.columns:
+        df[alias_col] = df[lmap[src_key]]
+        notes.append(f"Aliased `{lmap[src_key]}` -> `{alias_col}`")
+
+for k in ("finish_time", "finish_split", "finish"):
+    _alias(k, "Finish_Time")
+_alias("finish_pos", "Finish_Pos")
+
+pat = re.compile(r"^(\d{2,4})m?_(time|split)$")
+for lk, orig in lmap.items():
+    m = pat.match(lk)
+    if m:
+        alias_col = f"{m.group(1)}_Time"
+        if alias_col not in df.columns:
+            df[alias_col] = df[orig]
+            notes.append(f"Aliased `{orig}` -> `{alias_col}`")
+
+return df, notes
+```
+
+# –––––––––––––––––––––––
+
+# Split-step detection
+
+# –––––––––––––––––––––––
+
+def detect_step(df: pd.DataFrame) -> int:
+“”“Return 100 or 200 based on gaps between **Time marker columns.”””
+markers = sorted(
+{int(c.split(”*”)[0]) for c in df.columns
+if c.endswith(”*Time”) and c != “Finish_Time”
+and c.split(”*”)[0].isdigit()},
+reverse=True,
+)
+if len(markers) < 2:
+return 100
+diffs = [markers[i] - markers[i + 1] for i in range(len(markers) - 1)]
+cnt100 = sum(60 <= d <= 140 for d in diffs)
+cnt200 = sum(160 <= d <= 240 for d in diffs)
+return 200 if cnt200 > cnt100 else 100
+
+# –––––––––––––––––––––––
+
+# Column helpers
+
+# –––––––––––––––––––––––
+
+def collect_markers(df: pd.DataFrame) -> list[int]:
+“”“Return sorted-descending list of numeric markers from *_Time columns.”””
+marks = set()
+for c in df.columns:
+if c.endswith(”*Time”) and c != “Finish_Time”:
 try:
-conn = sqlite3.connect(path)
-conn.executescript(_SCHEMA)
-conn.commit()
-conn.close()
-return True, f”DB ready at {path}”
-except Exception as e:
-return False, f”DB init failed: {e}”
+marks.add(int(c.split(”*”)[0]))
+except ValueError:
+pass
+return sorted(marks, reverse=True)
+
+def expected_segments(distance_m: float, step: int) -> list[str]:
+cols = [f”{m}_Time” for m in range(int(distance_m) - step, step - 1, -step)]
+cols.append(“Finish_Time”)
+return cols
 
 # –––––––––––––––––––––––
 
-# Helpers
+# Integrity scan
 
 # –––––––––––––––––––––––
 
-def _f(x) -> float | None:
-“”“Float or None (for DB nullability).”””
-try:
-v = float(x)
-return v if np.isfinite(v) else None
-except Exception:
-return None
-
-def _i(x) -> int | None:
-try:
-v = int(x)
-return v
-except Exception:
-return None
-
-# –––––––––––––––––––––––
-
-# Save race
-
-# –––––––––––––––––––––––
-
-def save_race(
-db_path: str,
-metrics: pd.DataFrame,
+def integrity_scan(
+df: pd.DataFrame,
 distance_m: float,
-split_step: int,
-date: str = “”,
-track: str = “”,
-race_no: int | None = None,
-app_version: str = “3.2”,
-src_hash: str = “”,
-extra_cols: dict | None = None,      # {horse_name: {col: value}} for any extra per-horse cols
-) -> tuple[bool, str]:
+step: int,
+) -> tuple[str, list[str], dict[str, int]]:
 “””
-Upsert one race + all performances into the DB.
-Returns (success, message).
+Checks only columns that actually exist in df.
+Returns (summary_text, missing_cols, {col: n_invalid}).
+“””
+exp = expected_segments(distance_m, step)
+missing = [c for c in exp if c not in df.columns]
 
 ```
-extra_cols lets callers pass in WinningDNA, xWin, PWR400, FatigueScore, CAR
-keyed by horse name.
-"""
-attrs = metrics.attrs
-race_id = sha1(f"{src_hash}{distance_m}{split_step}{date}{track}{race_no}")
+invalid: dict[str, int] = {}
+for c in exp:
+    if c in df.columns:
+        s = pd.to_numeric(df[c], errors="coerce")
+        invalid[c] = int(((s <= 0) | s.isna()).sum())
 
-race_row = (
-    race_id,
-    date or datetime.now().strftime("%Y-%m-%d"),
-    track or "",
-    _i(race_no),
-    _i(distance_m),
-    _i(split_step),
-    _f(attrs.get("FSR")),
-    _f(attrs.get("CollapseSeverity")),
-    str(attrs.get("SHAPE_TAG", "")),
-    _f(attrs.get("SCI")),
-    _i(attrs.get("FRA_APPLIED", 0)),
-    str(attrs.get("GOING", "Good")),
-    app_version,
-    datetime.now().isoformat(),
-    src_hash,
-)
+msgs: list[str] = []
+if missing:
+    msgs.append("Missing: " + ", ".join(missing))
+bads = [f"{k} ({v} rows)" for k, v in invalid.items() if v > 0]
+if bads:
+    msgs.append("Invalid/zero times -> treated as missing: " + ", ".join(bads))
 
-perf_rows = []
-for _, r in metrics.iterrows():
-    horse = str(r.get("Horse", ""))
-    horse_canon_ = canon_horse(horse)
-    perf_id = sha1(f"{race_id}{horse_canon_}")
-
-    # optional extra columns (WinningDNA, xWin, etc.)
-    ex = (extra_cols or {}).get(horse, {})
-
-    perf_rows.append((
-        perf_id, race_id,
-        horse, horse_canon_,
-        _i(r.get("Finish_Pos")),
-        _f(r.get("RaceTime_s")),
-        _f(r.get("F200_idx")),
-        _f(r.get("tsSPI")),
-        _f(r.get("Accel")),
-        _f(r.get("Grind")),
-        _f(r.get("Grind_CG")),
-        _f(r.get("DeltaG")),
-        _f(r.get("FinisherFactor")),
-        _f(r.get("GrindAdjPts")),
-        _f(r.get("PI")),
-        _f(r.get("PI_RS")),
-        _f(r.get("GCI")),
-        _f(r.get("GCI_RS")),
-        _f(r.get("HiddenScore")),
-        None, None,                  # ability / ability_tier (not computed here)
-        None, None, None,            # iai / bal / comp
-        None, None, None, None,      # pct cols
-        None, None,                  # dir_hint / confidence
-        _f(ex.get("WinningDNA")),
-        _f(ex.get("xWin")),
-        _f(ex.get("PWR400")),
-        _f(ex.get("FatigueScore")),
-        _f(ex.get("CAR")),
-        datetime.now().isoformat(),
-    ))
-
-try:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys=ON;")
-
-    conn.execute("""
-        INSERT OR REPLACE INTO races
-        (race_id,date,track,race_no,distance_m,split_step,
-         fsr,collapse,shape_tag,sci,fra_applied,going,
-         app_version,created_ts,src_hash)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, race_row)
-
-    conn.executemany("""
-        INSERT OR REPLACE INTO performances
-        (perf_id,race_id,horse,horse_canon,finish_pos,race_time_s,
-         f200_idx,tsspi,accel,grind,grind_cg,delta_g,finisher_factor,
-         grind_adj_pts,pi,pi_rs,gci,gci_rs,hidden,ability,ability_tier,
-         iai,bal,comp,iai_pct,hid_pct,bal_pct,comp_pct,
-         dir_hint,confidence,winning_dna,xwin,pwr400,fatigue_score,car,
-         inserted_ts)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, perf_rows)
-
-    conn.commit()
-    conn.close()
-    return True, f"Saved race {race_id[:8]}… with {len(perf_rows)} performances."
-except Exception as e:
-    return False, f"DB write failed: {e}"
+return (" * ".join(msgs) or "OK"), missing, invalid
 ```
 
 # –––––––––––––––––––––––
 
-# Query helpers
+# File loader
 
 # –––––––––––––––––––––––
 
-def query_horse(db_path: str, name: str) -> pd.DataFrame:
-“”“Return all performance rows for a horse (fuzzy canonical match).”””
-canon = canon_horse(name)
-try:
-conn = sqlite3.connect(db_path)
-df = pd.read_sql_query(
+def load_file(uploaded_file) -> tuple[pd.DataFrame, list[str]]:
 “””
-SELECT p.*, r.date, r.track, r.distance_m, r.going, r.shape_tag
-FROM performances p
-JOIN races r ON p.race_id = r.race_id
-WHERE p.horse_canon LIKE ?
-ORDER BY r.date DESC
-“””,
-conn,
-params=(f”%{canon}%”,),
-)
-conn.close()
-return df
-except Exception:
-return pd.DataFrame()
+Read CSV or Excel upload, normalise headers.
+Returns (work_df, alias_notes).
+Raises on parse failure.
+“””
+if uploaded_file.name.lower().endswith(”.csv”):
+raw = pd.read_csv(uploaded_file)
+else:
+raw = pd.read_excel(uploaded_file)
 
-def query_recent_races(db_path: str, limit: int = 20) -> pd.DataFrame:
-“”“Return recent race summaries.”””
-try:
-conn = sqlite3.connect(db_path)
-df = pd.read_sql_query(
-“SELECT * FROM races ORDER BY date DESC LIMIT ?”,
-conn, params=(limit,),
-)
-conn.close()
-return df
-except Exception:
-return pd.DataFrame()
+```
+# Coerce obvious numeric columns
+for c in list(raw.columns):
+    lc = c.lower().strip()
+    if any(lc.endswith(s) for s in ("_time", "_pos", "_split")) \
+            or lc in ("race time", "finish_time", "finish_pos",
+                       "horse weight", "weight allocated"):
+        raw[c] = as_num(raw[c])
+
+if "Finish_Pos" not in raw.columns:
+    raw["Finish_Pos"] = np.arange(1, len(raw) + 1)
+
+work, notes = normalize_headers(raw.copy())
+return work, notes
+```
