@@ -1,24 +1,25 @@
 “””
-db.py — SQLite persistence for Race Edge.
+db.py - SQLite persistence for Race Edge.
 
 Provides:
-• init_db(path)          — create/verify schema
-• save_race(conn, …)   — insert race + all performances
-• query_horse(conn, name) — retrieve horse history
-“””
-import sqlite3
-from datetime import datetime
+
+- init_db(path)          - create/verify schema
+- save_race(conn, …)   - insert race + all performances
+- query_horse(conn, name) - retrieve horse history
+  “””
+  import sqlite3
+  from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
 from utils import canon_horse, sha1
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Schema
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 _SCHEMA = “””
 PRAGMA journal_mode=WAL;
@@ -101,11 +102,11 @@ return True, f”DB ready at {path}”
 except Exception as e:
 return False, f”DB init failed: {e}”
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Helpers
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def _f(x) -> float | None:
 “”“Float or None (for DB nullability).”””
@@ -122,11 +123,11 @@ return v
 except Exception:
 return None
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Save race
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def save_race(
 db_path: str,
@@ -238,11 +239,11 @@ except Exception as e:
     return False, f"DB write failed: {e}"
 ```
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Query helpers
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def query_horse(db_path: str, name: str) -> pd.DataFrame:
 “”“Return all performance rows for a horse (fuzzy canonical match).”””
