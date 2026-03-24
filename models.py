@@ -1,24 +1,25 @@
 “””
-models.py — analytical sub-modules for Race Edge.
+models.py - analytical sub-modules for Race Edge.
 
 All algorithms are UNCHANGED.  Only structural changes:
-• each module is a standalone function
-• shared helpers imported from utils.py (no redefinitions)
-• no Streamlit imports — purely computational
-“””
-import math
-import re
-import numpy as np
-import pandas as pd
+
+- each module is a standalone function
+- shared helpers imported from utils.py (no redefinitions)
+- no Streamlit imports - purely computational
+  “””
+  import math
+  import re
+  import numpy as np
+  import pandas as pd
 
 from utils import as_num, clamp, mad_std, winsorize, lerp, norm_str
 from metrics import pi_weights_distance_and_context, speed_to_idx
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 # Ahead of the Handicap
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 def ahead_of_handicap(
 metrics: pd.DataFrame,
@@ -76,14 +77,14 @@ PI_med = float(np.nanmedian(df["PI"]))
 df["ΔPI_vs_med"]  = df["PI"] - PI_med
 df["RanAbove_kg"] = df["ΔPI_vs_med"] / beta_eff
 df["RanAbove_MR"] = df["RanAbove_kg"] * 2
-df["β_eff (PI/kg)"] = beta_eff
+df["beta_eff (PI/kg)"] = beta_eff
 
 view = df.rename(columns={weight_col: "Wt (kg)"})
 view = view[["Horse", "Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg",
-             "RanAbove_MR", "β_eff (PI/kg)"]].sort_values(
+             "RanAbove_MR", "beta_eff (PI/kg)"]].sort_values(
     "RanAbove_kg", ascending=False
 )
-for c in ["Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]:
+for c in ["Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "beta_eff (PI/kg)"]:
     view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
 
 view.attrs["PI_med"]  = PI_med
@@ -92,14 +93,14 @@ view.attrs["beta_eff"] = beta_eff
 return view
 ```
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 # Winning DNA Matrix
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 def winning_dna(metrics: pd.DataFrame, distance_m: float) -> pd.DataFrame:
-“”“Returns enriched df with WinningDNA, EZ01…LL01, SOS01, DNA_TopTraits, DNA_Summary.”””
+“”“Returns enriched df with WinningDNA, EZ01_LL01, SOS01, DNA_TopTraits, DNA_Summary.”””
 WD     = metrics.copy()
 gr_col = metrics.attrs.get(“GR_COL”, “Grind”)
 RSI    = float(metrics.attrs.get(“RSI”, 0.0))
@@ -240,18 +241,18 @@ def _top_traits(r):
     ez,ll = float(r.get("EZ01",0)), float(r.get("LL01",0))
     if ez>=0.70 and ll<=0.45: keep.append("Sprinter-leaning")
     if ll>=0.70 and ez<=0.45: keep.append("Stayer-leaning")
-    return " · ".join(keep)
+    return " . ".join(keep)
 
 WD["DNA_TopTraits"] = WD.apply(_top_traits, axis=1)
 WD.attrs["DNA_WEIGHTS"] = W
 return WD
 ```
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 # Hidden Horses v2
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 def hidden_horses(metrics: pd.DataFrame, distance_m: float) -> pd.DataFrame:
 hh     = metrics.copy()
@@ -377,11 +378,11 @@ hh["Tier"]=hh["Tier"].astype(tier_order)
 return hh.sort_values(["Tier","HiddenScore","PI"],ascending=[True,False,False])
 ```
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 # PWX + EFI
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 def pwx_efi(metrics: pd.DataFrame) -> pd.DataFrame | None:
 GR_COL = metrics.attrs.get(“GR_COL”,“Grind”)
@@ -420,11 +421,11 @@ df["PWX"]=_cal(PWX_raw); df["EFI"]=_cal(EFI_raw)
 return df[["Horse","PWX","EFI"]].sort_values(["PWX","EFI"],ascending=[False,False]).reset_index(drop=True)
 ```
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 # Fatigue Gradient
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 def fatigue_gradient(metrics: pd.DataFrame, work: pd.DataFrame) -> pd.DataFrame:
 “”“Refined one-run fatigue table.”””
@@ -570,11 +571,11 @@ return (view.assign(_g=ord_g,_s=-view["FatigueScore"].astype(float))
         .drop(columns=["_g","_s"]).reset_index(drop=True))
 ```
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 # PWR400
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 def compute_pwr400(
 df: pd.DataFrame,
@@ -635,11 +636,11 @@ w.attrs["PWR400_NOTE"]={
 return w
 ```
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 # R&V (CAR)
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 def context_aware_reliability(metrics: pd.DataFrame, work: pd.DataFrame) -> pd.DataFrame:
 df=metrics.copy()
@@ -723,11 +724,11 @@ sort_c=["R&V"]+( ["PI"] if "PI" in out.columns else [])
 return out.sort_values(sort_c,ascending=[False]*len(sort_c),kind="mergesort").reset_index(drop=True)
 ```
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 # xWin
 
-# ══════════════════════════════════════════════
+# ______________________________________________
 
 def xwin(
 metrics: pd.DataFrame,
@@ -831,7 +832,7 @@ def _driver(r):
         if k>0.35: bits.append("Against shape")
         elif k<-0.35: bits.append("With shape")
     if trim_T>0: bits.append("(slow mid)")
-    return " · ".join(bits)
+    return " . ".join(bits)
 
 XW["Drivers"]=XW.apply(_driver,axis=1)
 view=XW[["Horse","xWin","Drivers"]].copy()
