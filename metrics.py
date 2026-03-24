@@ -1,5 +1,5 @@
 “””
-metrics.py — core metric engine for Race Edge.
+metrics.py - core metric engine for Race Edge.
 
 All PI / GCI / RSI / CG algorithms are UNCHANGED from the original.
 This file only reorganises them into importable functions and removes
@@ -17,11 +17,11 @@ pct_at_or_above,
 )
 from data_io import collect_markers
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Stage / speed helpers  (unchanged logic)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def _sum_times(row, cols):
 vals = [pd.to_numeric(row.get(c), errors=“coerce”) for c in cols]
@@ -60,11 +60,11 @@ else:
 tfin = pd.to_numeric(row.get(“Finish_Time”), errors=“coerce”)
 return np.nan if (pd.isna(tfin) or tfin <= 0) else 200.0 / float(tfin)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Adaptive window helpers  (unchanged)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def _adaptive_f_cols_and_dist(D, step, markers, frame_cols):
 if not markers:
@@ -102,11 +102,11 @@ if first_span <= 180:  return int(D - 150)
 if first_span <= 220:  return int(D - 400)
 return int(D - 250)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
-# Speed → Index  (unchanged)
+# Speed _ Index  (unchanged)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def _shrink_center(idx_series):
 x = pd.to_numeric(idx_series, errors=“coerce”).dropna().values
@@ -139,11 +139,11 @@ idx = 100.0 * (s / (center / 100.0 * med))
 idx = 100.0 + _dispersion_equalizer(idx - 100.0, n_eff)
 return _variance_floor(idx)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # PI weights  (unchanged)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def pi_weights_distance_and_context(
 distance_m: float,
@@ -203,11 +203,11 @@ return out, {"going": going, "field_n": n, "multipliers": mult,
              "base": base.copy(), "final": out.copy()}
 ```
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Distance-aware per-kg penalty
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def perkg_pts(dm: float) -> float:
 knots = [(1000, 0.10), (1200, 0.12), (1400, 0.14),
@@ -220,11 +220,11 @@ if a <= dm <= b:
 return va + (vb - va) * (dm - a) / (b - a)
 return 0.16
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Main builder  (algorithms 100 % unchanged)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def build_metrics_and_shape(
 df_in: pd.DataFrame,
@@ -248,7 +248,7 @@ seg_markers = collect_markers(w)
 D = float(D_actual_m)
 step = int(step)
 
-# ── per-segment raw speeds ──
+# -- per-segment raw speeds --
 for m in seg_markers:
     w[f"spd_{m}"] = (step * 1.0) / pd.to_numeric(
         w.get(f"{m}_Time"), errors="coerce"
@@ -259,7 +259,7 @@ if "Finish_Time" in w.columns:
         w.get("Finish_Time"), errors="coerce"
     )
 
-# ── RaceTime ──
+# -- RaceTime --
 if seg_markers:
     wanted = [f"{m}_Time" for m in range(int(D) - step, step - 1, -step)
               if f"{m}_Time" in w.columns]
@@ -272,7 +272,7 @@ if seg_markers:
 else:
     w["RaceTime_s"] = pd.to_numeric(w.get("Race Time"), errors="coerce")
 
-# ── composite speeds ──
+# -- composite speeds --
 f_cols, f_dist = _adaptive_f_cols_and_dist(D, step, seg_markers, w.columns)
 w["_F_spd"] = w.apply(
     lambda r: (f_dist / _sum_times(r, f_cols))
@@ -292,13 +292,13 @@ else:
 w["_ACC_spd"] = w.apply(lambda r: _stage_speed(r, acc_cols, float(step)), axis=1)
 w["_GR_spd"]  = w.apply(lambda r: _grind_speed(r, step), axis=1)
 
-# ── speed → indices ──
+# -- speed _ indices --
 w["F200_idx"] = speed_to_idx(w["_F_spd"])
 w["tsSPI"]    = speed_to_idx(w["_MID_spd"])
 w["Accel"]    = speed_to_idx(w["_ACC_spd"])
 w["Grind"]    = speed_to_idx(w["_GR_spd"])
 
-# ── Corrected Grind ──
+# -- Corrected Grind --
 ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
 GR_field  = pd.to_numeric(w["_GR_spd"],  errors="coerce").mean(skipna=True)
 FSR = float(GR_field / ACC_field) \
@@ -330,7 +330,7 @@ w["Grind_CG"] = [
     _fade_cap(g, dg) for g, dg in zip(w["Grind_CG"], w["DeltaG"])
 ]
 
-# ── PI v3.2 ──
+# -- PI v3.2 --
 GR_COL = "Grind_CG" if use_cg else "Grind"
 acc_med = pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True)
 grd_med = pd.to_numeric(w[GR_COL],  errors="coerce").median(skipna=True)
@@ -347,7 +347,7 @@ if use_cg and dampen_cg and CollapseSeverity >= 3.0:
     PI_W["Accel"] += shift * 0.5
     PI_W["tsSPI"] += shift * 0.5
 
-# ── mass-aware PI ──
+# -- mass-aware PI --
 mass_kg, mass_src = mass_series(w)
 w.attrs["MASS_SRC"] = mass_src
 mass_ref = float(np.nanmedian(mass_kg)) if np.isfinite(np.nanmedian(mass_kg)) else np.nan
@@ -381,7 +381,7 @@ sigma = mad_std(centered)
 sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else sigma
 w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
 
-# ── GCI ──
+# -- GCI --
 winner_time = None
 if "RaceTime_s" in w.columns and w["RaceTime_s"].notna().any():
     try:
@@ -417,7 +417,7 @@ for _, r in w.iterrows():
     gci_vals.append(round(10.0 * (wT * T + wPACE * LQ + wSS * SS + wEFF * EFF), 3))
 w["GCI"] = gci_vals
 
-# ── GCI_RS ──
+# -- GCI_RS --
 RSI_val = float(w.attrs.get("RSI", 0.0))
 SCI_val = float(w.attrs.get("SCI", 0.0))
 dLM = (pd.to_numeric(w["Accel"], errors="coerce") -
@@ -434,13 +434,13 @@ if SCI_val < 0.40:
     adj *= 0.5
 w["GCI_RS"] = (pd.to_numeric(w["GCI"], errors="coerce") + adj).clip(0.0, 10.0).round(3)
 
-# ── EARLY / LATE ──
+# -- EARLY / LATE --
 w["EARLY_idx"] = (0.65 * pd.to_numeric(w["F200_idx"], errors="coerce") +
                   0.35 * pd.to_numeric(w["tsSPI"],    errors="coerce"))
 w["LATE_idx"]  = (0.60 * pd.to_numeric(w["Accel"],   errors="coerce") +
                   0.40 * pd.to_numeric(w[GR_COL],    errors="coerce"))
 
-# ── attrs ──
+# -- attrs --
 w.attrs.update({
     "GR_COL": GR_COL,
     "STEP":   step,
@@ -456,7 +456,7 @@ w.attrs.update({
     },
 })
 
-# ── Race Shape (RSI / SCI) ──
+# -- Race Shape (RSI / SCI) --
 acc = pd.to_numeric(w["Accel"], errors="coerce")
 mid = pd.to_numeric(w["tsSPI"], errors="coerce")
 grd = pd.to_numeric(w[GR_COL],  errors="coerce")
@@ -535,11 +535,11 @@ w.attrs.update({
 return w, seg_markers
 ```
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # RQS / RPS  (unchanged algorithms)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
 if df is None or len(df) == 0:
@@ -566,7 +566,7 @@ rqs = (0.55 * S1 + 0.25 * S2 + 0.20 * S3) * trust - penalty
 return float(np.clip(round(rqs, 1), 0.0, 100.0))
 
 def compute_rps(df: pd.DataFrame) -> float:
-“”“Star-aware peak strength — uses PI_RS if present, falls back to PI.”””
+“”“Star-aware peak strength - uses PI_RS if present, falls back to PI.”””
 if df is None or len(df) == 0:
 return 0.0
 pi = pd.to_numeric(df.get(“PI_RS”, df.get(“PI”)), errors=“coerce”).dropna()
