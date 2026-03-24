@@ -17,9 +17,9 @@ from utils import as_num
 def normalize_headers(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 “””
 Map common column-name variants to canonical forms:
-* ‘<n>_time’ / ‘<n>m_time’ / ‘<n>*split’  →  ‘<n>*Time’
-* ‘finish_time’ / ‘finish_split’ / ‘finish’ →  ‘Finish_Time’
-* ‘finish_pos’                               →  ‘Finish_Pos’
+* ‘<n>_time’ / ‘<n>m_time’ / ‘<n>*split’  ->  ‘<n>*Time’
+* ‘finish_time’ / ‘finish_split’ / ‘finish’ ->  ‘Finish_Time’
+* ‘finish_pos’                               ->  ‘Finish_Pos’
 Returns (df_with_aliases, list_of_alias_notes).
 “””
 notes: list[str] = []
@@ -32,7 +32,7 @@ for c in df.columns
 def _alias(src_key: str, alias_col: str):
     if src_key in lmap and alias_col not in df.columns:
         df[alias_col] = df[lmap[src_key]]
-        notes.append(f"Aliased `{lmap[src_key]}` → `{alias_col}`")
+        notes.append(f"Aliased `{lmap[src_key]}` -> `{alias_col}`")
 
 for k in ("finish_time", "finish_split", "finish"):
     _alias(k, "Finish_Time")
@@ -45,7 +45,7 @@ for lk, orig in lmap.items():
         alias_col = f"{m.group(1)}_Time"
         if alias_col not in df.columns:
             df[alias_col] = df[orig]
-            notes.append(f"Aliased `{orig}` → `{alias_col}`")
+            notes.append(f"Aliased `{orig}` -> `{alias_col}`")
 
 return df, notes
 ```
@@ -123,7 +123,7 @@ if missing:
     msgs.append("Missing: " + ", ".join(missing))
 bads = [f"{k} ({v} rows)" for k, v in invalid.items() if v > 0]
 if bads:
-    msgs.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
+    msgs.append("Invalid/zero times -> treated as missing: " + ", ".join(bads))
 
 return (" * ".join(msgs) or "OK"), missing, invalid
 ```
