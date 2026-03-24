@@ -136,12 +136,12 @@ sc = ax.scatter(xv, yv, s=_pi_sizes(piv), c=cv, cmap="coolwarm", norm=norm,
 label_points_neatly(ax, xv, yv, names)
 
 ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
-ax.set_xlabel("Acceleration vs field (points) →")
-ax.set_ylabel(("Corrected " if use_cg else "") + "Grind vs field (points) ↑")
-ax.set_title("Shape Map . +X=Accel . +Y=" + ("CG" if use_cg else "Grind") + " . Colour=tsSPIΔ")
+ax.set_xlabel("Acceleration vs field (points) ->")
+ax.set_ylabel(("Corrected " if use_cg else "") + "Grind vs field (points) ^")
+ax.set_title("Shape Map . +X=Accel . +Y=" + ("CG" if use_cg else "Grind") + " . Colour=tsSPI_")
 ax.legend(_pi_legend_handles(), ["PI low", "PI mid", "PI high"],
           loc="upper left", frameon=False, fontsize=8)
-fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04).set_label("tsSPI − 100")
+fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04).set_label("tsSPI - 100")
 ax.grid(True, linestyle=":", alpha=0.25)
 fig.tight_layout()
 return fig
@@ -167,13 +167,13 @@ if marks:
     m1 = int(marks[0])
     L0 = max(1.0, race_distance - m1)
     if f"{m1}_Time" in work.columns:
-        segs.append((f"{int(race_distance)}→{m1}", float(L0), f"{m1}_Time"))
+        segs.append((f"{int(race_distance)}->{m1}", float(L0), f"{m1}_Time"))
     for a, b in zip(marks, marks[1:]):
         src = f"{int(b)}_Time"
         if src in work.columns:
-            segs.append((f"{int(a)}→{int(b)}", float(a - b), src))
+            segs.append((f"{int(a)}->{int(b)}", float(a - b), src))
 if "Finish_Time" in work.columns:
-    segs.append((f"{step}→0 (Finish)", float(step), "Finish_Time"))
+    segs.append((f"{step}->0 (Finish)", float(step), "Finish_Time"))
 
 if not segs:
     fig, ax = plt.subplots(); ax.text(0.5, 0.5, "No segment data", ha="center"); return fig
@@ -241,13 +241,13 @@ if dfm.empty:
     return None
 
 pwr_med = float(np.nanmedian(dfm["PWR400"]))
-dfm["PWR400Δ"]  = dfm["PWR400"] - pwr_med
+dfm["PWR400_"]  = dfm["PWR400"] - pwr_med
 dfm["Freshness"] = -dfm["FatigueScore"]
 
 tag_map = {"late engine": 3.0, "balanced": 0.0, "neutral": 0.0, "front-spent": -3.0}
 dfm["TagVal"] = dfm["Tag"].map(tag_map).fillna(0.0)
 
-xv = dfm["PWR400Δ"].to_numpy()
+xv = dfm["PWR400_"].to_numpy()
 yv = dfm["Freshness"].to_numpy()
 cv = dfm["TagVal"].to_numpy()
 piv = dfm["PI"].fillna(0).to_numpy()
@@ -265,13 +265,13 @@ sc   = ax.scatter(xv, yv, s=_pi_sizes(piv), c=cv, cmap="coolwarm", norm=norm,
 label_points_neatly(ax, xv, yv, names)
 
 ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
-ax.set_xlabel("PWR400 − field median (late power under load) →")
-ax.set_ylabel("Freshness (−FatigueScore) ↑")
+ax.set_xlabel("PWR400 - field median (late power under load) ->")
+ax.set_ylabel("Freshness (-FatigueScore) ^")
 ax.set_title("Power-Freshness Map  .  Size=PI  .  Colour=Fatigue Tag")
 ax.legend(_pi_legend_handles(), ["PI low", "PI mid", "PI high"],
           loc="upper left", frameon=False, fontsize=8)
 fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04).set_label(
-    "Fatigue Tag (−3 front-spent . 0 balanced . +3 late engine)"
+    "Fatigue Tag (-3 front-spent . 0 balanced . +3 late engine)"
 )
 ax.grid(True, linestyle=":", alpha=0.25)
 fig.tight_layout()
