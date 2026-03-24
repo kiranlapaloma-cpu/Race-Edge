@@ -1,5 +1,5 @@
 “””
-utils.py — shared helpers for Race Edge.
+utils.py - shared helpers for Race Edge.
 All functions here are pure (no Streamlit, no side effects).
 “””
 import math
@@ -11,11 +11,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Numeric helpers
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def as_num(x):
 “”“Coerce to numeric Series / scalar with NaN on failure.”””
@@ -33,7 +33,7 @@ def clamp(v, lo, hi):
 return max(lo, min(hi, float(v)))
 
 def mad_std(x):
-“”“Robust σ via MAD (1.4826 × median |xᵢ − median(x)|).”””
+“”“Robust sigma via MAD (1.4826 _ median |x_ _ median(x)|).”””
 x = np.asarray(x, dtype=float)
 x = x[np.isfinite(x)]
 if x.size == 0:
@@ -56,11 +56,11 @@ def pct_at_or_above(s, thr):
 s = pd.to_numeric(s, errors=“coerce”).dropna()
 return 0.0 if s.empty else float((s >= thr).mean())
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # String / identity helpers
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def sha1(s: str) -> str:
 return hashlib.sha1(s.encode(“utf-8”)).hexdigest()
@@ -73,14 +73,14 @@ s = re.sub(r”[^\w\s]”, “ “, s)
 return re.sub(r”\s+”, “ “, s)
 
 def norm_str(x: str) -> str:
-“”“Lowercase, collapse spaces — for fuzzy key matching.”””
+“”“Lowercase, collapse spaces - for fuzzy key matching.”””
 return re.sub(r”\s+”, “ “, str(x).strip().lower())
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # NaN / Inf sanitisation (for Streamlit / Arrow)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def _is_nanlike(x):
 try:
@@ -123,7 +123,7 @@ return type(obj)(sanitize(v) for v in obj)
 return None if _is_nanlike(obj) else obj
 
 def sanitize_jsonable(obj, ndigits=3):
-“”“Recursively convert NaN/Inf → None and round floats.”””
+“”“Recursively convert NaN/Inf _ None and round floats.”””
 if obj is None:
 return None
 if isinstance(obj, (float, np.floating)):
@@ -143,11 +143,11 @@ return sanitize_jsonable(float(obj), ndigits)
 except Exception:
 return None
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Matplotlib helpers
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def color_cycle(n: int) -> list:
 base = plt.rcParams[“axes.prop_cycle”].by_key().get(
@@ -178,11 +178,11 @@ vmin = center - 0.1 if vmin >= center else vmin
 vmax = center + 0.1 if vmax <= center else vmax
 return TwoSlopeNorm(vcenter=center, vmin=vmin, vmax=vmax)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 # Weight / mass parsing  (single authoritative copy)
 
-# ──────────────────────────────────────────────
+# –––––––––––––––––––––––
 
 def parse_mass_to_kg(v) -> float:
 “””
