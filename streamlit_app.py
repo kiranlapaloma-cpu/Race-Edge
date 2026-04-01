@@ -3144,6 +3144,14 @@ if _view_is("Visuals", "Full Report"):
     need_p  = {"Horse", "PI", "PWR400"}
     need_fg = {"Horse", "FatigueScore", "Tag"}
 
+    # Rebuild fatigue table on demand for views where the Fatigue section
+    # has not already run in this execution path.
+    try:
+        if "_ftab" not in locals() or _ftab is None:
+            _ftab = build_fatigue_table_refined(metrics)
+    except Exception:
+        _ftab = pd.DataFrame()
+
     missing_p  = need_p  - set(metrics.columns)
     missing_fg = need_fg - set(_ftab.columns)
 
