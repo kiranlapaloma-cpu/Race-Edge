@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.lines import Line2D
 
 # ======================= Global NaN/Inf → None guard (JSON-safe, index-safe) =======================
 
