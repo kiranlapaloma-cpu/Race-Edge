@@ -109,6 +109,72 @@ def _safe_download_button(*a, **k):
     return _orig_download_button(*a, **k)
 st.download_button = _safe_download_button
 # ======================= /Global guard =======================
+# ----------------------- Global plot helpers -----------------------
+def _repel_labels_builtin(ax, x, y, labels, *, init_shift=0.18, k_attract=0.006, k_repel=0.012, max_iter=250):
+    trans = ax.transData
+    renderer = ax.figure.canvas.get_renderer()
+    xy = np.column_stack([x, y]).astype(float)
+    offs = np.zeros_like(xy)
+    for i, (xi, yi) in enumerate(xy):
+        offs[i] = [init_shift if xi >= 0 else -init_shift, init_shift if yi >= 0 else -init_shift]
+
+    texts, lines = [], []
+    for (xi, yi), (dx, dy), lab in zip(xy, offs, labels):
+        t = ax.text(xi + dx, yi + dy, lab, fontsize=8.4, va="center", ha="left",
+                    bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75),
+                    zorder=5)
+        texts.append(t)
+        lines.append(ax.plot([xi, xi + dx], [yi, yi + dy], color="gray", lw=0.45, alpha=0.45, zorder=4)[0])
+
+    ax.figure.canvas.draw()
+    for _ in range(max_iter):
+        moved = 0.0
+        bbs = [t.get_window_extent(renderer=renderer).expanded(1.06, 1.12) for t in texts]
+        centers = []
+        for bb in bbs:
+            centers.append(((bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2))
+
+        for i, t in enumerate(texts):
+            xi, yi = xy[i]
+            tx, ty = t.get_position()
+            px, py = trans.transform((tx, ty))
+            ox, oy = trans.transform((xi, yi))
+
+            fx = (ox - px) * k_attract
+            fy = (oy - py) * k_attract
+
+            for j in range(len(texts)):
+                if i == j:
+                    continue
+                bb_i, bb_j = bbs[i], bbs[j]
+                if not bb_i.overlaps(bb_j):
+                    continue
+                cx_i, cy_i = centers[i]
+                cx_j, cy_j = centers[j]
+                dxp = (cx_i - cx_j) if (cx_i - cx_j) != 0 else (1.0 if i < j else -1.0)
+                dyp = (cy_i - cy_j) if (cy_i - cy_j) != 0 else (1.0 if i < j else -1.0)
+                dist = max((dxp * dxp + dyp * dyp) ** 0.5, 1.0)
+                fx += (dxp / dist) * k_repel * 12.0
+                fy += (dyp / dist) * k_repel * 12.0
+
+            new_tx, new_ty = trans.inverted().transform((px + fx, py + fy))
+            moved += abs(new_tx - tx) + abs(new_ty - ty)
+            t.set_position((new_tx, new_ty))
+            lines[i].set_data([xi, new_tx], [yi, new_ty])
+
+        ax.figure.canvas.draw()
+        renderer = ax.figure.canvas.get_renderer()
+        if moved < 1e-3:
+            break
+
+
+def label_points_neatly(ax, x, y, labels):
+    try:
+        _repel_labels_builtin(ax, x, y, labels)
+    except Exception:
+        for xi, yi, lab in zip(x, y, labels):
+            ax.text(xi, yi, str(lab), fontsize=8.2, va="center", ha="left", zorder=5)
+
 # ----------------------- Page config -----------------------
 st.set_page_config(
     page_title="Race Edge — PI v3.2 + Hidden v2 + Ability v2 + CG + Race Shape + DB",
