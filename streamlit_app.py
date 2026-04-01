@@ -1969,7 +1969,7 @@ if _view_is("Visuals", "Full Report"):
     with cpc1:
         pace_mode = st.selectbox("Curve mode", ["Raw Pace (m/s)", "Vs Field Average"], index=0, key="pace_curve_mode")
     with cpc2:
-        runner_set = st.selectbox("Runners shown", ["Winner vs Field", "Top 4", "Top 8", "Top 10"], index=2, key="pace_curve_runner_set")
+        runner_set = st.selectbox("Runners shown", ["Winner vs Field", "Top 4", "Top 8", "Top 10", "Whole field"], index=2, key="pace_curve_runner_set")
     with cpc3:
         show_phase_shading = st.toggle("Phase shading", value=True, key="pace_curve_phase_shading")
 
@@ -2032,7 +2032,7 @@ if _view_is("Visuals", "Full Report"):
                 ranked = metrics.copy()
                 ranking_rule = "table order"
 
-            n_lookup = {"Winner vs Field": 1, "Top 4": 4, "Top 8": 8, "Top 10": 10}
+            n_lookup = {"Winner vs Field": 1, "Top 4": 4, "Top 8": 8, "Top 10": 10, "Whole field": len(ranked)}
             topn = n_lookup.get(runner_set, 8)
             picked = ranked.head(topn).copy()
             if picked.empty:
@@ -2114,19 +2114,17 @@ if _view_is("Visuals", "Full Report"):
                         ax.scatter([x_vals[jj]], [y[jj]], color=palette[i], s=28 if is_top4 else 20,
                                    edgecolor="black", linewidth=0.4, zorder=z+1)
 
-                    # store end labels for highlighted runners only when chart is busy
+                    # store end labels for all shown runners
                     if show_end_labels and len(finite):
-                        should_label = True if len(picked_names) <= 6 else is_top4
-                        if should_label:
-                            jf = finite[-1]
-                            end_label_specs.append({
-                                "name": name,
-                                "x": float(x_vals[jf]),
-                                "y": float(y[jf]),
-                                "color": palette[i],
-                                "is_winner": is_winner,
-                                "z": z,
-                            })
+                        jf = finite[-1]
+                        end_label_specs.append({
+                            "name": name,
+                            "x": float(x_vals[jf]),
+                            "y": float(y[jf]),
+                            "color": palette[i],
+                            "is_winner": is_winner,
+                            "z": z,
+                        })
 
                 # non-overlapping right-edge labels with leader lines
                 if show_end_labels and end_label_specs:
@@ -2170,7 +2168,7 @@ if _view_is("Visuals", "Full Report"):
                 ax.set_ylabel(ylab)
                 ax.set_title(f"Pace Curve — {title_tail}")
                 ax.grid(True, ls="--", alpha=0.28)
-                ax.set_xlim(-0.35, len(x_vals)-1 + (0.85 if show_end_labels else 0.25))
+                ax.set_xlim(-0.35, len(x_vals)-1 + (1.30 if (show_end_labels and len(picked_names) > 12) else (1.05 if show_end_labels else 0.25)))
 
                 # cleaner legend: just field avg + winner + top placers when available
                 handles, labels = ax.get_legend_handles_labels()
@@ -3219,3 +3217,4 @@ if _view_is("Exports & Notes", "Full Report"):
                 st.write(metrics.attrs)
             except Exception:
                 pass
+
