@@ -1962,111 +1962,225 @@ if _view_is("Visuals", "Full Report"):
             st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
 
 
-    # ======================= Pace Curve — field average (lean version) =======================
-    st.markdown("## Pace Curve — field average (black) + Top 10 finishers")
+    # ======================= Pace Curve — enhanced detailed version =======================
+    st.markdown("## Pace Curve")
 
-    # Optional: toggle PNG export (saves memory if off)
-    make_png = st.toggle("Prepare PNG for download (uses more memory)", value=False) if _view_is("Exports & Notes", "Full Report") else False
+    cpc1, cpc2, cpc3 = st.columns([1.15, 1.0, 1.0])
+    with cpc1:
+        pace_mode = st.selectbox("Curve mode", ["Raw Pace (m/s)", "Vs Field Average"], index=0, key="pace_curve_mode")
+    with cpc2:
+        runner_set = st.selectbox("Runners shown", ["Winner vs Field", "Top 4", "Top 8", "Top 10"], index=2, key="pace_curve_runner_set")
+    with cpc3:
+        show_phase_shading = st.toggle("Phase shading", value=True, key="pace_curve_phase_shading")
+
+    cpc4, cpc5 = st.columns([1,1])
+    with cpc4:
+        show_end_labels = st.toggle("Line-end labels", value=True, key="pace_curve_end_labels")
+    with cpc5:
+        make_png = st.toggle("Prepare PNG for download", value=False, key="pace_curve_png") if _view_is("Exports & Notes", "Full Report") else False
     pace_png = None
 
     step = int(metrics.attrs.get("STEP", 100))
     D = float(race_distance_input)
     marks = _collect_markers(work)
 
-    # ---- Build segments ----
-    segs = []
+    def _pace_x_label(v):
+        try:
+            vv = int(round(float(v)))
+            return f"{vv}m" if vv > 0 else "FIN"
+        except Exception:
+            return str(v)
+
+    # ---- Build segments in race order (early -> finish) ----
+    segs = []  # (x_value, seg_len, time_col)
     if marks:
         m1 = int(marks[0])
         L0 = max(1.0, D - m1)
         if f"{m1}_Time" in work.columns:
-            segs.append((f"{int(D)}→{m1}", float(L0), f"{m1}_Time"))
+            segs.append((m1, float(L0), f"{m1}_Time"))
         for a, b in zip(marks, marks[1:]):
             src = f"{int(b)}_Time"
             if src in work.columns:
-                segs.append((f"{int(a)}→{int(b)}", float(a - b), src))
+                segs.append((int(b), float(a - b), src))
     if "Finish_Time" in work.columns:
-        segs.append((f"{step}→0 (Finish)", float(step), "Finish_Time"))
+        segs.append((0, float(step), "Finish_Time"))
 
     if not segs:
         st.info("Not enough *_Time columns to draw the pace curve.")
     else:
-        # ---- Compute speeds efficiently ----
-        seg_keys = [f"s{i}" for i in range(len(segs))]
-        arr = np.full((len(work), len(segs)), np.nan, dtype="float32")
-
+        # ---- Compute per-horse segment speeds ----
+        nseg = len(segs)
+        arr = np.full((len(work), nseg), np.nan, dtype="float32")
         for j, (_, L, col) in enumerate(segs):
             if col in work.columns:
                 t = pd.to_numeric(work[col], errors="coerce").astype("float32")
                 t = np.where((t > 0) & np.isfinite(t), t, np.nan)
                 arr[:, j] = L / t
 
-        # Field average once
         field_avg = np.nanmean(arr, axis=0)
         if not np.isfinite(np.nanmean(field_avg)):
             st.info("Pace curve: all segments missing/invalid.")
         else:
-            # ---- Pick Top 10 ----
+            # ---- Choose runners ----
             if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
-                top10 = metrics.nsmallest(10, "Finish_Pos")
-                rule = "Top-10 by Finish_Pos"
+                ranked = metrics.sort_values("Finish_Pos", ascending=True).copy()
+                ranking_rule = "Finish_Pos"
+            elif "PI" in metrics.columns and metrics["PI"].notna().any():
+                ranked = metrics.sort_values("PI", ascending=False).copy()
+                ranking_rule = "PI"
             else:
-                top10 = metrics.nlargest(10, "PI")
-                rule = "Top-10 by PI"
+                ranked = metrics.copy()
+                ranking_rule = "table order"
 
-            # ---- Build plot ----
-            x_idx = np.arange(len(segs))
-            x_labels = [lbl for (lbl, _, _) in segs]
+            n_lookup = {"Winner vs Field": 1, "Top 4": 4, "Top 8": 8, "Top 10": 10}
+            topn = n_lookup.get(runner_set, 8)
+            picked = ranked.head(topn).copy()
+            if picked.empty:
+                st.info("No runners available for pace curve.")
+            else:
+                x_vals = np.arange(nseg)
+                x_labels = [_pace_x_label(xv) for (xv, _, _) in segs]
 
-            fig, ax = plt.subplots(figsize=(8.0, 5.0))
-            ax.plot(x_idx, field_avg, color="black", lw=2.0, label="Field average")
-
-            palette = color_cycle(len(top10))
-            for i, (_, r) in enumerate(top10.iterrows()):
-                speeds = np.full(len(segs), np.nan, dtype="float32")
-                for j, (_, L, col) in enumerate(segs):
-                    t = pd.to_numeric(r.get(col, np.nan), errors="coerce")
-                    if np.isfinite(t) and t > 0:
-                        speeds[j] = L / float(t)
-                if np.any(np.isfinite(speeds)):
-                    ax.plot(x_idx, speeds, lw=1.0, marker="o", ms=2.5,
-                            color=palette[i], label=str(r.get("Horse", "")))
-
-            # ---- Axes and styling ----
-            ax.set_xticks(x_idx)
-            ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
-            ax.set_ylabel("Speed (m/s)")
-            ax.set_title("Pace over segments (left = early, right = home straight)")
-            ax.grid(True, ls="--", alpha=0.3)
-            ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18),
-                      ncol=3, frameon=False, fontsize=8)
-            st.pyplot(fig)
-            plt.close(fig)
-
-            # ---- Optional PNG export ----
-            if make_png:
-                buf = io.BytesIO()
-                fig2, ax2 = plt.subplots(figsize=(8.0, 5.0))
-                ax2.plot(x_idx, field_avg, color="black", lw=2.0)
-                for i, (_, r) in enumerate(top10.iterrows()):
-                    speeds = np.full(len(segs), np.nan, dtype="float32")
+                picked_names = [str(x) for x in picked.get("Horse", pd.Series(dtype=str)).tolist()]
+                speed_map = {}
+                for _, r in picked.iterrows():
+                    name = str(r.get("Horse", ""))
+                    speeds = np.full(nseg, np.nan, dtype="float32")
                     for j, (_, L, col) in enumerate(segs):
                         t = pd.to_numeric(r.get(col, np.nan), errors="coerce")
                         if np.isfinite(t) and t > 0:
                             speeds[j] = L / float(t)
-                    ax2.plot(x_idx, speeds, lw=1.0, color=palette[i])
-                ax2.set_xticks(x_idx)
-                ax2.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
-                ax2.set_ylabel("Speed (m/s)")
-                ax2.set_title("Pace Curve")
-                ax2.grid(True, ls="--", alpha=0.3)
-                fig2.savefig(buf, format="png", dpi=180, bbox_inches="tight", facecolor="white")
-                plt.close(fig2)
-                pace_png = buf.getvalue()
-                st.download_button("Download pace curve (PNG)",
-                                   pace_png, file_name="pace_curve.png", mime="image/png")
+                    speed_map[name] = speeds
 
-            st.caption(f"Top-10 plotted: {rule}. Finish segment included explicitly.")
-    # ======================= /Pace Curve (lean version) =======================
+                # ---- Display transform ----
+                disp_map = {}
+                if pace_mode == "Vs Field Average":
+                    for nm, spd in speed_map.items():
+                        disp_map[nm] = spd - field_avg
+                    field_line = np.zeros_like(field_avg)
+                    ylab = "Speed vs field avg (m/s)"
+                    title_tail = "relative to field average"
+                else:
+                    disp_map = speed_map
+                    field_line = field_avg
+                    ylab = "Speed (m/s)"
+                    title_tail = "raw pace by segment"
+
+                # ---- Plot ----
+                fig, ax = plt.subplots(figsize=(10.8, 6.4))
+
+                # phase shading: early / sustain / home drive / finish
+                if show_phase_shading and nseg >= 2:
+                    bands = []
+                    if nseg >= 4:
+                        bands = [(-0.5, max(0.5, nseg-3.5), "Early"),
+                                 (max(0.5, nseg-3.5), max(1.5, nseg-1.5), "Sustain"),
+                                 (max(1.5, nseg-1.5), max(2.5, nseg-0.5), "Home drive"),
+                                 (max(2.5, nseg-0.5), nseg-0.5, "Finish")]
+                    else:
+                        bands = [(-0.5, nseg-1.5, "Race"), (nseg-1.5, nseg-0.5, "Finish")]
+                    for idx_b, (x0, x1, lab) in enumerate(bands):
+                        if x1 > x0:
+                            ax.axvspan(x0, x1, alpha=0.06 if idx_b % 2 == 0 else 0.10, color="grey")
+                            ax.text((x0+x1)/2.0, 0.98, lab, transform=ax.get_xaxis_transform(),
+                                    ha="center", va="top", fontsize=8)
+
+                # field average
+                ax.plot(x_vals, field_line, color="black", lw=2.8, marker="o", ms=4.2, label="Field average", zorder=4)
+
+                # runner lines
+                palette = color_cycle(len(picked))
+                line_end_texts = []
+                winner_name = picked_names[0] if picked_names else None
+                top4_names = set(picked_names[:min(4, len(picked_names))])
+                y_end_offsets = np.linspace(-0.18, 0.18, max(1, len(picked_names)))
+
+                for i, name in enumerate(picked_names):
+                    y = disp_map.get(name)
+                    if y is None or not np.any(np.isfinite(y)):
+                        continue
+                    is_winner = (name == winner_name)
+                    is_top4 = name in top4_names
+                    lw = 2.8 if is_winner else (2.0 if is_top4 else 1.15)
+                    alpha = 1.0 if is_winner else (0.92 if is_top4 else 0.58)
+                    ms = 4.0 if is_winner else (3.2 if is_top4 else 2.4)
+                    z = 6 if is_winner else (5 if is_top4 else 3)
+                    ax.plot(x_vals, y, color=palette[i], lw=lw, alpha=alpha,
+                            marker="o", ms=ms, label=name, zorder=z)
+
+                    # mark strongest segment
+                    finite = np.where(np.isfinite(y))[0]
+                    if len(finite):
+                        jj = finite[np.nanargmax(y[finite])]
+                        ax.scatter([x_vals[jj]], [y[jj]], color=palette[i], s=28 if is_top4 else 20,
+                                   edgecolor="black", linewidth=0.4, zorder=z+1)
+
+                    # end labels near finish side
+                    if show_end_labels and len(finite):
+                        jf = finite[-1]
+                        xt = x_vals[jf] + 0.10
+                        yt = y[jf] + float(y_end_offsets[i])
+                        txt = ax.text(xt, yt, name, fontsize=8, color=palette[i], va="center", ha="left")
+                        line_end_texts.append(txt)
+
+                if show_end_labels and line_end_texts:
+                    try:
+                        _repel_labels_builtin(ax, line_end_texts, xpad=0.02, ypad=0.012, iters=140)
+                    except Exception:
+                        pass
+
+                ax.set_xticks(x_vals)
+                ax.set_xticklabels(x_labels, rotation=0, fontsize=9)
+                ax.set_ylabel(ylab)
+                ax.set_title(f"Pace Curve — {title_tail}")
+                ax.grid(True, ls="--", alpha=0.28)
+                ax.set_xlim(-0.35, len(x_vals)-1 + (0.85 if show_end_labels else 0.25))
+
+                # cleaner legend: just field avg + winner + top placers when available
+                handles, labels = ax.get_legend_handles_labels()
+                keep_labels = ["Field average"]
+                if winner_name:
+                    keep_labels.append(winner_name)
+                keep_labels.extend([nm for nm in picked_names[1:min(4, len(picked_names))]])
+                keep = [(h, l) for h, l in zip(handles, labels) if l in keep_labels]
+                if keep:
+                    ax.legend([h for h, _ in keep], [l for _, l in keep],
+                              loc="upper center", bbox_to_anchor=(0.5, -0.14),
+                              ncol=min(4, len(keep)), frameon=False, fontsize=8)
+
+                st.pyplot(fig)
+
+                # caption / interpretation
+                try:
+                    if pace_mode == "Raw Pace (m/s)":
+                        late_slice = slice(max(0, nseg-3), nseg)
+                        early_slice = slice(0, min(2, nseg))
+                        field_early = float(np.nanmean(field_avg[early_slice]))
+                        field_late = float(np.nanmean(field_avg[late_slice]))
+                        race_shape = "quickened late" if field_late > field_early else "strong early, flatter late"
+                        winner_line = disp_map.get(winner_name, np.full(nseg, np.nan)) if winner_name else np.full(nseg, np.nan)
+                        winner_note = ""
+                        if winner_name and np.any(np.isfinite(winner_line)) and np.any(np.isfinite(field_avg)):
+                            wlate = float(np.nanmean(winner_line[late_slice]))
+                            flate = float(np.nanmean(field_avg[late_slice]))
+                            if wlate > flate:
+                                winner_note = f" {winner_name} finished above the field average late."
+                            else:
+                                winner_note = f" {winner_name} tracked the race shape rather than clearly separating late."
+                        st.caption(f"View: {runner_set}. Ranking basis: {ranking_rule}. Race shape looked {race_shape}.{winner_note}")
+                    else:
+                        st.caption(f"View: {runner_set}. Ranking basis: {ranking_rule}. Values above zero indicate segments run faster than the field average.")
+                except Exception:
+                    st.caption(f"View: {runner_set}. Ranking basis: {ranking_rule}.")
+
+                # optional png export
+                if make_png:
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format="png", dpi=220, bbox_inches="tight", facecolor="white")
+                    pace_png = buf.getvalue()
+                    st.download_button("Download pace curve (PNG)", pace_png, file_name="pace_curve.png", mime="image/png")
+                plt.close(fig)
+    # ======================= /Pace Curve (enhanced detailed version) =======================
 
 if _view_is("Advanced Models", "Full Report"):
     # ======================= Winning DNA Matrix — distance-aware & report cards =======================
