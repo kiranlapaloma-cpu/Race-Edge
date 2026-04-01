@@ -2069,17 +2069,37 @@ if _view_is("Visuals", "Full Report"):
                 # ---- Plot ----
                 fig, ax = plt.subplots(figsize=(10.8, 6.4))
 
-                # phase shading: early / sustain / home drive / finish
+                # phase shading: early / sustain / acceleration / grind
                 if show_phase_shading and nseg >= 2:
+                    seg_marks = [int(xv) for (xv, _, _) in segs]
+                    idx_600 = seg_marks.index(600) if 600 in seg_marks else None
+                    idx_200 = seg_marks.index(200) if 200 in seg_marks else None
+                    idx_fin = seg_marks.index(0) if 0 in seg_marks else (nseg - 1)
+
                     bands = []
-                    if nseg >= 4:
-                        bands = [(-0.5, max(0.5, nseg-3.5), "Early"),
-                                 (max(0.5, nseg-3.5), max(1.5, nseg-1.5), "Sustain"),
-                                 (max(1.5, nseg-1.5), max(2.5, nseg-0.5), "Home drive"),
-                                 (max(2.5, nseg-0.5), nseg-0.5, "Finish")]
-                    else:
-                        bands = [(-0.5, nseg-1.5, "Race"), (nseg-1.5, nseg-0.5, "Finish")]
+                    # Everything before the acceleration phase
+                    if idx_600 is not None and idx_600 > 0:
+                        if idx_600 >= 2:
+                            mid_cut = max(0, int(round(idx_600 * 0.55)))
+                            mid_cut = min(mid_cut, idx_600)
+                            if mid_cut > 0:
+                                bands.append((-0.5, mid_cut - 0.5, "Early"))
+                            if idx_600 - 0.5 > mid_cut - 0.5:
+                                bands.append((mid_cut - 0.5, idx_600 - 0.5, "Sustain"))
+                        else:
+                            bands.append((-0.5, idx_600 - 0.5, "Early"))
+                    elif idx_fin > 0:
+                        bands.append((-0.5, idx_fin - 0.5, "Race"))
+
+                    # User-defined pace phases
+                    if idx_600 is not None and idx_200 is not None and idx_200 >= idx_600:
+                        bands.append((idx_600 - 0.5, idx_200 + 0.5, "Acceleration"))
+                    if idx_fin is not None:
+                        bands.append((idx_fin - 0.5, idx_fin + 0.5, "Grind"))
+
                     for idx_b, (x0, x1, lab) in enumerate(bands):
+                        x0 = max(-0.5, x0)
+                        x1 = min(nseg - 0.5, x1)
                         if x1 > x0:
                             ax.axvspan(x0, x1, alpha=0.06 if idx_b % 2 == 0 else 0.10, color="grey")
                             ax.text((x0+x1)/2.0, 0.98, lab, transform=ax.get_xaxis_transform(),
@@ -3217,4 +3237,3 @@ if _view_is("Exports & Notes", "Full Report"):
                 st.write(metrics.attrs)
             except Exception:
                 pass
-
