@@ -322,15 +322,312 @@ def _view_is(*names: str) -> bool:
     except Exception:
         return False
 
+
+
+# ----------------------- RPSS helpers -----------------------
+DISTANCE_STD_100M = {
+    1000: 5.13,
+    1160: 5.28,
+    1200: 5.35,
+    1400: 5.65,
+    1450: 5.75,
+    1600: 5.90,
+    1750: 5.92,
+    1800: 5.93,
+    1900: 5.94,
+    1950: 5.95,
+    2000: 5.95,
+    2200: 6.02,
+    2400: 6.10,
+    2450: 6.12,
+    2600: 6.20,
+    2800: 6.30,
+    3000: 6.40,
+    3200: 6.50,
+}
+
+def _benchmark_std_100m(distance_m: float) -> float:
+    """Practical trip benchmark ladder anchored at 5.50s per 100m for 1000m races."""
+    knots = sorted((float(k), float(v)) for k, v in DISTANCE_STD_100M.items())
+    d = float(distance_m)
+    if d <= knots[0][0]:
+        return float(knots[0][1])
+    if d >= knots[-1][0]:
+        return float(knots[-1][1])
+    for (a, va), (b, vb) in zip(knots, knots[1:]):
+        if a <= d <= b:
+            if a == b:
+                return float(vb)
+            t = (d - a) / (b - a)
+            return float(va + (vb - va) * t)
+    return 5.70
+
+
+def _benchmark_split_time(distance_m: float, split_step: int) -> float:
+    std100 = _benchmark_std_100m(distance_m)
+    step = int(split_step)
+    if step == 100:
+        return float(std100)
+    if step == 200:
+        return float(std100 * 2.0)
+    return float(std100 * (step / 100.0))
+
+
+def _robust_center(series: pd.Series, p_lo: float = 0.10, p_hi: float = 0.90) -> float:
+    s = pd.to_numeric(series, errors="coerce")
+    s = s[np.isfinite(s)]
+    if s.empty:
+        return np.nan
+    try:
+        return float(winsorize(s, p_lo=p_lo, p_hi=p_hi).mean())
+    except Exception:
+        return float(s.median())
+
+
+def _phase_avg_split(df: pd.DataFrame, cols: list[str], prefix: str) -> pd.DataFrame:
+    vals = df[cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan) if cols else pd.DataFrame(index=df.index)
+    out = pd.DataFrame(index=df.index)
+    out[f"{prefix}_avg_split_time"] = vals.mean(axis=1, skipna=True) if cols else np.nan
+    out[f"{prefix}_valid_splits"] = vals.notna().sum(axis=1) if cols else 0
+    return out
+
+
+def compute_rpss(metrics_df: pd.DataFrame, distance_m: float, split_step: int, seg_markers: list[int]):
+    """
+    RPSS = Race Pace Strength Score.
+    Uses the tsSPI section only for the headline score, benchmarked to a distance standard.
+    Also reports race-level Acceleration and Grind phase split averages to describe shape change.
+    """
+    if metrics_df is None or len(metrics_df) == 0:
+        return None
+    step = int(split_step)
+    D = float(distance_m)
+    tssp_start = _adaptive_tssp_start(D, step, seg_markers)
+    mid_cols = [c for c in _make_range_cols(D, tssp_start, 600, step) if c in metrics_df.columns]
+    if not mid_cols:
+        return None
+
+    # Pace-shape companion windows using the app's pace-curve phase definitions.
+    if step == 100:
+        accel_cols = [c for c in ["600_Time", "500_Time", "400_Time", "300_Time"] if c in metrics_df.columns]
+        grind_cols = [c for c in ["200_Time", "Finish_Time"] if c in metrics_df.columns]
+    else:
+        accel_cols = [c for c in ["600_Time", "400_Time"] if c in metrics_df.columns]
+        grind_cols = [c for c in ["200_Time", "Finish_Time"] if c in metrics_df.columns]
+        # On 200m data the final leg usually sits in 200_Time; keep Finish_Time only if that's the last segment column.
+        if "200_Time" in grind_cols and "Finish_Time" in grind_cols:
+            grind_cols = ["200_Time"]
+
+    df = metrics_df.copy()
+    mid_stats = _phase_avg_split(df, mid_cols, "_RPSS")
+    acc_stats = _phase_avg_split(df, accel_cols, "_ACC")
+    grd_stats = _phase_avg_split(df, grind_cols, "_GRD")
+    for part in [mid_stats, acc_stats, grd_stats]:
+        for c in part.columns:
+            df[c] = part[c]
+
+    usable = df[(pd.to_numeric(df["_RPSS_avg_split_time"], errors="coerce").notna()) & (df["_RPSS_valid_splits"] > 0)].copy()
+    if usable.empty:
+        return None
+
+    benchmark_std_100m = _benchmark_std_100m(D)
+    benchmark_split_time = _benchmark_split_time(D, step)
+
+    usable["_RPSS_vs_std_pct"] = 100.0 * (benchmark_split_time / pd.to_numeric(usable["_RPSS_avg_split_time"], errors="coerce"))
+    usable["_RPSS_margin"] = benchmark_split_time - pd.to_numeric(usable["_RPSS_avg_split_time"], errors="coerce")
+
+    finish_col = "Finish_Pos" if "Finish_Pos" in usable.columns else None
+    if finish_col:
+        usable["_FinishSort"] = pd.to_numeric(usable[finish_col], errors="coerce").fillna(1e9)
+        usable = usable.sort_values(["_FinishSort", "Horse" if "Horse" in usable.columns else usable.columns[0]])
+    top_n = max(1, int(np.ceil(len(usable) / 2.0)))
+    top_half = usable.head(top_n).copy() if finish_col else usable.nsmallest(top_n, columns="_RPSS_avg_split_time")
+
+    race_avg = _robust_center(usable["_RPSS_avg_split_time"])
+    top_half_avg = _robust_center(top_half["_RPSS_avg_split_time"])
+    rpss = float(100.0 * (benchmark_split_time / race_avg)) if np.isfinite(race_avg) and race_avg > 0 else np.nan
+    top_half_rpss = float(100.0 * (benchmark_split_time / top_half_avg)) if np.isfinite(top_half_avg) and top_half_avg > 0 else np.nan
+    beaters_pct = float((pd.to_numeric(usable["_RPSS_avg_split_time"], errors="coerce") <= benchmark_split_time).mean() * 100.0)
+    top_half_beaters_pct = float((pd.to_numeric(top_half["_RPSS_avg_split_time"], errors="coerce") <= benchmark_split_time).mean() * 100.0)
+
+    accel_avg = _robust_center(usable["_ACC_avg_split_time"])
+    grind_avg = _robust_center(usable["_GRD_avg_split_time"])
+    accel_vs_std = float(100.0 * (benchmark_split_time / accel_avg)) if np.isfinite(accel_avg) and accel_avg > 0 else np.nan
+    grind_vs_std = float(100.0 * (benchmark_split_time / grind_avg)) if np.isfinite(grind_avg) and grind_avg > 0 else np.nan
+    accel_lift_pct = float((race_avg / accel_avg) * 100.0) if np.isfinite(race_avg) and np.isfinite(accel_avg) and accel_avg > 0 else np.nan
+    grind_hold_pct = float((accel_avg / grind_avg) * 100.0) if np.isfinite(accel_avg) and np.isfinite(grind_avg) and grind_avg > 0 else np.nan
+
+    if not np.isfinite(rpss):
+        verdict = "Unavailable"
+    elif rpss < 97.0:
+        verdict = "Weak sustained pace"
+    elif rpss < 98.5:
+        verdict = "Fair sustained pace"
+    elif rpss < 99.5:
+        verdict = "Slightly below strong standard"
+    elif rpss <= 100.5:
+        verdict = "Genuine / strong"
+    elif rpss <= 102.0:
+        verdict = "Very strong"
+    else:
+        verdict = "Exceptional"
+
+    out_cols = [c for c in ["Horse", "Finish_Pos"] if c in usable.columns]
+    out = usable[out_cols + ["_RPSS_avg_split_time", "_RPSS_vs_std_pct", "_RPSS_margin", "_RPSS_valid_splits"]].copy()
+    out = out.rename(columns={
+        "_RPSS_avg_split_time": "Avg tsSPI split time",
+        "_RPSS_vs_std_pct": "tsSPI vs std (%)",
+        "_RPSS_margin": "Margin vs std (s)",
+        "_RPSS_valid_splits": "tsSPI splits used",
+    })
+
+    winner_row = None
+    if "Finish_Pos" in usable.columns:
+        _fp = pd.to_numeric(usable["Finish_Pos"], errors="coerce")
+        _w = usable.loc[_fp == _fp.min()] if _fp.notna().any() else usable.iloc[:1]
+        if len(_w):
+            winner_row = _w.iloc[0]
+    elif len(usable):
+        winner_row = usable.iloc[0]
+
+    def _phase_best_name_and_vals(df, avg_col):
+        if avg_col not in df.columns or "Horse" not in df.columns:
+            return None, np.nan, np.nan
+        _vals = pd.to_numeric(df[avg_col], errors="coerce")
+        _tmp = df.loc[_vals.notna()].copy()
+        if _tmp.empty:
+            return None, np.nan, np.nan
+        _tmp[avg_col] = pd.to_numeric(_tmp[avg_col], errors="coerce")
+        _best = _tmp.loc[_tmp[avg_col].idxmin()]
+        _best_avg = float(_best[avg_col])
+        _best_vs = float(100.0 * (benchmark_split_time / _best_avg)) if np.isfinite(_best_avg) and _best_avg > 0 else np.nan
+        return _best.get("Horse"), _best_avg, _best_vs
+
+    win_tsspi = float(winner_row["_RPSS_avg_split_time"]) if winner_row is not None and pd.notna(winner_row.get("_RPSS_avg_split_time")) else np.nan
+    win_tsspi_vs = float(100.0 * (benchmark_split_time / win_tsspi)) if np.isfinite(win_tsspi) and win_tsspi > 0 else np.nan
+    win_accel = float(winner_row["_ACC_avg_split_time"]) if winner_row is not None and pd.notna(winner_row.get("_ACC_avg_split_time")) else np.nan
+    win_accel_vs = float(100.0 * (benchmark_split_time / win_accel)) if np.isfinite(win_accel) and win_accel > 0 else np.nan
+    win_grind = float(winner_row["_GRD_avg_split_time"]) if winner_row is not None and pd.notna(winner_row.get("_GRD_avg_split_time")) else np.nan
+    win_grind_vs = float(100.0 * (benchmark_split_time / win_grind)) if np.isfinite(win_grind) and win_grind > 0 else np.nan
+    winner_name = winner_row.get("Horse") if winner_row is not None and "Horse" in winner_row.index else None
+
+    best_tsspi_name, best_tsspi, best_tsspi_vs = _phase_best_name_and_vals(usable, "_RPSS_avg_split_time")
+    best_acc_name, best_acc, best_acc_vs = _phase_best_name_and_vals(usable, "_ACC_avg_split_time")
+    best_grd_name, best_grd, best_grd_vs = _phase_best_name_and_vals(usable, "_GRD_avg_split_time")
+
+    phase_table = pd.DataFrame([
+        {
+            "Phase": "tsSPI",
+            "Avg split (s)": race_avg,
+            "Vs std (%)": rpss,
+            "Change vs prior (%)": np.nan,
+            "Winner": winner_name,
+            "Winner split (s)": win_tsspi,
+            "Winner vs std (%)": win_tsspi_vs,
+            "Best horse": best_tsspi_name,
+            "Best split (s)": best_tsspi,
+            "Best vs std (%)": best_tsspi_vs,
+        },
+        {
+            "Phase": "Acceleration",
+            "Avg split (s)": accel_avg,
+            "Vs std (%)": accel_vs_std,
+            "Change vs prior (%)": accel_lift_pct,
+            "Winner": winner_name,
+            "Winner split (s)": win_accel,
+            "Winner vs std (%)": win_accel_vs,
+            "Best horse": best_acc_name,
+            "Best split (s)": best_acc,
+            "Best vs std (%)": best_acc_vs,
+        },
+        {
+            "Phase": "Grind",
+            "Avg split (s)": grind_avg,
+            "Vs std (%)": grind_vs_std,
+            "Change vs prior (%)": grind_hold_pct,
+            "Winner": winner_name,
+            "Winner split (s)": win_grind,
+            "Winner vs std (%)": win_grind_vs,
+            "Best horse": best_grd_name,
+            "Best split (s)": best_grd,
+            "Best vs std (%)": best_grd_vs,
+        },
+    ])
+
+    return {
+        "distance_m": D,
+        "split_step": step,
+        "mid_cols": mid_cols,
+        "accel_cols": accel_cols,
+        "grind_cols": grind_cols,
+        "benchmark_std_100m": benchmark_std_100m,
+        "benchmark_split_time": benchmark_split_time,
+        "race_avg_split_time": race_avg,
+        "top_half_avg_split_time": top_half_avg,
+        "accel_avg_split_time": accel_avg,
+        "grind_avg_split_time": grind_avg,
+        "accel_vs_std": accel_vs_std,
+        "grind_vs_std": grind_vs_std,
+        "accel_lift_pct": accel_lift_pct,
+        "grind_hold_pct": grind_hold_pct,
+        "rpss": rpss,
+        "top_half_rpss": top_half_rpss,
+        "beaters_pct": beaters_pct,
+        "top_half_beaters_pct": top_half_beaters_pct,
+        "verdict": verdict,
+        "phase_table": phase_table,
+        "table": out.reset_index(drop=True),
+    }
+
+
+def render_rpss_section(rpss_info: dict | None):
+    st.markdown("## Race Pace Strength Score (RPSS)")
+    st.caption("Race-level sustained pressure score using the tsSPI section only, benchmarked to a standard split time for the trip.")
+    if not rpss_info:
+        st.info("RPSS could not be calculated for this race.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("RPSS", f"{rpss_info['rpss']:.2f}" if np.isfinite(rpss_info['rpss']) else "-")
+    c2.metric("Std split", f"{rpss_info['benchmark_split_time']:.2f}s")
+    c3.metric("Race avg tsSPI", f"{rpss_info['race_avg_split_time']:.2f}s" if np.isfinite(rpss_info['race_avg_split_time']) else "-")
+    c4.metric("Beaters", f"{rpss_info['beaters_pct']:.1f}%")
+
+    st.markdown(f"**Verdict:** {rpss_info['verdict']}  ")
+    _top_half_txt = f"{rpss_info['top_half_rpss']:.2f}" if np.isfinite(rpss_info['top_half_rpss']) else "-"
+    st.caption(
+        f"Benchmark: {rpss_info['benchmark_std_100m']:.2f}s per 100m • Top-half RPSS: {_top_half_txt}"
+    )
+
+    phase_df = rpss_info.get("phase_table")
+    if phase_df is not None and len(phase_df):
+        phase_df = phase_df.copy()
+        for _col, _dp in {
+            "Avg split (s)": 3,
+            "Vs std (%)": 2,
+            "Change vs prior (%)": 2,
+            "Winner split (s)": 3,
+            "Winner vs std (%)": 2,
+            "Best split (s)": 3,
+            "Best vs std (%)": 2,
+        }.items():
+            if _col in phase_df.columns:
+                phase_df[_col] = pd.to_numeric(phase_df[_col], errors="coerce").round(_dp)
+        st.dataframe(phase_df, use_container_width=True, hide_index=True)
+
+    # Runner-level tsSPI detail table intentionally removed to keep the app lighter and faster.
+
 def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, going: str, wind_tag: str):
     st.markdown("## Dashboard")
     st.caption("Quick race snapshot — strongest overall profiles and key sectional leaders.")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Distance", f"{int(distance_m)} m")
     c2.metric("Split Step", f"{int(split_step)} m")
     c3.metric("Going", going)
     c4.metric("Wind", wind_tag if wind_tag not in (None, "", "None") else "None")
+    _rpss = metrics.attrs.get("RPSS")
+    c5.metric("RPSS", f"{float(_rpss):.2f}" if _rpss is not None and np.isfinite(float(_rpss)) else "-")
 
     pi_col = "PI_RS" if ("PI_RS" in metrics.columns and pd.to_numeric(metrics["PI_RS"], errors="coerce").notna().any()) else ("PI" if "PI" in metrics.columns else None)
     gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else ("GCI" if "GCI" in metrics.columns else None)
@@ -1359,6 +1656,15 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
+# ----------------------- RPSS (race-level tsSPI benchmark strength) -----------------------
+RPSS_INFO = compute_rpss(metrics, float(race_distance_input), int(split_step), seg_markers)
+if RPSS_INFO:
+    metrics.attrs["RPSS"] = RPSS_INFO.get("rpss")
+    metrics.attrs["RPSS_VERDICT"] = RPSS_INFO.get("verdict")
+    metrics.attrs["RPSS_BEATERS_PCT"] = RPSS_INFO.get("beaters_pct")
+    metrics.attrs["RPSS_STD_SPLIT"] = RPSS_INFO.get("benchmark_split_time")
+    metrics.attrs["RPSS_RACE_AVG_SPLIT"] = RPSS_INFO.get("race_avg_split_time")
+
 # ----------------------- Race Quality Score (RQS v2) -----------------------
 def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
     """
@@ -1669,6 +1975,8 @@ if _view_is("Core Metrics", "Full Report"):
         if moved:
             st.caption(f"Going: {g} — PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
             st.caption("RSI: + = slow-early (late favoured), − = fast-early (early favoured).  RS_Component per horse uses the same axis.  🔵 with shape · 🔴 against shape.")
+
+    render_rpss_section(RPSS_INFO)
 
     # ======================= Race Class Summary (pure stats) =======================
     st.markdown("## Race Class Summary")
