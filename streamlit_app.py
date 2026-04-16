@@ -407,16 +407,16 @@ def compute_rpss(metrics_df: pd.DataFrame, distance_m: float, split_step: int, s
     if not mid_cols:
         return None
 
-    # Pace-shape companion windows using the app's pace-curve phase definitions.
+    # Pace-shape companion windows using the user's segment-time definitions.
+    # 200m files: 400_Time = 600→400, 200_Time = 400→200, Finish_Time = 200→FIN
+    # 100m files: 400_Time = 500→400, 300_Time = 400→300, 200_Time = 300→200,
+    #             100_Time = 200→100, Finish_Time = 100→FIN
     if step == 100:
-        accel_cols = [c for c in ["600_Time", "500_Time", "400_Time", "300_Time"] if c in metrics_df.columns]
-        grind_cols = [c for c in ["200_Time", "Finish_Time"] if c in metrics_df.columns]
+        accel_cols = [c for c in ["500_Time", "400_Time", "300_Time", "200_Time"] if c in metrics_df.columns]
+        grind_cols = [c for c in ["100_Time", "Finish_Time"] if c in metrics_df.columns]
     else:
-        accel_cols = [c for c in ["600_Time", "400_Time"] if c in metrics_df.columns]
-        grind_cols = [c for c in ["200_Time", "Finish_Time"] if c in metrics_df.columns]
-        # On 200m data the final leg usually sits in 200_Time; keep Finish_Time only if that's the last segment column.
-        if "200_Time" in grind_cols and "Finish_Time" in grind_cols:
-            grind_cols = ["200_Time"]
+        accel_cols = [c for c in ["400_Time", "200_Time"] if c in metrics_df.columns]
+        grind_cols = [c for c in ["Finish_Time"] if c in metrics_df.columns]
 
     df = metrics_df.copy()
     mid_stats = _phase_avg_split(df, mid_cols, "_RPSS")
