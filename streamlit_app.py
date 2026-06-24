@@ -183,7 +183,7 @@ st.set_page_config(
 
 # ----------------------- Globals ---------------------------
 DB_DEFAULT_PATH = "race_edge.db"
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 
 # ----------------------- Small helpers ---------------------
 def as_num(x):
@@ -633,7 +633,7 @@ def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, 
     gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else ("GCI" if "GCI" in metrics.columns else None)
     gr_col = metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind")
 
-    for c in [pi_col, gci_col, "Accel", "tsSPI", gr_col, "Finish_Pos"]:
+    for c in [pi_col, gci_col, "Accel", "tsSPI", "TOF", gr_col, "Finish_Pos"]:
         if c and c not in metrics.columns:
             metrics[c] = np.nan
 
@@ -648,7 +648,7 @@ def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, 
 
     st.markdown("### Sectional leaders")
     leaders = []
-    for label, col in [("Best Accel", "Accel"), ("Best Sustain", gr_col), ("Best Travel", "tsSPI")]:
+    for label, col in [("Best Accel", "Accel"), ("Best TOF", "TOF"), ("Best Sustain", gr_col), ("Best Travel", "tsSPI"), ("Best SRI", "SRI")]:
         if col in metrics.columns:
             s = pd.to_numeric(metrics[col], errors="coerce")
             if s.notna().any():
@@ -677,7 +677,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Dashboard", "Core Metrics", "Visuals", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Dashboard", "Core Metrics", "Visuals", "Class Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -1183,6 +1183,75 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["spd_Finish"] = ((100.0 if step == 100 else 200.0) /
                        pd.to_numeric(w.get("Finish_Time"), errors="coerce")) if "Finish_Time" in w.columns else np.nan
 
+    # ----- SRI: Speed Retention Index -----
+    # Peak_Speed = fastest sectional speed
+    # Peak_Location = section where the peak happened (remaining metres marker, FIN for finish split)
+    # SRI = average speed from the peak section through the finish ÷ peak speed × 100
+    # This works for both 100m and 200m files, including odd first panels.
+    def _sri_profile(val):
+        if pd.isna(val): return "-"
+        try:
+            x = float(val)
+        except Exception:
+            return "-"
+        if x >= 96.0: return "Elite sustainer"
+        if x >= 94.0: return "Strong sustainer"
+        if x >= 92.0: return "Balanced"
+        if x >= 90.0: return "Tactical"
+        return "Peak-and-fade"
+
+    sri_segments = []  # race order: early -> finish, each as (location_label, length_m, time_col)
+    if seg_markers:
+        first_m = int(seg_markers[0])
+        first_len = max(1.0, D - first_m)
+        first_col = f"{first_m}_Time"
+        if first_col in w.columns:
+            sri_segments.append((str(first_m), float(first_len), first_col))
+        for a, b in zip(seg_markers, seg_markers[1:]):
+            col = f"{int(b)}_Time"
+            if col in w.columns:
+                sri_segments.append((str(int(b)), float(a - b), col))
+    if "Finish_Time" in w.columns:
+        sri_segments.append(("FIN", float(100.0 if step == 100 else 200.0), "Finish_Time"))
+
+    def _sri_row(r):
+        speeds, labels = [], []
+        for lab, dist_m, col in sri_segments:
+            t = pd.to_numeric(r.get(col), errors="coerce")
+            if pd.notna(t) and t > 0 and dist_m > 0:
+                speeds.append(float(dist_m) / float(t))
+                labels.append(lab)
+            else:
+                speeds.append(np.nan)
+                labels.append(lab)
+        arr = np.asarray(speeds, dtype=float)
+        if arr.size == 0 or not np.isfinite(arr).any():
+            return pd.Series({"Peak_Speed": np.nan, "Peak_Location": "-", "SRI": np.nan, "SRI_Profile": "-"})
+        peak_i = int(np.nanargmax(arr))
+        peak = float(arr[peak_i])
+        tail = arr[peak_i:]
+        tail = tail[np.isfinite(tail)]
+        if peak <= 0 or tail.size == 0:
+            sri = np.nan
+        else:
+            sri = float(np.nanmean(tail) / peak * 100.0)
+        return pd.Series({
+            "Peak_Speed": round(peak, 3),
+            "Peak_Location": labels[peak_i],
+            "SRI": round(sri, 2) if np.isfinite(sri) else np.nan,
+            "SRI_Profile": _sri_profile(sri)
+        })
+
+    if sri_segments:
+        sri_out = w.apply(_sri_row, axis=1)
+        for c in ["Peak_Speed", "Peak_Location", "SRI", "SRI_Profile"]:
+            w[c] = sri_out[c]
+    else:
+        w["Peak_Speed"] = np.nan
+        w["Peak_Location"] = "-"
+        w["SRI"] = np.nan
+        w["SRI_Profile"] = "-"
+
     # RaceTime = sum of segments (incl Finish)
     if seg_markers:
         wanted = [f"{m}_Time" for m in range(int(D)-step, step-1, -step) if f"{m}_Time" in w.columns]
@@ -1212,6 +1281,28 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["tsSPI"]    = _speed_to_idx(w["_MID_spd"])
     w["Accel"]    = _speed_to_idx(w["_ACC_spd"])
     w["Grind"]    = _speed_to_idx(w["_GR_spd"])
+
+    # ----- TOF: Turn of Foot Differential -----
+    # tsSPI and Accel both sit around 100, so division adds little signal.
+    # TOF = Accel - tsSPI isolates how much sharper the horse became in the acceleration phase
+    # compared with its sustained/travel phase.
+    w["TOF"] = (pd.to_numeric(w["Accel"], errors="coerce") -
+                pd.to_numeric(w["tsSPI"], errors="coerce")).round(2)
+
+    def _tof_profile(val):
+        if pd.isna(val): return "-"
+        try:
+            x = float(val)
+        except Exception:
+            return "-"
+        if x >= 3.0: return "Explosive turn of foot"
+        if x >= 1.5: return "Sharp accelerator"
+        if x >= 0.5: return "Tactical kick"
+        if x > -0.5: return "Balanced"
+        if x > -1.5: return "Sustainer"
+        return "Builder / grinder"
+
+    w["TOF_Profile"] = w["TOF"].map(_tof_profile)
 
     # ----- Corrected Grind (CG) -----
     ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
@@ -1924,15 +2015,16 @@ if _view_is("Dashboard", "Full Report"):
     render_dashboard(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
 
 if _view_is("Core Metrics", "Full Report"):
-    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
+    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape + SRI + TOF)")
 
 if _view_is("Core Metrics", "Full Report"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
 
     show_cols = [
         "Horse","Finish_Pos","RaceTime_s",
-        "F200_idx","tsSPI","Accel","Grind","Grind_CG",
+        "F200_idx","tsSPI","Accel","TOF","TOF_Profile","Grind","Grind_CG",
         "EARLY_idx","LATE_idx",
+        "Peak_Speed","Peak_Location","SRI","SRI_Profile",
         "GrindAdjPts","DeltaG",
         "PI","GCI","GCI_RS",
         "RSI","RS_Component","RSI_Cue"
@@ -2270,6 +2362,74 @@ if _view_is("Visuals", "Full Report"):
             st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
 
 
+    # ======================= TOF Map — Acceleration vs Travel =======================
+    st.markdown("## TOF Map — Turn of Foot vs Travel")
+    need_tof = {"Horse", "Accel", "tsSPI", "TOF"}
+    if not need_tof.issubset(metrics.columns):
+        st.info("TOF Map: Accel, tsSPI and TOF are not available for this file.")
+    else:
+        dft = metrics.loc[:, ["Horse", "Accel", "tsSPI", "TOF", "SRI", "PI"]].copy()
+        for c in ["Accel", "tsSPI", "TOF", "SRI", "PI"]:
+            dft[c] = pd.to_numeric(dft.get(c, np.nan), errors="coerce")
+        dft = dft.dropna(subset=["Accel", "tsSPI", "TOF"])
+        if dft.empty:
+            st.info("Not enough TOF data to draw the map.")
+        else:
+            fig, ax = plt.subplots(figsize=(7.8, 5.8))
+            names = dft["Horse"].astype(str).to_list()
+            x = (dft["tsSPI"] - 100.0).to_numpy()
+            y = (dft["Accel"] - 100.0).to_numpy()
+            tof_vals = dft["TOF"].to_numpy()
+            pi_vals = dft["PI"].fillna(dft["PI"].median()).to_numpy()
+            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
+            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
+            sc = ax.scatter(x, y, c=tof_vals, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6, cmap="coolwarm")
+            label_points_neatly(ax, x, y, names)
+            ax.axhline(0, color="gray", lw=1.0, ls=(0,(3,3)))
+            ax.axvline(0, color="gray", lw=1.0, ls=(0,(3,3)))
+            ax.set_xlabel("tsSPI − 100 / travel strength")
+            ax.set_ylabel("Accel − 100 / acceleration strength")
+            ax.set_title("Top-left = sharp kick; top-right = complete accelerator")
+            ax.grid(True, linestyle=":", alpha=0.25)
+            cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("TOF = Accel − tsSPI")
+            st.pyplot(fig)
+            st.caption("TOF isolates acceleration above/below the horse’s travel strength. Size=PI; colour=TOF.")
+
+    # ======================= SRI Map — Peak Speed vs Speed Retention =======================
+    st.markdown("## SRI Map — Peak Speed vs Speed Retention")
+    need_sri = {"Horse", "Peak_Speed", "SRI"}
+    if not need_sri.issubset(metrics.columns):
+        st.info("SRI Map: Peak Speed and SRI are not available for this file.")
+    else:
+        dfs = metrics.loc[:, ["Horse", "Peak_Speed", "Peak_Location", "SRI", "PI"]].copy()
+        dfs["Peak_Speed"] = pd.to_numeric(dfs["Peak_Speed"], errors="coerce")
+        dfs["SRI"] = pd.to_numeric(dfs["SRI"], errors="coerce")
+        dfs["PI"] = pd.to_numeric(dfs.get("PI", np.nan), errors="coerce")
+        dfs = dfs.dropna(subset=["Peak_Speed", "SRI"])
+        if dfs.empty:
+            st.info("Not enough SRI data to draw the map.")
+        else:
+            fig, ax = plt.subplots(figsize=(7.8, 5.8))
+            names = dfs["Horse"].astype(str).to_list()
+            x = dfs["Peak_Speed"].to_numpy()
+            y = dfs["SRI"].to_numpy()
+            pi_vals = dfs["PI"].fillna(dfs["PI"].median()).to_numpy()
+            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
+            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
+            ax.scatter(x, y, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6)
+            label_points_neatly(ax, x, y, names)
+            ax.axhline(96, color="gray", lw=1.0, ls=(0,(3,3)))
+            ax.axhline(94, color="gray", lw=0.8, ls=":")
+            ax.axhline(92, color="gray", lw=0.8, ls=":")
+            ax.set_xlabel("Peak speed (m/s)")
+            ax.set_ylabel("SRI — speed retained after peak (%)")
+            ax.set_title("Top-right = high peak speed + high retention")
+            ax.grid(True, linestyle=":", alpha=0.25)
+            st.pyplot(fig)
+            st.caption("SRI = average speed from the horse’s peak sectional through the finish ÷ peak speed × 100. Size=PI.")
+
+
     # ======================= Pace Curve — enhanced detailed version =======================
     st.markdown("## Pace Curve")
 
@@ -2543,6 +2703,211 @@ if _view_is("Visuals", "Full Report"):
                     st.download_button("Download pace curve (PNG)", pace_png, file_name="pace_curve.png", mime="image/png")
                 plt.close(fig)
     # ======================= /Pace Curve (enhanced detailed version) =======================
+
+
+# ======================= Class Plane Analysis — Experimental =======================
+if _view_is("Class Plane Analysis", "Full Report"):
+    st.markdown("## Class Plane Analysis")
+    st.caption(
+        "Experimental module. It fits a race-specific plane using tsSPI and Accel to estimate expected Grind, "
+        "then ranks horses by how far above or below that plane they finished."
+    )
+
+    req = {"Horse", "tsSPI", "Accel", "Grind"}
+    if not req.issubset(metrics.columns):
+        st.warning("Class Plane Analysis needs Horse, tsSPI, Accel and Grind columns.")
+    else:
+        cpa1, cpa2, cpa3 = st.columns([1.1, 1.0, 1.0])
+        with cpa1:
+            grind_options = ["Grind"]
+            if "Grind_CG" in metrics.columns:
+                grind_options.append("Grind_CG")
+            plane_grind_col = st.selectbox(
+                "Grind target",
+                grind_options,
+                index=0,
+                help="Use raw Grind by default. Grind_CG is available if you want the plane to use corrected grind."
+            )
+        with cpa2:
+            centre_values = st.toggle(
+                "Use centred values",
+                value=True,
+                help="Recommended. Fits tsSPI−100, Accel−100 and Grind−100 for cleaner coefficients."
+            )
+        with cpa3:
+            show_3d_plane = st.toggle("Show 3D plane", value=True)
+
+        plane_df = metrics.loc[:, ["Horse", "tsSPI", "Accel", plane_grind_col]].copy()
+        extra_cols = [c for c in ["TOF", "PI", "SRI", "Peak_Location", "Finish_Pos"] if c in metrics.columns]
+        for c in extra_cols:
+            plane_df[c] = metrics[c]
+
+        for c in ["tsSPI", "Accel", plane_grind_col, "TOF", "PI", "SRI", "Finish_Pos"]:
+            if c in plane_df.columns:
+                plane_df[c] = pd.to_numeric(plane_df[c], errors="coerce")
+
+        plane_df = plane_df.dropna(subset=["tsSPI", "Accel", plane_grind_col]).reset_index(drop=True)
+
+        if len(plane_df) < 4:
+            st.info("Need at least 4 runners with tsSPI, Accel and Grind to fit a stable plane.")
+        else:
+            if centre_values:
+                x = (plane_df["tsSPI"] - 100.0).to_numpy(dtype=float)
+                y = (plane_df["Accel"] - 100.0).to_numpy(dtype=float)
+                z = (plane_df[plane_grind_col] - 100.0).to_numpy(dtype=float)
+                x_label = "tsSPI − 100"
+                y_label = "Accel − 100"
+                z_label = f"{plane_grind_col} − 100"
+                formula_target = f"{plane_grind_col}Δ"
+            else:
+                x = plane_df["tsSPI"].to_numpy(dtype=float)
+                y = plane_df["Accel"].to_numpy(dtype=float)
+                z = plane_df[plane_grind_col].to_numpy(dtype=float)
+                x_label = "tsSPI"
+                y_label = "Accel"
+                z_label = plane_grind_col
+                formula_target = plane_grind_col
+
+            Xmat = np.column_stack([np.ones(len(plane_df)), x, y])
+            coef, residuals, rank, singular_vals = np.linalg.lstsq(Xmat, z, rcond=None)
+            intercept, b_tsspi, c_accel = [float(v) for v in coef]
+            expected_z = Xmat @ coef
+
+            if centre_values:
+                plane_df["Expected_Grind"] = 100.0 + expected_z
+                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+            else:
+                plane_df["Expected_Grind"] = expected_z
+                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+
+            z_mean = float(np.nanmean(z))
+            ss_res = float(np.nansum((z - expected_z) ** 2))
+            ss_tot = float(np.nansum((z - z_mean) ** 2))
+            r2 = np.nan if ss_tot <= 1e-12 else 1.0 - ss_res / ss_tot
+
+            def _cr_profile(v):
+                try:
+                    v = float(v)
+                except Exception:
+                    return "-"
+                if v >= 3.0:
+                    return "🔥 Major above-plane"
+                if v >= 1.5:
+                    return "🟢 Above expectation"
+                if v > -1.5:
+                    return "⚪ Around expectation"
+                if v > -3.0:
+                    return "🟠 Below expectation"
+                return "🔴 Emptied / weak sustain"
+
+            plane_df["CR_Profile"] = plane_df["Class_Residual"].map(_cr_profile)
+            plane_df["Expected_Grind"] = plane_df["Expected_Grind"].round(2)
+            plane_df["Class_Residual"] = plane_df["Class_Residual"].round(2)
+
+            st.markdown("### Plane formula")
+            st.code(
+                f"{formula_target} = {intercept:.3f} + ({b_tsspi:.3f} × {x_label}) + ({c_accel:.3f} × {y_label})",
+                language="text"
+            )
+            st.caption(
+                f"R² = {r2:.3f} · runners used = {len(plane_df)} · rank = {rank}. "
+                "Class Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
+            )
+            if rank < 3:
+                st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
+
+            st.markdown("### Class Residual ranking")
+            out_cols = ["Horse", "Finish_Pos", "tsSPI", "Accel", plane_grind_col, "Expected_Grind", "Class_Residual", "CR_Profile"]
+            out_cols += [c for c in ["TOF", "SRI", "Peak_Location", "PI"] if c in plane_df.columns and c not in out_cols]
+            rank_df = plane_df.sort_values("Class_Residual", ascending=False).reset_index(drop=True)
+            st.dataframe(rank_df[out_cols], use_container_width=True, hide_index=True)
+
+            csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Class Plane table (CSV)",
+                data=csv,
+                file_name="class_plane_analysis.csv",
+                mime="text/csv"
+            )
+
+            st.markdown("### TOF vs Class Residual")
+            if "TOF" not in plane_df.columns:
+                st.info("TOF is not available, so the TOF vs CR map cannot be drawn.")
+            else:
+                d2 = plane_df.dropna(subset=["TOF", "Class_Residual"]).copy()
+                if d2.empty:
+                    st.info("Not enough TOF/CR data to draw the map.")
+                else:
+                    fig, ax = plt.subplots(figsize=(8.2, 5.8))
+                    xv = d2["TOF"].to_numpy(dtype=float)
+                    yv = d2["Class_Residual"].to_numpy(dtype=float)
+                    pi_vals = pd.to_numeric(d2.get("PI", pd.Series(np.nan, index=d2.index)), errors="coerce")
+                    if pi_vals.notna().any() and float(pi_vals.max()) != float(pi_vals.min()):
+                        sizes = 50.0 + (pi_vals.fillna(pi_vals.median()).to_numpy() - float(pi_vals.min())) / (float(pi_vals.max()) - float(pi_vals.min()) + 1e-9) * 120.0
+                    else:
+                        sizes = np.full(len(d2), 80.0)
+                    cv = yv
+                    vmax = float(np.nanmax(np.abs(cv))) if np.isfinite(cv).any() else 1.0
+                    vmax = max(vmax, 1.0)
+                    sc = ax.scatter(xv, yv, c=cv, s=sizes, cmap="coolwarm", vmin=-vmax, vmax=vmax,
+                                    alpha=0.92, edgecolor="black", linewidth=0.6)
+                    label_points_neatly(ax, xv, yv, d2["Horse"].astype(str).to_list())
+                    ax.axhline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
+                    ax.axvline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
+                    ax.set_xlabel("TOF = Accel − tsSPI")
+                    ax.set_ylabel("Class Residual")
+                    ax.set_title("Top-right = turn of foot + above-plane sustain")
+                    ax.grid(True, linestyle=":", alpha=0.25)
+                    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                    cbar.set_label("Class Residual")
+                    st.pyplot(fig)
+                    st.caption("High TOF + high CR = acceleration weapon that still sustained better than expected.")
+
+            if show_3d_plane:
+                st.markdown("### 3D Class Plane")
+                try:
+                    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+                    fig = plt.figure(figsize=(8.8, 6.6))
+                    ax = fig.add_subplot(111, projection="3d")
+
+                    cr_vals = plane_df["Class_Residual"].to_numpy(dtype=float)
+                    vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
+                    vmax = max(vmax, 1.0)
+                    sc = ax.scatter(x, y, z, c=cr_vals, cmap="coolwarm", vmin=-vmax, vmax=vmax,
+                                    s=55, edgecolor="black", linewidth=0.5, depthshade=True)
+
+                    for xi, yi, zi, name in zip(x, y, z, plane_df["Horse"].astype(str)):
+                        ax.text(xi, yi, zi, name, fontsize=7)
+
+                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 15)
+                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 15)
+                    Xg, Yg = np.meshgrid(x_grid, y_grid)
+                    Zg = intercept + b_tsspi * Xg + c_accel * Yg
+                    ax.plot_surface(Xg, Yg, Zg, alpha=0.22, linewidth=0, antialiased=True)
+
+                    ax.set_xlabel(x_label)
+                    ax.set_ylabel(y_label)
+                    ax.set_zlabel(z_label)
+                    ax.set_title("Race-specific class plane")
+                    cbar = fig.colorbar(sc, ax=ax, shrink=0.65, pad=0.08)
+                    cbar.set_label("Class Residual")
+                    st.pyplot(fig)
+                    st.caption("Points above the plane sustained better than expected after their travel and acceleration effort.")
+                except Exception as e:
+                    st.info(f"3D plane could not be rendered: {e}")
+
+            with st.expander("How to read this module"):
+                st.markdown(
+                    """
+- **Plane:** the race-specific expected relationship between travel strength, acceleration strength and grind.
+- **Expected Grind:** what the model predicts a horse should have produced from its tsSPI and Accel.
+- **Class Residual:** actual Grind minus expected Grind.
+- **Positive CR:** the horse sustained better than expected.
+- **Negative CR:** the horse did less late than its travel/acceleration profile suggested.
+
+This is experimental. In small fields or unusual race shapes, use it as a guide rather than a final rating.
+                    """
+                )
 
 if _view_is("Advanced Models", "Full Report"):
     # ======================= Winning DNA Matrix — distance-aware & report cards =======================
