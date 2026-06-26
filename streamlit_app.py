@@ -677,7 +677,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Dashboard", "Core Metrics", "Visuals", "Class Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Dashboard", "Core Metrics", "Visuals", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -2705,17 +2705,17 @@ if _view_is("Visuals", "Full Report"):
     # ======================= /Pace Curve (enhanced detailed version) =======================
 
 
-# ======================= Class Plane Analysis — Experimental =======================
-if _view_is("Class Plane Analysis", "Full Report"):
-    st.markdown("## Class Plane Analysis")
+# ======================= Race Plane Analysis — Experimental =======================
+if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
+    st.markdown("## Race Plane Analysis")
     st.caption(
-        "Experimental module. It fits a race-specific plane using tsSPI and Accel to estimate expected Grind, "
-        "then ranks horses by how far above or below that plane they finished."
+        "Experimental module. The Race Plane Formula describes what this race rewarded from tsSPI and Accel, "
+        "then the residual ranks horses by how far above or below that race expectation they sustained."
     )
 
     req = {"Horse", "tsSPI", "Accel", "Grind"}
     if not req.issubset(metrics.columns):
-        st.warning("Class Plane Analysis needs Horse, tsSPI, Accel and Grind columns.")
+        st.warning("Race Plane Analysis needs Horse, tsSPI, Accel and Grind columns.")
     else:
         cpa1, cpa2, cpa3 = st.columns([1.1, 1.0, 1.0])
         with cpa1:
@@ -2804,7 +2804,40 @@ if _view_is("Class Plane Analysis", "Full Report"):
             plane_df["Expected_Grind"] = plane_df["Expected_Grind"].round(2)
             plane_df["Class_Residual"] = plane_df["Class_Residual"].round(2)
 
-            st.markdown("### Plane formula")
+            # --- Race DNA: relative contribution of each race-plane input ---
+            denom = abs(b_tsspi) + abs(c_accel)
+            if denom > 1e-12:
+                travel_share = abs(b_tsspi) / denom
+                accel_share = abs(c_accel) / denom
+            else:
+                travel_share = np.nan
+                accel_share = np.nan
+
+            residual_std = float(np.nanstd(plane_df["Class_Residual"].to_numpy(dtype=float), ddof=1)) if len(plane_df) > 1 else np.nan
+            residual_range = float(np.nanmax(plane_df["Class_Residual"]) - np.nanmin(plane_df["Class_Residual"])) if len(plane_df) else np.nan
+
+            def _influence_label(coef, name):
+                sign = "positive" if coef > 0 else "negative" if coef < 0 else "neutral"
+                return f"{name} {sign}"
+
+            def _race_identity(r2_val, travel_sh, accel_sh, b_coef, c_coef):
+                if not np.isfinite(r2_val):
+                    return "Unclear race plane"
+                if r2_val < 0.30:
+                    return "Low-explainability / hidden-quality race"
+                if np.isfinite(accel_sh) and accel_sh >= 0.70 and c_coef > 0:
+                    return "Acceleration-dominated race"
+                if np.isfinite(travel_sh) and travel_sh >= 0.70 and b_coef > 0:
+                    return "Travel-dominated race"
+                if b_coef > 0 and c_coef > 0:
+                    return "Balanced travel + acceleration race"
+                if c_coef > 0 and b_coef <= 0:
+                    return "Acceleration-led / travel not rewarded"
+                return "Mixed race plane"
+
+            race_identity = _race_identity(r2, travel_share, accel_share, b_tsspi, c_accel)
+
+            st.markdown("### Race Plane Formula")
             st.code(
                 f"{formula_target} = {intercept:.3f} + ({b_tsspi:.3f} × {x_label}) + ({c_accel:.3f} × {y_label})",
                 language="text"
@@ -2812,6 +2845,19 @@ if _view_is("Class Plane Analysis", "Full Report"):
             st.caption(
                 f"R² = {r2:.3f} · runners used = {len(plane_df)} · rank = {rank}. "
                 "Class Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
+            )
+
+            st.markdown("### Race DNA")
+            dna_cols = st.columns(4)
+            dna_cols[0].metric("Travel influence", "-" if not np.isfinite(travel_share) else f"{travel_share*100:.0f}%", f"coef {b_tsspi:+.2f}")
+            dna_cols[1].metric("Acceleration influence", "-" if not np.isfinite(accel_share) else f"{accel_share*100:.0f}%", f"coef {c_accel:+.2f}")
+            dna_cols[2].metric("Explainability", "-" if not np.isfinite(r2) else f"{r2*100:.0f}%", "R²")
+            dna_cols[3].metric("Residual spread", "-" if not np.isfinite(residual_std) else f"{residual_std:.2f}", "std dev")
+
+            st.info(
+                f"**Race identity:** {race_identity}. "
+                f"Travel coefficient is {b_tsspi:+.3f}; Accel coefficient is {c_accel:+.3f}. "
+                "The percentages use absolute coefficient size, while the sign tells whether that influence was positive or negative."
             )
             if rank < 3:
                 st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
@@ -2824,13 +2870,13 @@ if _view_is("Class Plane Analysis", "Full Report"):
 
             csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
             st.download_button(
-                "Download Class Plane table (CSV)",
+                "Download Race Plane table (CSV)",
                 data=csv,
-                file_name="class_plane_analysis.csv",
+                file_name="race_plane_analysis.csv",
                 mime="text/csv"
             )
 
-            st.markdown("### TOF vs Class Residual")
+            st.markdown("### TOF vs Race Residual")
             if "TOF" not in plane_df.columns:
                 st.info("TOF is not available, so the TOF vs CR map cannot be drawn.")
             else:
@@ -2864,7 +2910,7 @@ if _view_is("Class Plane Analysis", "Full Report"):
                     st.caption("High TOF + high CR = acceleration weapon that still sustained better than expected.")
 
             if show_3d_plane:
-                st.markdown("### 3D Class Plane")
+                st.markdown("### 3D Race Plane")
                 try:
                     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
                     fig = plt.figure(figsize=(8.8, 6.6))
@@ -2888,22 +2934,24 @@ if _view_is("Class Plane Analysis", "Full Report"):
                     ax.set_xlabel(x_label)
                     ax.set_ylabel(y_label)
                     ax.set_zlabel(z_label)
-                    ax.set_title("Race-specific class plane")
+                    ax.set_title("Race-specific race plane")
                     cbar = fig.colorbar(sc, ax=ax, shrink=0.65, pad=0.08)
                     cbar.set_label("Class Residual")
                     st.pyplot(fig)
-                    st.caption("Points above the plane sustained better than expected after their travel and acceleration effort.")
+                    st.caption("Points above the race plane sustained better than expected after their travel and acceleration effort.")
                 except Exception as e:
                     st.info(f"3D plane could not be rendered: {e}")
 
             with st.expander("How to read this module"):
                 st.markdown(
                     """
-- **Plane:** the race-specific expected relationship between travel strength, acceleration strength and grind.
+- **Race Plane Formula:** the race-specific expected relationship between travel strength, acceleration strength and grind.
 - **Expected Grind:** what the model predicts a horse should have produced from its tsSPI and Accel.
 - **Class Residual:** actual Grind minus expected Grind.
 - **Positive CR:** the horse sustained better than expected.
 - **Negative CR:** the horse did less late than its travel/acceleration profile suggested.
+
+- **Race DNA:** relative contribution of tsSPI and Accel to the formula, plus R² explainability and residual spread.
 
 This is experimental. In small fields or unusual race shapes, use it as a guide rather than a final rating.
                     """
