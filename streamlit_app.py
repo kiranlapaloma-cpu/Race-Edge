@@ -670,6 +670,219 @@ def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, 
         bullets.append(f"RPS: **{float(rps):.1f}/100**")
     st.markdown("\n".join([f"- {b}" for b in bullets]))
 
+
+# ----------------------- UX summary / simplified metric helpers -----------------------
+def _metric_col(metrics: pd.DataFrame, candidates, default=None):
+    for c in candidates:
+        if c in metrics.columns and pd.to_numeric(metrics[c], errors="coerce").notna().any():
+            return c
+    return default
+
+def _best_row(metrics: pd.DataFrame, col: str, highest=True):
+    if col not in metrics.columns or "Horse" not in metrics.columns:
+        return None
+    s = pd.to_numeric(metrics[col], errors="coerce")
+    if not s.notna().any():
+        return None
+    idx = s.idxmax() if highest else s.idxmin()
+    return metrics.loc[idx]
+
+def _fmt_metric(v, dp=2):
+    try:
+        v=float(v)
+        return f"{v:.{dp}f}" if np.isfinite(v) else "-"
+    except Exception:
+        return "-"
+
+def _horse_profile(row, gr_col="Grind"):
+    vals = {}
+    for c in ["tsSPI", "Accel", gr_col, "SRI", "TOF"]:
+        try: vals[c] = float(row.get(c, np.nan))
+        except Exception: vals[c] = np.nan
+    strong = []
+    if np.isfinite(vals.get("tsSPI", np.nan)) and vals["tsSPI"] >= 100.6: strong.append("travels")
+    if np.isfinite(vals.get("Accel", np.nan)) and vals["Accel"] >= 100.8: strong.append("accelerates")
+    if np.isfinite(vals.get(gr_col, np.nan)) and vals[gr_col] >= 100.8: strong.append("grinds")
+    if np.isfinite(vals.get("SRI", np.nan)) and vals["SRI"] >= 96: strong.append("retains")
+    tof = vals.get("TOF", np.nan)
+    if len(strong) >= 3:
+        return "Complete profile"
+    if np.isfinite(tof) and tof >= 1.5:
+        return "Turn-of-foot horse"
+    if "grinds" in strong and "retains" in strong:
+        return "Sustainer / stayer"
+    if "travels" in strong and "accelerates" in strong:
+        return "Tactical traveller"
+    if "grinds" in strong:
+        return "Late grinder"
+    if "accelerates" in strong:
+        return "Sharp accelerator"
+    if "travels" in strong:
+        return "Good traveller"
+    return "Balanced / ordinary"
+
+def _main_strength(row, gr_col="Grind"):
+    items = []
+    mapping = [("F200_idx","F200"),("tsSPI","Travel"),("Accel","Accel"),(gr_col,"Grind"),("SRI","Retention"),("TOF","TOF")]
+    for col, label in mapping:
+        try:
+            v = float(row.get(col, np.nan))
+            if np.isfinite(v):
+                # For TOF, zero is average; for SRI, higher is better but scale differs.
+                score = v if col not in ("TOF",) else 100 + v
+                items.append((score, label, v))
+        except Exception:
+            pass
+    if not items: return "-"
+    items.sort(reverse=True, key=lambda x: x[0])
+    return items[0][1]
+
+def render_race_summary(metrics: pd.DataFrame, split_step: int, distance_m: float, going: str, wind_tag: str):
+    st.markdown("## Race Summary")
+    st.caption("Fast read first. Detailed evidence is kept in the specialist modules.")
+    pi_col = _metric_col(metrics, ["PI_RS", "PI"], "PI")
+    gr_col = metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind")
+    shape = metrics.attrs.get("SHAPE_TAG", metrics.attrs.get("RACE_PROFILE", "Unknown"))
+    finish_flav = metrics.attrs.get("FINISH_FLAV", "Balanced Finish")
+    rqs = metrics.attrs.get("RQS", np.nan)
+    rps = metrics.attrs.get("RPS", np.nan)
+    # winners/leaders
+    best_pi = _best_row(metrics, pi_col) if pi_col else None
+    best_acc = _best_row(metrics, "Accel")
+    best_travel = _best_row(metrics, "tsSPI")
+    best_grind = _best_row(metrics, gr_col)
+    best_sri = _best_row(metrics, "SRI")
+    best_tof = _best_row(metrics, "TOF")
+    # phase winner if available
+    phase_cols = {"F200":"F200_PI_pts", "Travel":"tsSPI_PI_pts", "Accel":"Accel_PI_pts", "Grind":"Grind_PI_pts"}
+    phase_winner = "Not available"
+    spreads = {}
+    for lab, col in phase_cols.items():
+        if col in metrics.columns:
+            x = pd.to_numeric(metrics[col], errors="coerce")
+            if x.notna().sum() >= 2: spreads[lab] = float(x.std())
+    if spreads:
+        phase_winner = max(spreads, key=spreads.get)
+    # hidden upgrade if Race Plane ran
+    upgrade_txt = "Run Race Plane"
+    if "Class_Residual" in metrics.columns:
+        cr = pd.to_numeric(metrics["Class_Residual"], errors="coerce")
+        if cr.notna().any():
+            tmp = metrics.copy(); tmp["_cr"] = cr
+            tmp["_fin"] = pd.to_numeric(tmp.get("Finish_Pos"), errors="coerce")
+            candidates = tmp[tmp["_fin"].fillna(99) > 2] if "Finish_Pos" in tmp.columns else tmp
+            if len(candidates) and candidates["_cr"].notna().any():
+                r = candidates.loc[candidates["_cr"].idxmax()]
+                upgrade_txt = f"{r['Horse']} ({r['_cr']:+.2f})"
+    verdict_bits = []
+    if best_pi is not None: verdict_bits.append(f"**Best overall:** {best_pi['Horse']} ({pi_col} {_fmt_metric(best_pi.get(pi_col))})")
+    if phase_winner != "Not available": verdict_bits.append(f"**Winning phase:** {phase_winner}")
+    verdict_bits.append(f"**Shape:** {shape}; **Finish:** {finish_flav}")
+    st.markdown("  ".join(verdict_bits))
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Race shape", str(shape))
+    c2.metric("Winning phase", phase_winner)
+    c3.metric("Race quality", f"{float(rqs):.1f}/100" if np.isfinite(float(rqs)) else "-")
+    c4.metric("Peak performance", f"{float(rps):.1f}/100" if np.isfinite(float(rps)) else "-")
+    c5,c6,c7,c8 = st.columns(4)
+    c5.metric("Best overall", best_pi["Horse"] if best_pi is not None else "-")
+    c6.metric("Best accelerator", best_acc["Horse"] if best_acc is not None else "-")
+    c7.metric("Best grinder", best_grind["Horse"] if best_grind is not None else "-")
+    c8.metric("Hidden upgrade", upgrade_txt)
+    st.markdown("### Sectional leaders")
+    leaders=[]
+    for award, row, col in [
+        ("Best overall", best_pi, pi_col), ("Best traveller", best_travel, "tsSPI"),
+        ("Best accelerator", best_acc, "Accel"), ("Best grinder", best_grind, gr_col),
+        ("Best retainer", best_sri, "SRI"), ("Best turn of foot", best_tof, "TOF")]:
+        if row is not None and col:
+            leaders.append({"Award": award, "Horse": row.get("Horse"), "Metric": col, "Score": _fmt_metric(row.get(col))})
+    if leaders: st.dataframe(pd.DataFrame(leaders), use_container_width=True, hide_index=True)
+    with st.expander("Advanced race statistics", expanded=False):
+        render_rpss_section(metrics.attrs.get("RPSS_INFO"))
+        st.write({"RQS": metrics.attrs.get("RQS"), "RPS": metrics.attrs.get("RPS"), "RSI": metrics.attrs.get("RSI"), "SCI": metrics.attrs.get("SCI")})
+
+def render_core_metrics_clean(metrics: pd.DataFrame):
+    st.markdown("## Core Metrics")
+    st.caption("Plain-English horse ability summary. Full detailed table is still available below.")
+    gr_col = metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind")
+    pi_col = _metric_col(metrics, ["PI_RS", "PI"], "PI")
+    st.markdown("""
+**Metric key:** tsSPI = how well it travelled • Accel = how strongly it quickened • Grind = how well it sustained late • SRI = speed retention • TOF = quickening relative to travel • PI = overall sectional performance.
+""")
+    awards=[]
+    for award, col in [("Best Overall", pi_col), ("Best Traveller", "tsSPI"), ("Best Accelerator", "Accel"), ("Best Grinder", gr_col), ("Best Retainer", "SRI"), ("Best Turn of Foot", "TOF")]:
+        if col and col in metrics.columns:
+            r=_best_row(metrics, col)
+            if r is not None:
+                awards.append({"Award": award, "Horse": r.get("Horse"), "Metric": col, "Score": _fmt_metric(r.get(col))})
+    if awards:
+        st.markdown("### Race leaders")
+        st.dataframe(pd.DataFrame(awards), use_container_width=True, hide_index=True)
+    st.markdown("### Horse profiles")
+    rows=[]
+    tmp=metrics.copy()
+    tmp["_pi"] = pd.to_numeric(tmp.get(pi_col, np.nan), errors="coerce") if pi_col else np.nan
+    tmp["_fin"] = pd.to_numeric(tmp.get("Finish_Pos", np.nan), errors="coerce")
+    tmp=tmp.sort_values(["_pi","_fin"], ascending=[False, True])
+    for _, r in tmp.iterrows():
+        rows.append({
+            "Horse": r.get("Horse"),
+            "Finish": r.get("Finish_Pos", "-"),
+            "PI": _fmt_metric(r.get(pi_col)) if pi_col else "-",
+            "Main Strength": _main_strength(r, gr_col),
+            "Profile": _horse_profile(r, gr_col),
+            "tsSPI": _fmt_metric(r.get("tsSPI")),
+            "Accel": _fmt_metric(r.get("Accel")),
+            "Grind": _fmt_metric(r.get(gr_col)),
+            "SRI": _fmt_metric(r.get("SRI")),
+            "TOF": _fmt_metric(r.get("TOF")),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    with st.expander("Advanced metrics — full table", expanded=False):
+        show_cols = ["Horse","Finish_Pos","RaceTime_s","F200_idx","tsSPI","Accel","TOF","TOF_Profile","Grind","Grind_CG","EARLY_idx","LATE_idx","Peak_Speed","Peak_Location","SRI","SRI_Profile","GrindAdjPts","DeltaG","PI","GCI","GCI_RS","RSI","RS_Component","RSI_Cue"]
+        tmp2 = metrics.copy()
+        for c in show_cols:
+            if c not in tmp2.columns: tmp2[c]=np.nan
+        display_df = tmp2[show_cols].copy()
+        display_df = display_df.assign(_FinishSort=pd.to_numeric(display_df["Finish_Pos"], errors="coerce").fillna(1e9)).sort_values(["PI","_FinishSort"], ascending=[False, True]).drop(columns=["_FinishSort"])
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+def render_phase_pi(metrics: pd.DataFrame):
+    st.markdown("## Phase PI Analysis")
+    st.caption("Shows how each horse built its PI and which phase separated the field. Phase values use the same PI component weights, shown as raw PI contribution points.")
+    phase_cols = [("F200", "F200_PI_pts"), ("Travel", "tsSPI_PI_pts"), ("Accel", "Accel_PI_pts"), ("Grind", "Grind_PI_pts")]
+    missing=[c for _,c in phase_cols if c not in metrics.columns]
+    if missing:
+        st.warning("Phase PI component columns were not found. Rebuild metrics with this updated app file.")
+        return
+    rows=[]
+    for lab, col in phase_cols:
+        s=pd.to_numeric(metrics[col], errors="coerce")
+        rows.append({"Phase": lab, "Avg contribution": round(float(s.mean()),3) if s.notna().any() else np.nan, "Spread": round(float(s.std()),3) if s.notna().sum()>=2 else np.nan})
+    race_phase=pd.DataFrame(rows)
+    if race_phase["Spread"].notna().any():
+        win_phase = race_phase.loc[race_phase["Spread"].idxmax(), "Phase"]
+    else:
+        win_phase = "-"
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Race winning phase", win_phase)
+    for i,(lab,col) in enumerate(phase_cols[:3], start=2):
+        s=pd.to_numeric(metrics[col], errors="coerce")
+        [c2,c3,c4][i-2].metric(f"{lab} avg", _fmt_metric(s.mean(),3))
+    st.markdown("### Race phase separation")
+    st.dataframe(race_phase, use_container_width=True, hide_index=True)
+    st.bar_chart(race_phase.set_index("Phase")[["Spread"]])
+    st.markdown("### Horse phase breakdown")
+    view_cols=["Horse","Finish_Pos","F200_PI_pts","tsSPI_PI_pts","Accel_PI_pts","Grind_PI_pts","PI","Phase_MainWeapon"]
+    tmp=metrics.copy()
+    if "Phase_MainWeapon" not in tmp.columns:
+        tmp["Phase_MainWeapon"] = tmp.apply(lambda r: max([(abs(float(r.get(c,0) or 0)), lab) for lab,c in phase_cols], key=lambda x:x[0])[1], axis=1)
+    for c in view_cols:
+        if c not in tmp.columns: tmp[c]=np.nan
+    view=tmp[view_cols].copy().sort_values("PI", ascending=False)
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
 # ----------------------- Sidebar ---------------------------
 with st.sidebar:
     st.markdown(f"### Race Edge v{APP_VERSION}")
@@ -677,7 +890,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Dashboard", "Core Metrics", "Visuals", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Race Summary", "Core Metrics", "Phase PI", "Race Plane Analysis", "Pace Curves", "Advanced Models", "Deep Tables", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -872,7 +1085,7 @@ st.markdown(f"**Detected split step:** {split_step} m")
 if alias_notes and SHOW_WARNINGS:
     st.info("Header aliases applied: " + "; ".join(alias_notes))
 
-if _view_is("Dashboard", "Exports & Notes", "Full Report"):
+if _view_is("Race Summary", "Dashboard", "Exports & Notes", "Full Report"):
     with st.expander("File preview", expanded=_view_is("Exports & Notes")):
         c1, c2, c3 = st.columns(3)
         c1.metric("Rows", len(work))
@@ -1523,6 +1736,28 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     sigma = mad_std(centered)
     sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else sigma
     w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
+
+    # ----- Phase PI contribution points -----
+    # Uses exactly the same PI component inputs and distance/going weights as PI_pts.
+    # These are raw contribution points before field-centering/scaling; their sum plus mass adjustment forms PI_pts.
+    for _col in ["F200_idx", "tsSPI", "Accel", GR_COL]:
+        if _col not in w.columns:
+            w[_col] = np.nan
+    w["F200_PI_pts"] = PI_W["F200_idx"] * (pd.to_numeric(w["F200_idx"], errors="coerce") - 100.0)
+    w["tsSPI_PI_pts"] = PI_W["tsSPI"] * (pd.to_numeric(w["tsSPI"], errors="coerce") - 100.0)
+    w["Accel_PI_pts"] = PI_W["Accel"] * (pd.to_numeric(w["Accel"], errors="coerce") - 100.0)
+    w["Grind_PI_pts"] = PI_W["Grind"] * (pd.to_numeric(w[GR_COL], errors="coerce") - 100.0)
+    _phase_cols = ["F200_PI_pts", "tsSPI_PI_pts", "Accel_PI_pts", "Grind_PI_pts"]
+    def _phase_weapon(r):
+        vals = []
+        for lab, col in [("F200","F200_PI_pts"),("Travel","tsSPI_PI_pts"),("Accel","Accel_PI_pts"),("Grind","Grind_PI_pts")]:
+            try:
+                v = float(r.get(col, np.nan))
+                if np.isfinite(v): vals.append((abs(v), lab))
+            except Exception:
+                pass
+        return max(vals, key=lambda x: x[0])[1] if vals else "-"
+    w["Phase_MainWeapon"] = w.apply(_phase_weapon, axis=1)
 # ---------- /Mass-aware PI points ----------
 
     # ----- GCI (time + shape + efficiency) -----
@@ -1934,6 +2169,10 @@ _profile_label, _profile_color = classify_race_profile(
 )
 metrics.attrs["RACE_PROFILE"] = _profile_label
 metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
+try:
+    metrics.attrs["RPSS_INFO"] = RPSS_INFO
+except Exception:
+    pass
 
 # ======================= Data Integrity & Header (post compute) ==========================
 def _expected_segments(distance_m: float, step:int) -> list[str]:
@@ -1977,7 +2216,10 @@ if rps_v is not None:
 metrics.attrs["WIND_AFFECTED"] = bool(WIND_AFFECTED)
 metrics.attrs["WIND_TAG"] = str(WIND_TAG)
 
-st.markdown(_hdr)
+if _view_is("Full Report"):
+    st.markdown(_hdr)
+else:
+    st.caption(f"Race: {int(race_distance_input)}m • {split_step}m splits • Shape {metrics.attrs.get('SHAPE_TAG','EVEN')} • RSI {metrics.attrs.get('RSI',0.0):+.2f}")
 
 # Badge + short legend line
 render_profile_badge(
@@ -2011,13 +2253,16 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
 if split_step == 200:
     st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
 
-if _view_is("Dashboard", "Full Report"):
-    render_dashboard(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
+if _view_is("Race Summary", "Dashboard", "Full Report"):
+    render_race_summary(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
 
 if _view_is("Core Metrics", "Full Report"):
-    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape + SRI + TOF)")
+    render_core_metrics_clean(metrics.copy())
 
-if _view_is("Core Metrics", "Full Report"):
+if _view_is("Phase PI", "Full Report"):
+    render_phase_pi(metrics.copy())
+
+if _view_is("Deep Tables", "Full Report"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
 
     show_cols = [
@@ -2293,7 +2538,7 @@ if _view_is("Core Metrics", "Full Report"):
         except Exception:
             _repel_labels_builtin(ax, x, y, names)
 
-if _view_is("Visuals", "Full Report"):
+if _view_is("Pace Curves", "Visuals", "Full Report"):
     # ======================= Visual 1: Sectional Shape Map =======================
     st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
     shape_map_png = None
