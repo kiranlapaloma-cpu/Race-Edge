@@ -670,219 +670,6 @@ def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, 
         bullets.append(f"RPS: **{float(rps):.1f}/100**")
     st.markdown("\n".join([f"- {b}" for b in bullets]))
 
-
-# ----------------------- UX summary / simplified metric helpers -----------------------
-def _metric_col(metrics: pd.DataFrame, candidates, default=None):
-    for c in candidates:
-        if c in metrics.columns and pd.to_numeric(metrics[c], errors="coerce").notna().any():
-            return c
-    return default
-
-def _best_row(metrics: pd.DataFrame, col: str, highest=True):
-    if col not in metrics.columns or "Horse" not in metrics.columns:
-        return None
-    s = pd.to_numeric(metrics[col], errors="coerce")
-    if not s.notna().any():
-        return None
-    idx = s.idxmax() if highest else s.idxmin()
-    return metrics.loc[idx]
-
-def _fmt_metric(v, dp=2):
-    try:
-        v=float(v)
-        return f"{v:.{dp}f}" if np.isfinite(v) else "-"
-    except Exception:
-        return "-"
-
-def _horse_profile(row, gr_col="Grind"):
-    vals = {}
-    for c in ["tsSPI", "Accel", gr_col, "SRI", "TOF"]:
-        try: vals[c] = float(row.get(c, np.nan))
-        except Exception: vals[c] = np.nan
-    strong = []
-    if np.isfinite(vals.get("tsSPI", np.nan)) and vals["tsSPI"] >= 100.6: strong.append("travels")
-    if np.isfinite(vals.get("Accel", np.nan)) and vals["Accel"] >= 100.8: strong.append("accelerates")
-    if np.isfinite(vals.get(gr_col, np.nan)) and vals[gr_col] >= 100.8: strong.append("grinds")
-    if np.isfinite(vals.get("SRI", np.nan)) and vals["SRI"] >= 96: strong.append("retains")
-    tof = vals.get("TOF", np.nan)
-    if len(strong) >= 3:
-        return "Complete profile"
-    if np.isfinite(tof) and tof >= 1.5:
-        return "Turn-of-foot horse"
-    if "grinds" in strong and "retains" in strong:
-        return "Sustainer / stayer"
-    if "travels" in strong and "accelerates" in strong:
-        return "Tactical traveller"
-    if "grinds" in strong:
-        return "Late grinder"
-    if "accelerates" in strong:
-        return "Sharp accelerator"
-    if "travels" in strong:
-        return "Good traveller"
-    return "Balanced / ordinary"
-
-def _main_strength(row, gr_col="Grind"):
-    items = []
-    mapping = [("F200_idx","F200"),("tsSPI","Travel"),("Accel","Accel"),(gr_col,"Grind"),("SRI","Retention"),("TOF","TOF")]
-    for col, label in mapping:
-        try:
-            v = float(row.get(col, np.nan))
-            if np.isfinite(v):
-                # For TOF, zero is average; for SRI, higher is better but scale differs.
-                score = v if col not in ("TOF",) else 100 + v
-                items.append((score, label, v))
-        except Exception:
-            pass
-    if not items: return "-"
-    items.sort(reverse=True, key=lambda x: x[0])
-    return items[0][1]
-
-def render_race_summary(metrics: pd.DataFrame, split_step: int, distance_m: float, going: str, wind_tag: str):
-    st.markdown("## Race Summary")
-    st.caption("Fast read first. Detailed evidence is kept in the specialist modules.")
-    pi_col = _metric_col(metrics, ["PI_RS", "PI"], "PI")
-    gr_col = metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind")
-    shape = metrics.attrs.get("SHAPE_TAG", metrics.attrs.get("RACE_PROFILE", "Unknown"))
-    finish_flav = metrics.attrs.get("FINISH_FLAV", "Balanced Finish")
-    rqs = metrics.attrs.get("RQS", np.nan)
-    rps = metrics.attrs.get("RPS", np.nan)
-    # winners/leaders
-    best_pi = _best_row(metrics, pi_col) if pi_col else None
-    best_acc = _best_row(metrics, "Accel")
-    best_travel = _best_row(metrics, "tsSPI")
-    best_grind = _best_row(metrics, gr_col)
-    best_sri = _best_row(metrics, "SRI")
-    best_tof = _best_row(metrics, "TOF")
-    # phase winner if available
-    phase_cols = {"F200":"F200_PI_pts", "Travel":"tsSPI_PI_pts", "Accel":"Accel_PI_pts", "Grind":"Grind_PI_pts"}
-    phase_winner = "Not available"
-    spreads = {}
-    for lab, col in phase_cols.items():
-        if col in metrics.columns:
-            x = pd.to_numeric(metrics[col], errors="coerce")
-            if x.notna().sum() >= 2: spreads[lab] = float(x.std())
-    if spreads:
-        phase_winner = max(spreads, key=spreads.get)
-    # hidden upgrade if Race Plane ran
-    upgrade_txt = "Run Race Plane"
-    if "Class_Residual" in metrics.columns:
-        cr = pd.to_numeric(metrics["Class_Residual"], errors="coerce")
-        if cr.notna().any():
-            tmp = metrics.copy(); tmp["_cr"] = cr
-            tmp["_fin"] = pd.to_numeric(tmp.get("Finish_Pos"), errors="coerce")
-            candidates = tmp[tmp["_fin"].fillna(99) > 2] if "Finish_Pos" in tmp.columns else tmp
-            if len(candidates) and candidates["_cr"].notna().any():
-                r = candidates.loc[candidates["_cr"].idxmax()]
-                upgrade_txt = f"{r['Horse']} ({r['_cr']:+.2f})"
-    verdict_bits = []
-    if best_pi is not None: verdict_bits.append(f"**Best overall:** {best_pi['Horse']} ({pi_col} {_fmt_metric(best_pi.get(pi_col))})")
-    if phase_winner != "Not available": verdict_bits.append(f"**Winning phase:** {phase_winner}")
-    verdict_bits.append(f"**Shape:** {shape}; **Finish:** {finish_flav}")
-    st.markdown("  ".join(verdict_bits))
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Race shape", str(shape))
-    c2.metric("Winning phase", phase_winner)
-    c3.metric("Race quality", f"{float(rqs):.1f}/100" if np.isfinite(float(rqs)) else "-")
-    c4.metric("Peak performance", f"{float(rps):.1f}/100" if np.isfinite(float(rps)) else "-")
-    c5,c6,c7,c8 = st.columns(4)
-    c5.metric("Best overall", best_pi["Horse"] if best_pi is not None else "-")
-    c6.metric("Best accelerator", best_acc["Horse"] if best_acc is not None else "-")
-    c7.metric("Best grinder", best_grind["Horse"] if best_grind is not None else "-")
-    c8.metric("Hidden upgrade", upgrade_txt)
-    st.markdown("### Sectional leaders")
-    leaders=[]
-    for award, row, col in [
-        ("Best overall", best_pi, pi_col), ("Best traveller", best_travel, "tsSPI"),
-        ("Best accelerator", best_acc, "Accel"), ("Best grinder", best_grind, gr_col),
-        ("Best retainer", best_sri, "SRI"), ("Best turn of foot", best_tof, "TOF")]:
-        if row is not None and col:
-            leaders.append({"Award": award, "Horse": row.get("Horse"), "Metric": col, "Score": _fmt_metric(row.get(col))})
-    if leaders: st.dataframe(pd.DataFrame(leaders), use_container_width=True, hide_index=True)
-    with st.expander("Advanced race statistics", expanded=False):
-        render_rpss_section(metrics.attrs.get("RPSS_INFO"))
-        st.write({"RQS": metrics.attrs.get("RQS"), "RPS": metrics.attrs.get("RPS"), "RSI": metrics.attrs.get("RSI"), "SCI": metrics.attrs.get("SCI")})
-
-def render_core_metrics_clean(metrics: pd.DataFrame):
-    st.markdown("## Core Metrics")
-    st.caption("Plain-English horse ability summary. Full detailed table is still available below.")
-    gr_col = metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind")
-    pi_col = _metric_col(metrics, ["PI_RS", "PI"], "PI")
-    st.markdown("""
-**Metric key:** tsSPI = how well it travelled • Accel = how strongly it quickened • Grind = how well it sustained late • SRI = speed retention • TOF = quickening relative to travel • PI = overall sectional performance.
-""")
-    awards=[]
-    for award, col in [("Best Overall", pi_col), ("Best Traveller", "tsSPI"), ("Best Accelerator", "Accel"), ("Best Grinder", gr_col), ("Best Retainer", "SRI"), ("Best Turn of Foot", "TOF")]:
-        if col and col in metrics.columns:
-            r=_best_row(metrics, col)
-            if r is not None:
-                awards.append({"Award": award, "Horse": r.get("Horse"), "Metric": col, "Score": _fmt_metric(r.get(col))})
-    if awards:
-        st.markdown("### Race leaders")
-        st.dataframe(pd.DataFrame(awards), use_container_width=True, hide_index=True)
-    st.markdown("### Horse profiles")
-    rows=[]
-    tmp=metrics.copy()
-    tmp["_pi"] = pd.to_numeric(tmp.get(pi_col, np.nan), errors="coerce") if pi_col else np.nan
-    tmp["_fin"] = pd.to_numeric(tmp.get("Finish_Pos", np.nan), errors="coerce")
-    tmp=tmp.sort_values(["_pi","_fin"], ascending=[False, True])
-    for _, r in tmp.iterrows():
-        rows.append({
-            "Horse": r.get("Horse"),
-            "Finish": r.get("Finish_Pos", "-"),
-            "PI": _fmt_metric(r.get(pi_col)) if pi_col else "-",
-            "Main Strength": _main_strength(r, gr_col),
-            "Profile": _horse_profile(r, gr_col),
-            "tsSPI": _fmt_metric(r.get("tsSPI")),
-            "Accel": _fmt_metric(r.get("Accel")),
-            "Grind": _fmt_metric(r.get(gr_col)),
-            "SRI": _fmt_metric(r.get("SRI")),
-            "TOF": _fmt_metric(r.get("TOF")),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    with st.expander("Advanced metrics — full table", expanded=False):
-        show_cols = ["Horse","Finish_Pos","RaceTime_s","F200_idx","tsSPI","Accel","TOF","TOF_Profile","Grind","Grind_CG","EARLY_idx","LATE_idx","Peak_Speed","Peak_Location","SRI","SRI_Profile","GrindAdjPts","DeltaG","PI","GCI","GCI_RS","RSI","RS_Component","RSI_Cue"]
-        tmp2 = metrics.copy()
-        for c in show_cols:
-            if c not in tmp2.columns: tmp2[c]=np.nan
-        display_df = tmp2[show_cols].copy()
-        display_df = display_df.assign(_FinishSort=pd.to_numeric(display_df["Finish_Pos"], errors="coerce").fillna(1e9)).sort_values(["PI","_FinishSort"], ascending=[False, True]).drop(columns=["_FinishSort"])
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-def render_phase_pi(metrics: pd.DataFrame):
-    st.markdown("## Phase PI Analysis")
-    st.caption("Shows how each horse built its PI and which phase separated the field. Phase values use the same PI component weights, shown as raw PI contribution points.")
-    phase_cols = [("F200", "F200_PI_pts"), ("Travel", "tsSPI_PI_pts"), ("Accel", "Accel_PI_pts"), ("Grind", "Grind_PI_pts")]
-    missing=[c for _,c in phase_cols if c not in metrics.columns]
-    if missing:
-        st.warning("Phase PI component columns were not found. Rebuild metrics with this updated app file.")
-        return
-    rows=[]
-    for lab, col in phase_cols:
-        s=pd.to_numeric(metrics[col], errors="coerce")
-        rows.append({"Phase": lab, "Avg contribution": round(float(s.mean()),3) if s.notna().any() else np.nan, "Spread": round(float(s.std()),3) if s.notna().sum()>=2 else np.nan})
-    race_phase=pd.DataFrame(rows)
-    if race_phase["Spread"].notna().any():
-        win_phase = race_phase.loc[race_phase["Spread"].idxmax(), "Phase"]
-    else:
-        win_phase = "-"
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Race winning phase", win_phase)
-    for i,(lab,col) in enumerate(phase_cols[:3], start=2):
-        s=pd.to_numeric(metrics[col], errors="coerce")
-        [c2,c3,c4][i-2].metric(f"{lab} avg", _fmt_metric(s.mean(),3))
-    st.markdown("### Race phase separation")
-    st.dataframe(race_phase, use_container_width=True, hide_index=True)
-    st.bar_chart(race_phase.set_index("Phase")[["Spread"]])
-    st.markdown("### Horse phase breakdown")
-    view_cols=["Horse","Finish_Pos","F200_PI_pts","tsSPI_PI_pts","Accel_PI_pts","Grind_PI_pts","PI","Phase_MainWeapon"]
-    tmp=metrics.copy()
-    if "Phase_MainWeapon" not in tmp.columns:
-        tmp["Phase_MainWeapon"] = tmp.apply(lambda r: max([(abs(float(r.get(c,0) or 0)), lab) for lab,c in phase_cols], key=lambda x:x[0])[1], axis=1)
-    for c in view_cols:
-        if c not in tmp.columns: tmp[c]=np.nan
-    view=tmp[view_cols].copy().sort_values("PI", ascending=False)
-    st.dataframe(view, use_container_width=True, hide_index=True)
-
 # ----------------------- Sidebar ---------------------------
 with st.sidebar:
     st.markdown(f"### Race Edge v{APP_VERSION}")
@@ -890,7 +677,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Race Summary", "Core Metrics", "Phase PI", "Race Plane Analysis", "Pace Curves", "Advanced Models", "Deep Tables", "Exports & Notes", "Full Report"],
+        ["Dashboard", "Core Metrics", "Visuals", "Phase PI Analysis", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -1085,7 +872,7 @@ st.markdown(f"**Detected split step:** {split_step} m")
 if alias_notes and SHOW_WARNINGS:
     st.info("Header aliases applied: " + "; ".join(alias_notes))
 
-if _view_is("Race Summary", "Dashboard", "Exports & Notes", "Full Report"):
+if _view_is("Dashboard", "Exports & Notes", "Full Report"):
     with st.expander("File preview", expanded=_view_is("Exports & Notes")):
         c1, c2, c3 = st.columns(3)
         c1.metric("Rows", len(work))
@@ -1737,27 +1524,52 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else sigma
     w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
 
-    # ----- Phase PI contribution points -----
-    # Uses exactly the same PI component inputs and distance/going weights as PI_pts.
-    # These are raw contribution points before field-centering/scaling; their sum plus mass adjustment forms PI_pts.
-    for _col in ["F200_idx", "tsSPI", "Accel", GR_COL]:
-        if _col not in w.columns:
-            w[_col] = np.nan
-    w["F200_PI_pts"] = PI_W["F200_idx"] * (pd.to_numeric(w["F200_idx"], errors="coerce") - 100.0)
-    w["tsSPI_PI_pts"] = PI_W["tsSPI"] * (pd.to_numeric(w["tsSPI"], errors="coerce") - 100.0)
-    w["Accel_PI_pts"] = PI_W["Accel"] * (pd.to_numeric(w["Accel"], errors="coerce") - 100.0)
-    w["Grind_PI_pts"] = PI_W["Grind"] * (pd.to_numeric(w[GR_COL], errors="coerce") - 100.0)
-    _phase_cols = ["F200_PI_pts", "tsSPI_PI_pts", "Accel_PI_pts", "Grind_PI_pts"]
-    def _phase_weapon(r):
-        vals = []
-        for lab, col in [("F200","F200_PI_pts"),("Travel","tsSPI_PI_pts"),("Accel","Accel_PI_pts"),("Grind","Grind_PI_pts")]:
-            try:
-                v = float(r.get(col, np.nan))
-                if np.isfinite(v): vals.append((abs(v), lab))
-            except Exception:
-                pass
-        return max(vals, key=lambda x: x[0])[1] if vals else "-"
-    w["Phase_MainWeapon"] = w.apply(_phase_weapon, axis=1)
+    # ----- Phase PI decomposition -----
+    # Uses the exact same PI primitives, weights, field centre and scaling as PI.
+    # These are additive contributions to the final PI scale, not separate new ratings.
+    # Rebuild check: PI ≈ clip(PI_Base + F200_PIc + tsSPI_PIc + Accel_PIc + Grind_PIc + Mass_PIc, 0, 10)
+    total_pi_w = sum(PI_W.values()) or 1.0
+    pi_scale = 2.2 / (sigma if (np.isfinite(sigma) and sigma > 0) else 1.0)
+    pi_intercept = 5.0 - (2.2 * med / (sigma if (np.isfinite(sigma) and sigma > 0) else 1.0))
+
+    def _phase_component(series, weight):
+        vals = pd.to_numeric(series, errors="coerce")
+        raw = (weight * (vals - 100.0)) / total_pi_w
+        return pi_scale * raw
+
+    w["PI_Base"] = round(float(pi_intercept), 4) if np.isfinite(pi_intercept) else np.nan
+    w["F200_PIc"] = _phase_component(w.get("F200_idx"), PI_W.get("F200_idx", 0.0)).round(3)
+    w["tsSPI_PIc"] = _phase_component(w.get("tsSPI"), PI_W.get("tsSPI", 0.0)).round(3)
+    w["Accel_PIc"] = _phase_component(w.get("Accel"), PI_W.get("Accel", 0.0)).round(3)
+    w["Grind_PIc"] = _phase_component(w.get(GR_COL), PI_W.get("Grind", 0.0)).round(3)
+    try:
+        w["Mass_PIc"] = (pi_scale * (-PER_KG_PTS * mass_delta)).round(3)
+    except Exception:
+        w["Mass_PIc"] = 0.0
+
+    phase_cols_calc = ["F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc"]
+    w["PI_Phase_Total"] = (
+        pd.to_numeric(w["PI_Base"], errors="coerce")
+        + w[phase_cols_calc].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+        + pd.to_numeric(w.get("Mass_PIc", 0.0), errors="coerce").fillna(0)
+    ).clip(0.0, 10.0).round(2)
+
+    def _main_phase_from_row(r):
+        vals = {
+            "F200": r.get("F200_PIc"),
+            "tsSPI": r.get("tsSPI_PIc"),
+            "Accel": r.get("Accel_PIc"),
+            "Grind": r.get("Grind_PIc"),
+        }
+        vals = {k: float(v) for k, v in vals.items() if pd.notna(v) and np.isfinite(float(v))}
+        if not vals:
+            return "-"
+        return max(vals, key=vals.get)
+
+    w["Main_PI_Phase"] = w.apply(_main_phase_from_row, axis=1)
+    w.attrs["PI_PHASE_WEIGHTS"] = PI_W.copy()
+    w.attrs["PI_PHASE_SCALE"] = float(pi_scale) if np.isfinite(pi_scale) else np.nan
+    w.attrs["PI_PHASE_BASE"] = float(pi_intercept) if np.isfinite(pi_intercept) else np.nan
 # ---------- /Mass-aware PI points ----------
 
     # ----- GCI (time + shape + efficiency) -----
@@ -2169,10 +1981,6 @@ _profile_label, _profile_color = classify_race_profile(
 )
 metrics.attrs["RACE_PROFILE"] = _profile_label
 metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
-try:
-    metrics.attrs["RPSS_INFO"] = RPSS_INFO
-except Exception:
-    pass
 
 # ======================= Data Integrity & Header (post compute) ==========================
 def _expected_segments(distance_m: float, step:int) -> list[str]:
@@ -2216,10 +2024,7 @@ if rps_v is not None:
 metrics.attrs["WIND_AFFECTED"] = bool(WIND_AFFECTED)
 metrics.attrs["WIND_TAG"] = str(WIND_TAG)
 
-if _view_is("Full Report"):
-    st.markdown(_hdr)
-else:
-    st.caption(f"Race: {int(race_distance_input)}m • {split_step}m splits • Shape {metrics.attrs.get('SHAPE_TAG','EVEN')} • RSI {metrics.attrs.get('RSI',0.0):+.2f}")
+st.markdown(_hdr)
 
 # Badge + short legend line
 render_profile_badge(
@@ -2253,16 +2058,13 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
 if split_step == 200:
     st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
 
-if _view_is("Race Summary", "Dashboard", "Full Report"):
-    render_race_summary(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
+if _view_is("Dashboard", "Full Report"):
+    render_dashboard(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
 
 if _view_is("Core Metrics", "Full Report"):
-    render_core_metrics_clean(metrics.copy())
+    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape + SRI + TOF)")
 
-if _view_is("Phase PI", "Full Report"):
-    render_phase_pi(metrics.copy())
-
-if _view_is("Deep Tables", "Full Report"):
+if _view_is("Core Metrics", "Full Report"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
 
     show_cols = [
@@ -2538,143 +2340,7 @@ if _view_is("Deep Tables", "Full Report"):
         except Exception:
             _repel_labels_builtin(ax, x, y, names)
 
-if _view_is("Pace Curves", "Visuals", "Full Report"):
-    # ======================= Visual 1: Sectional Shape Map =======================
-    st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
-    shape_map_png = None
-    GR_COL = metrics.attrs.get("GR_COL","Grind")
-
-    need_cols={"Horse","Accel",GR_COL,"tsSPI","PI"}
-    if not need_cols.issubset(metrics.columns):
-        st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
-    else:
-        dfm = metrics.loc[:, ["Horse","Accel",GR_COL,"tsSPI","PI"]].copy()
-        for c in ["Accel",GR_COL,"tsSPI","PI"]:
-            dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
-        dfm = dfm.dropna(subset=["Accel",GR_COL,"tsSPI"])
-        if dfm.empty:
-            st.info("Not enough data to draw the shape map.")
-        else:
-            dfm["AccelΔ"]=dfm["Accel"]-100.0
-            dfm["GrindΔ"]=dfm[GR_COL]-100.0
-            dfm["tsSPIΔ"]=dfm["tsSPI"]-100.0
-            names=dfm["Horse"].astype(str).to_list()
-            xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy()
-            cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI"].fillna(0).to_numpy()
-
-            span=max(4.5,float(np.nanmax(np.abs(np.concatenate([xv,yv])))))
-            lim=np.ceil(span/1.5)*1.5
-
-            DOT_MIN, DOT_MAX = 40.0, 140.0
-            pmin,pmax=np.nanmin(piv),np.nanmax(piv)
-            sizes=np.full_like(xv,DOT_MIN) if not np.isfinite(pmin) or not np.isfinite(pmax) \
-                   else DOT_MIN+(piv-pmin)/(pmax-pmin+1e-9)*(DOT_MAX-DOT_MIN)
-
-            fig, ax = plt.subplots(figsize=(7.8,6.2))
-            # quadrant tint (stronger alpha)
-            TINT=0.12
-            ax.add_patch(Rectangle((0,0),lim,lim,facecolor="#4daf4a",alpha=TINT,zorder=0))
-            ax.add_patch(Rectangle((-lim,0),lim,lim,facecolor="#377eb8",alpha=TINT,zorder=0))
-            ax.add_patch(Rectangle((0,-lim),lim,lim,facecolor="#ff7f00",alpha=TINT,zorder=0))
-            ax.add_patch(Rectangle((-lim,-lim),lim,lim,facecolor="#984ea3",alpha=TINT,zorder=0))
-            ax.axvline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
-            ax.axhline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
-
-            vmin,vmax=np.nanmin(cv),np.nanmax(cv)
-            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin==vmax:
-                vmin,vmax=-1.0,1.0
-            norm=TwoSlopeNorm(vcenter=0.0,vmin=vmin,vmax=vmax)
-
-            sc=ax.scatter(xv,yv,s=sizes,c=cv,cmap="coolwarm",norm=norm,
-                          edgecolor="black",linewidth=0.6,alpha=0.95)
-            label_points_neatly(ax,xv,yv,names)
-
-            ax.set_xlim(-lim,lim); ax.set_ylim(-lim,lim)
-            ax.set_xlabel("Acceleration vs field (points) →")
-            ax.set_ylabel(("Corrected " if USE_CG else "")+"Grind vs field (points) ↑")
-            ax.set_title("Quadrants: +X=Accel  · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
-            s_ex=[DOT_MIN,0.5*(DOT_MIN+DOT_MAX),DOT_MAX]
-            h_ex=[Line2D([0],[0],marker='o',color='w',markerfacecolor='gray',
-                         markersize=np.sqrt(s/np.pi),markeredgecolor='black') for s in s_ex]
-            ax.legend(h_ex,["PI low","PI mid","PI high"],loc="upper left",frameon=False,fontsize=8)
-            cbar=fig.colorbar(sc,ax=ax,fraction=0.046,pad=0.04); cbar.set_label("tsSPI − 100")
-            ax.grid(True,linestyle=":",alpha=0.25)
-            st.pyplot(fig)
-            buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=300,bbox_inches="tight")
-            shape_map_png=buf.getvalue()
-            if _view_is("Exports & Notes", "Full Report"):
-                st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
-            st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
-
-
-    # ======================= TOF Map — Acceleration vs Travel =======================
-    st.markdown("## TOF Map — Turn of Foot vs Travel")
-    need_tof = {"Horse", "Accel", "tsSPI", "TOF"}
-    if not need_tof.issubset(metrics.columns):
-        st.info("TOF Map: Accel, tsSPI and TOF are not available for this file.")
-    else:
-        dft = metrics.loc[:, ["Horse", "Accel", "tsSPI", "TOF", "SRI", "PI"]].copy()
-        for c in ["Accel", "tsSPI", "TOF", "SRI", "PI"]:
-            dft[c] = pd.to_numeric(dft.get(c, np.nan), errors="coerce")
-        dft = dft.dropna(subset=["Accel", "tsSPI", "TOF"])
-        if dft.empty:
-            st.info("Not enough TOF data to draw the map.")
-        else:
-            fig, ax = plt.subplots(figsize=(7.8, 5.8))
-            names = dft["Horse"].astype(str).to_list()
-            x = (dft["tsSPI"] - 100.0).to_numpy()
-            y = (dft["Accel"] - 100.0).to_numpy()
-            tof_vals = dft["TOF"].to_numpy()
-            pi_vals = dft["PI"].fillna(dft["PI"].median()).to_numpy()
-            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
-            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
-            sc = ax.scatter(x, y, c=tof_vals, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6, cmap="coolwarm")
-            label_points_neatly(ax, x, y, names)
-            ax.axhline(0, color="gray", lw=1.0, ls=(0,(3,3)))
-            ax.axvline(0, color="gray", lw=1.0, ls=(0,(3,3)))
-            ax.set_xlabel("tsSPI − 100 / travel strength")
-            ax.set_ylabel("Accel − 100 / acceleration strength")
-            ax.set_title("Top-left = sharp kick; top-right = complete accelerator")
-            ax.grid(True, linestyle=":", alpha=0.25)
-            cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label("TOF = Accel − tsSPI")
-            st.pyplot(fig)
-            st.caption("TOF isolates acceleration above/below the horse’s travel strength. Size=PI; colour=TOF.")
-
-    # ======================= SRI Map — Peak Speed vs Speed Retention =======================
-    st.markdown("## SRI Map — Peak Speed vs Speed Retention")
-    need_sri = {"Horse", "Peak_Speed", "SRI"}
-    if not need_sri.issubset(metrics.columns):
-        st.info("SRI Map: Peak Speed and SRI are not available for this file.")
-    else:
-        dfs = metrics.loc[:, ["Horse", "Peak_Speed", "Peak_Location", "SRI", "PI"]].copy()
-        dfs["Peak_Speed"] = pd.to_numeric(dfs["Peak_Speed"], errors="coerce")
-        dfs["SRI"] = pd.to_numeric(dfs["SRI"], errors="coerce")
-        dfs["PI"] = pd.to_numeric(dfs.get("PI", np.nan), errors="coerce")
-        dfs = dfs.dropna(subset=["Peak_Speed", "SRI"])
-        if dfs.empty:
-            st.info("Not enough SRI data to draw the map.")
-        else:
-            fig, ax = plt.subplots(figsize=(7.8, 5.8))
-            names = dfs["Horse"].astype(str).to_list()
-            x = dfs["Peak_Speed"].to_numpy()
-            y = dfs["SRI"].to_numpy()
-            pi_vals = dfs["PI"].fillna(dfs["PI"].median()).to_numpy()
-            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
-            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
-            ax.scatter(x, y, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6)
-            label_points_neatly(ax, x, y, names)
-            ax.axhline(96, color="gray", lw=1.0, ls=(0,(3,3)))
-            ax.axhline(94, color="gray", lw=0.8, ls=":")
-            ax.axhline(92, color="gray", lw=0.8, ls=":")
-            ax.set_xlabel("Peak speed (m/s)")
-            ax.set_ylabel("SRI — speed retained after peak (%)")
-            ax.set_title("Top-right = high peak speed + high retention")
-            ax.grid(True, linestyle=":", alpha=0.25)
-            st.pyplot(fig)
-            st.caption("SRI = average speed from the horse’s peak sectional through the finish ÷ peak speed × 100. Size=PI.")
-
-
+if _view_is("Visuals", "Full Report"):
     # ======================= Pace Curve — enhanced detailed version =======================
     st.markdown("## Pace Curve")
 
@@ -2949,6 +2615,304 @@ if _view_is("Pace Curves", "Visuals", "Full Report"):
                 plt.close(fig)
     # ======================= /Pace Curve (enhanced detailed version) =======================
 
+
+
+
+    # ======================= Visual 1: Sectional Shape Map =======================
+    st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
+    shape_map_png = None
+    GR_COL = metrics.attrs.get("GR_COL","Grind")
+
+    need_cols={"Horse","Accel",GR_COL,"tsSPI","PI"}
+    if not need_cols.issubset(metrics.columns):
+        st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
+    else:
+        dfm = metrics.loc[:, ["Horse","Accel",GR_COL,"tsSPI","PI"]].copy()
+        for c in ["Accel",GR_COL,"tsSPI","PI"]:
+            dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
+        dfm = dfm.dropna(subset=["Accel",GR_COL,"tsSPI"])
+        if dfm.empty:
+            st.info("Not enough data to draw the shape map.")
+        else:
+            dfm["AccelΔ"]=dfm["Accel"]-100.0
+            dfm["GrindΔ"]=dfm[GR_COL]-100.0
+            dfm["tsSPIΔ"]=dfm["tsSPI"]-100.0
+            names=dfm["Horse"].astype(str).to_list()
+            xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy()
+            cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI"].fillna(0).to_numpy()
+
+            span=max(4.5,float(np.nanmax(np.abs(np.concatenate([xv,yv])))))
+            lim=np.ceil(span/1.5)*1.5
+
+            DOT_MIN, DOT_MAX = 40.0, 140.0
+            pmin,pmax=np.nanmin(piv),np.nanmax(piv)
+            sizes=np.full_like(xv,DOT_MIN) if not np.isfinite(pmin) or not np.isfinite(pmax) \
+                   else DOT_MIN+(piv-pmin)/(pmax-pmin+1e-9)*(DOT_MAX-DOT_MIN)
+
+            fig, ax = plt.subplots(figsize=(7.8,6.2))
+            # quadrant tint (stronger alpha)
+            TINT=0.12
+            ax.add_patch(Rectangle((0,0),lim,lim,facecolor="#4daf4a",alpha=TINT,zorder=0))
+            ax.add_patch(Rectangle((-lim,0),lim,lim,facecolor="#377eb8",alpha=TINT,zorder=0))
+            ax.add_patch(Rectangle((0,-lim),lim,lim,facecolor="#ff7f00",alpha=TINT,zorder=0))
+            ax.add_patch(Rectangle((-lim,-lim),lim,lim,facecolor="#984ea3",alpha=TINT,zorder=0))
+            ax.axvline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
+            ax.axhline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
+
+            vmin,vmax=np.nanmin(cv),np.nanmax(cv)
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin==vmax:
+                vmin,vmax=-1.0,1.0
+            norm=TwoSlopeNorm(vcenter=0.0,vmin=vmin,vmax=vmax)
+
+            sc=ax.scatter(xv,yv,s=sizes,c=cv,cmap="coolwarm",norm=norm,
+                          edgecolor="black",linewidth=0.6,alpha=0.95)
+            label_points_neatly(ax,xv,yv,names)
+
+            ax.set_xlim(-lim,lim); ax.set_ylim(-lim,lim)
+            ax.set_xlabel("Acceleration vs field (points) →")
+            ax.set_ylabel(("Corrected " if USE_CG else "")+"Grind vs field (points) ↑")
+            ax.set_title("Quadrants: +X=Accel  · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
+            s_ex=[DOT_MIN,0.5*(DOT_MIN+DOT_MAX),DOT_MAX]
+            h_ex=[Line2D([0],[0],marker='o',color='w',markerfacecolor='gray',
+                         markersize=np.sqrt(s/np.pi),markeredgecolor='black') for s in s_ex]
+            ax.legend(h_ex,["PI low","PI mid","PI high"],loc="upper left",frameon=False,fontsize=8)
+            cbar=fig.colorbar(sc,ax=ax,fraction=0.046,pad=0.04); cbar.set_label("tsSPI − 100")
+            ax.grid(True,linestyle=":",alpha=0.25)
+            st.pyplot(fig)
+            buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=300,bbox_inches="tight")
+            shape_map_png=buf.getvalue()
+            if _view_is("Exports & Notes", "Full Report"):
+                st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
+            st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
+
+
+    # ======================= TOF Map — Acceleration vs Travel =======================
+    st.markdown("## TOF Map — Turn of Foot vs Travel")
+    need_tof = {"Horse", "Accel", "tsSPI", "TOF"}
+    if not need_tof.issubset(metrics.columns):
+        st.info("TOF Map: Accel, tsSPI and TOF are not available for this file.")
+    else:
+        dft = metrics.loc[:, ["Horse", "Accel", "tsSPI", "TOF", "SRI", "PI"]].copy()
+        for c in ["Accel", "tsSPI", "TOF", "SRI", "PI"]:
+            dft[c] = pd.to_numeric(dft.get(c, np.nan), errors="coerce")
+        dft = dft.dropna(subset=["Accel", "tsSPI", "TOF"])
+        if dft.empty:
+            st.info("Not enough TOF data to draw the map.")
+        else:
+            fig, ax = plt.subplots(figsize=(7.8, 5.8))
+            names = dft["Horse"].astype(str).to_list()
+            x = (dft["tsSPI"] - 100.0).to_numpy()
+            y = (dft["Accel"] - 100.0).to_numpy()
+            tof_vals = dft["TOF"].to_numpy()
+            pi_vals = dft["PI"].fillna(dft["PI"].median()).to_numpy()
+            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
+            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
+            sc = ax.scatter(x, y, c=tof_vals, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6, cmap="coolwarm")
+            label_points_neatly(ax, x, y, names)
+            ax.axhline(0, color="gray", lw=1.0, ls=(0,(3,3)))
+            ax.axvline(0, color="gray", lw=1.0, ls=(0,(3,3)))
+            ax.set_xlabel("tsSPI − 100 / travel strength")
+            ax.set_ylabel("Accel − 100 / acceleration strength")
+            ax.set_title("Top-left = sharp kick; top-right = complete accelerator")
+            ax.grid(True, linestyle=":", alpha=0.25)
+            cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("TOF = Accel − tsSPI")
+            st.pyplot(fig)
+            st.caption("TOF isolates acceleration above/below the horse’s travel strength. Size=PI; colour=TOF.")
+
+    # ======================= SRI Map — Peak Speed vs Speed Retention =======================
+    st.markdown("## SRI Map — Peak Speed vs Speed Retention")
+    need_sri = {"Horse", "Peak_Speed", "SRI"}
+    if not need_sri.issubset(metrics.columns):
+        st.info("SRI Map: Peak Speed and SRI are not available for this file.")
+    else:
+        dfs = metrics.loc[:, ["Horse", "Peak_Speed", "Peak_Location", "SRI", "PI"]].copy()
+        dfs["Peak_Speed"] = pd.to_numeric(dfs["Peak_Speed"], errors="coerce")
+        dfs["SRI"] = pd.to_numeric(dfs["SRI"], errors="coerce")
+        dfs["PI"] = pd.to_numeric(dfs.get("PI", np.nan), errors="coerce")
+        dfs = dfs.dropna(subset=["Peak_Speed", "SRI"])
+        if dfs.empty:
+            st.info("Not enough SRI data to draw the map.")
+        else:
+            fig, ax = plt.subplots(figsize=(7.8, 5.8))
+            names = dfs["Horse"].astype(str).to_list()
+            x = dfs["Peak_Speed"].to_numpy()
+            y = dfs["SRI"].to_numpy()
+            pi_vals = dfs["PI"].fillna(dfs["PI"].median()).to_numpy()
+            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
+            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
+            ax.scatter(x, y, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6)
+            label_points_neatly(ax, x, y, names)
+            ax.axhline(96, color="gray", lw=1.0, ls=(0,(3,3)))
+            ax.axhline(94, color="gray", lw=0.8, ls=":")
+            ax.axhline(92, color="gray", lw=0.8, ls=":")
+            ax.set_xlabel("Peak speed (m/s)")
+            ax.set_ylabel("SRI — speed retained after peak (%)")
+            ax.set_title("Top-right = high peak speed + high retention")
+            ax.grid(True, linestyle=":", alpha=0.25)
+            st.pyplot(fig)
+            st.caption("SRI = average speed from the horse’s peak sectional through the finish ÷ peak speed × 100. Size=PI.")
+
+
+# ======================= Phase PI Analysis =======================
+if _view_is("Phase PI Analysis", "Full Report"):
+    st.markdown("## Phase PI Analysis")
+    st.caption(
+        "Breaks each horse's PI into the same weighted phase contributions used in the PI calculation. "
+        "This shows how each horse built its PI and where the race separated."
+    )
+
+    phase_map = {
+        "F200": "F200_PIc",
+        "tsSPI": "tsSPI_PIc",
+        "Accel": "Accel_PIc",
+        "Grind": "Grind_PIc",
+    }
+    phase_cols = list(phase_map.values())
+
+    if not all(c in metrics.columns for c in phase_cols):
+        st.warning("Phase PI Analysis needs F200_PIc, tsSPI_PIc, Accel_PIc and Grind_PIc. Re-run metrics with the updated app file.")
+    else:
+        phase_df = metrics.copy()
+        for c in phase_cols + ["PI", "PI_Phase_Total", "Mass_PIc", "Finish_Pos"]:
+            if c in phase_df.columns:
+                phase_df[c] = pd.to_numeric(phase_df[c], errors="coerce")
+
+        # Race-level phase separation: where the field was split most.
+        phase_summary_rows = []
+        for phase, col in phase_map.items():
+            vals = pd.to_numeric(phase_df[col], errors="coerce")
+            avg = float(vals.mean()) if vals.notna().any() else np.nan
+            spread = float(vals.std(ddof=1)) if vals.notna().sum() > 1 else np.nan
+            avg_abs = float(vals.abs().mean()) if vals.notna().any() else np.nan
+            phase_summary_rows.append({
+                "Phase": phase,
+                "Avg PI contribution": avg,
+                "Avg absolute contribution": avg_abs,
+                "Separation": spread,
+            })
+        phase_summary = pd.DataFrame(phase_summary_rows)
+
+        valid_sep = phase_summary.dropna(subset=["Separation"])
+        winning_phase = "-"
+        if not valid_sep.empty:
+            winning_phase = str(valid_sep.loc[valid_sep["Separation"].idxmax(), "Phase"])
+
+        sep_sum = phase_summary["Separation"].replace([np.inf, -np.inf], np.nan).fillna(0).sum()
+        if sep_sum > 0:
+            phase_summary["Separation share"] = phase_summary["Separation"] / sep_sum * 100.0
+        else:
+            phase_summary["Separation share"] = np.nan
+
+        def _phase_meaning(row):
+            phase = row["Phase"]
+            if phase == winning_phase:
+                return "Race separated here"
+            if pd.notna(row.get("Separation")) and sep_sum > 0 and row.get("Separation share", 0) >= 25:
+                return "Important support phase"
+            return "Secondary phase"
+
+        phase_summary["Race meaning"] = phase_summary.apply(_phase_meaning, axis=1)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        card_map = {"F200": c1, "tsSPI": c2, "Accel": c3, "Grind": c4}
+        for phase, col in phase_map.items():
+            vals = pd.to_numeric(phase_df[col], errors="coerce")
+            avg = vals.mean() if vals.notna().any() else np.nan
+            spread = vals.std(ddof=1) if vals.notna().sum() > 1 else np.nan
+            card_map[phase].metric(
+                f"{phase} avg",
+                "-" if not np.isfinite(avg) else f"{avg:+.2f}",
+                "spread -" if not np.isfinite(spread) else f"spread {spread:.2f}"
+            )
+        c5.metric("Winning phase", winning_phase)
+
+        st.info(
+            f"**Race read:** The largest Phase PI separation was in **{winning_phase}**. "
+            "That is the phase where the field's PI profiles spread out most, so it is the most likely phase where the race was won or lost."
+        )
+
+        st.markdown("### Horse Phase PI table")
+        horse_cols = ["Horse", "Finish_Pos", "F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc", "Mass_PIc", "PI_Phase_Total", "PI", "Main_PI_Phase"]
+        horse_cols = [c for c in horse_cols if c in phase_df.columns]
+        view_df = phase_df[horse_cols].copy()
+        sort_col = "PI" if "PI" in view_df.columns else "PI_Phase_Total"
+        if sort_col in view_df.columns:
+            view_df = view_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+        for c in ["F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc", "Mass_PIc", "PI_Phase_Total", "PI"]:
+            if c in view_df.columns:
+                view_df[c] = pd.to_numeric(view_df[c], errors="coerce").round(2)
+        st.dataframe(view_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Race Phase PI table")
+        show_summary = phase_summary.copy()
+        for c in ["Avg PI contribution", "Avg absolute contribution", "Separation", "Separation share"]:
+            show_summary[c] = pd.to_numeric(show_summary[c], errors="coerce").round(2)
+        st.dataframe(show_summary, use_container_width=True, hide_index=True)
+
+        csv_phase = view_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Phase PI table (CSV)",
+            data=csv_phase,
+            file_name="phase_pi_analysis.csv",
+            mime="text/csv"
+        )
+
+        st.markdown("### Race phase separation")
+        try:
+            fig, ax = plt.subplots(figsize=(7.8, 4.8))
+            phases = phase_summary["Phase"].astype(str).to_list()
+            sep_vals = pd.to_numeric(phase_summary["Separation"], errors="coerce").fillna(0).to_numpy(dtype=float)
+            ax.bar(phases, sep_vals)
+            ax.set_ylabel("Std dev of phase PI contribution")
+            ax.set_title("Where the race separated")
+            ax.grid(axis="y", linestyle=":", alpha=0.35)
+            for i, v in enumerate(sep_vals):
+                ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+            st.pyplot(fig)
+            st.caption("The highest bar is the phase where the field spread out most on the PI scale.")
+        except Exception as e:
+            st.info(f"Race phase separation chart could not be drawn: {e}")
+
+        st.markdown("### Horse phase contribution heatmap")
+        try:
+            dplot = phase_df[["Horse"] + phase_cols].copy()
+            for c in phase_cols:
+                dplot[c] = pd.to_numeric(dplot[c], errors="coerce")
+            dplot["_total_abs"] = dplot[phase_cols].abs().sum(axis=1)
+            dplot = dplot.sort_values("_total_abs", ascending=False).head(16).reset_index(drop=True)
+            mat = dplot[phase_cols].to_numpy(dtype=float)
+            vmax = float(np.nanmax(np.abs(mat))) if np.isfinite(mat).any() else 1.0
+            vmax = max(vmax, 0.5)
+            fig, ax = plt.subplots(figsize=(8.5, max(4.8, 0.38 * len(dplot) + 1.6)))
+            im = ax.imshow(mat, aspect="auto", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            ax.set_xticks(range(len(phase_map)))
+            ax.set_xticklabels(list(phase_map.keys()))
+            ax.set_yticks(range(len(dplot)))
+            ax.set_yticklabels(dplot["Horse"].astype(str).to_list())
+            ax.set_title("How each horse built its PI")
+            for i in range(mat.shape[0]):
+                for j in range(mat.shape[1]):
+                    val = mat[i, j]
+                    if np.isfinite(val):
+                        ax.text(j, i, f"{val:+.2f}", ha="center", va="center", fontsize=8)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("PI contribution")
+            st.pyplot(fig)
+            st.caption("Positive cells show where a horse added to PI. Negative cells show where it lost PI.")
+        except Exception as e:
+            st.info(f"Phase contribution heatmap could not be drawn: {e}")
+
+        with st.expander("How to read Phase PI"):
+            st.markdown(
+                """
+- **F200 PIc / tsSPI PIc / Accel PIc / Grind PIc** are additive PI-scale contributions using the same weights, centre and scaling as the main PI.
+- **Main PI Phase** is the phase that added the most to that horse's PI.
+- **Avg PI contribution** shows what the field generally gained or lost in that phase.
+- **Separation** is the standard deviation of that phase's contribution. The highest separation is where the race most likely split.
+- **PI Phase Total** is a rebuild check against the displayed PI. Small differences can occur because the official PI is clipped to 0–10 and rounded.
+                """
+            )
 
 # ======================= Race Plane Analysis — Experimental =======================
 if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
