@@ -630,14 +630,13 @@ def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, 
     c5.metric("RPSS", f"{float(_rpss):.2f}" if _rpss is not None and np.isfinite(float(_rpss)) else "-")
 
     pi_col = "PI_RS" if ("PI_RS" in metrics.columns and pd.to_numeric(metrics["PI_RS"], errors="coerce").notna().any()) else ("PI" if "PI" in metrics.columns else None)
-    gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else ("GCI" if "GCI" in metrics.columns else None)
     gr_col = metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind")
 
-    for c in [pi_col, gci_col, "Accel", "tsSPI", "TOF", gr_col, "Finish_Pos"]:
+    for c in [pi_col, "Accel", "tsSPI", "TOF", gr_col, "Finish_Pos"]:
         if c and c not in metrics.columns:
             metrics[c] = np.nan
 
-    top_cols = [c for c in ["Horse", "Finish_Pos", pi_col, gci_col] if c]
+    top_cols = [c for c in ["Horse", "Finish_Pos", pi_col] if c]
     if top_cols:
         st.markdown("### Top overall profiles")
         top_df = metrics[top_cols].copy()
@@ -677,7 +676,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Dashboard", "Core Metrics", "Visuals", "Phase PI Analysis", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Dashboard", "Core Metrics", "Visuals", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -702,7 +701,7 @@ with st.sidebar:
             "Track Going",
             options=["Good", "Firm", "Soft", "Heavy"],
             index=0,
-            help="Only affects PI weights; GCI stays independent"
+            help="Only affects PI weights; the underlying sectional indices stay unchanged"
         ) if USE_GOING_ADJUST else "Good"
         WIND_AFFECTED = st.toggle("Wind affected race?", value=False, help="Purely informational (disclaimer only).")
         WIND_TAG = st.selectbox(
@@ -760,8 +759,6 @@ CREATE TABLE IF NOT EXISTS performances(
   grind_adj_pts   REAL,
   pi              REAL,
   pi_rs           REAL,    -- NEW: PI after race-shape adjustments (if any)
-  gci             REAL,
-  gci_rs          REAL,    -- NEW: GCI after race-shape adjustments (if any)
   hidden          REAL,
   ability         REAL,
   ability_tier    TEXT,
@@ -1086,28 +1083,34 @@ def pi_weights_distance_and_context(
     """
     Returns PI weights (sum=1). If return_meta=True, also returns a meta dict
     describing the going multipliers actually applied.
-    Going affects PI weighting ONLY (not indices or GCI).
+    Going affects PI weighting only; the underlying sectional indices remain unchanged.
     """
 
     dm = float(distance_m or 1200)
 
-    # ---- Base by distance (your current logic) ----
-    if dm <= 1000:
-        F200, ts, ACC, GR = 0.10, 0.20, 0.45, 0.25
-
-    elif dm <= 1200:
-        F200, ts, ACC, GR = 0.10, 0.25, 0.40, 0.25
-
-    elif dm <= 1400:
-        F200, ts, ACC, GR = 0.10, 0.30, 0.35, 0.25
-
-    elif dm <= 2200:
-        F200, ts, ACC, GR = 0.08, 0.35, 0.35, 0.22
-
-    else:  # 2400–3200
-        F200, ts, ACC, GR = 0.05, 0.40, 0.35, 0.20
-
-    base = {"F200_idx":F200, "tsSPI":ts, "Accel":ACC, "Grind":GR}
+    # ---- Continuous base weights by distance ----
+    # Refined to reward complete sprint performances and genuine staying strength.
+    # Values between anchors are linearly interpolated, avoiding abrupt distance bands.
+    anchors = [
+        (1000.0, {"F200_idx":0.12, "tsSPI":0.23, "Accel":0.30, "Grind":0.35}),
+        (1200.0, {"F200_idx":0.10, "tsSPI":0.25, "Accel":0.32, "Grind":0.33}),
+        (1400.0, {"F200_idx":0.10, "tsSPI":0.30, "Accel":0.35, "Grind":0.25}),
+        (1600.0, {"F200_idx":0.08, "tsSPI":0.34, "Accel":0.34, "Grind":0.24}),
+        (2000.0, {"F200_idx":0.07, "tsSPI":0.37, "Accel":0.31, "Grind":0.25}),
+        (2400.0, {"F200_idx":0.05, "tsSPI":0.40, "Accel":0.28, "Grind":0.27}),
+        (3000.0, {"F200_idx":0.03, "tsSPI":0.42, "Accel":0.23, "Grind":0.32}),
+    ]
+    if dm <= anchors[0][0]:
+        base = anchors[0][1].copy()
+    elif dm >= anchors[-1][0]:
+        base = anchors[-1][1].copy()
+    else:
+        base = anchors[-1][1].copy()
+        for (d0, w0), (d1, w1) in zip(anchors, anchors[1:]):
+            if d0 <= dm <= d1:
+                base = _interp_weights(dm, d0, w0, d1, w1)
+                break
+    F200, ts, ACC, GR = (base["F200_idx"], base["tsSPI"], base["Accel"], base["Grind"])
 
     # ---- Mild context nudge (your bias step) ----
     if acc_med is not None and grd_med is not None and math.isfinite(acc_med) and math.isfinite(grd_med):
@@ -1134,17 +1137,17 @@ def pi_weights_distance_and_context(
     # Heavy: stronger version of Soft
     if going == "Firm":
         # Firm: boost Accel ONLY
-        amp = 0.06 * field_scale
+        amp = 0.03 * field_scale
         mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0 + amp, "Grind": 1.0}
 
     elif going == "Soft":
         # Soft: boost Grind ONLY
-        amp = 0.06 * field_scale
+        amp = 0.03 * field_scale
         mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0 + amp}
 
     elif going == "Heavy":
         # Heavy: boost Grind ONLY (stronger)
-        amp = 0.10 * field_scale
+        amp = 0.05 * field_scale
         mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0 + amp}
 
     else:  # "Good" or unknown
@@ -1432,7 +1435,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     # Store for captions/DB/PDF
     w.attrs["GOING"] = going_for_pi
     w.attrs["PI_GOING_META"] = PI_META
-    if use_cg and dampen_cg and CollapseSeverity >= 3.0:
+    if use_cg and dampen_cg and CollapseSeverity >= 3.0 and float(D) >= 1400.0:
         d = min(0.02 + 0.01*(CollapseSeverity-3.0), 0.08)
         shift = min(d, PI_W["Grind"])
         PI_W["Grind"] -= shift
@@ -1494,9 +1497,36 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     # Positive mass_delta = carried HEAVIER than reference → penalty
 
     # 2) Per-kg impact in PI points (tweakable)
-    PER_KG_PTS = 0.14  # subtract 0.14 PI_pts per extra kg carried vs race median
+    PER_KG_PTS = float(perkg)  # distance-sensitive PI-points penalty per extra kg vs race median
 
-    # 3) Base (sectional) PI points as you already do, then apply mass adjustment
+    # 3) Base sectional PI points, then apply mass and sprint-conversion adjustments.
+    def _conversion_penalty_coefficient(dm: float) -> float:
+        # Applies most strongly in compressed sprint races and fades smoothly to zero at 1400m.
+        knots = [(1000.0, 0.18), (1100.0, 0.15), (1200.0, 0.12), (1300.0, 0.06), (1400.0, 0.00)]
+        dm = float(dm)
+        if dm <= knots[0][0]: return knots[0][1]
+        if dm >= knots[-1][0]: return 0.0
+        for (d0, k0), (d1, k1) in zip(knots, knots[1:]):
+            if d0 <= dm <= d1:
+                t = (dm-d0)/(d1-d0)
+                return k0 + (k1-k0)*t
+        return 0.0
+
+    CONVERSION_K = _conversion_penalty_coefficient(D)
+
+    def _sprint_conversion_penalty(r) -> float:
+        if CONVERSION_K <= 0:
+            return 0.0
+        f = pd.to_numeric(pd.Series([r.get("F200_idx")]), errors="coerce").iloc[0]
+        t = pd.to_numeric(pd.Series([r.get("tsSPI")]), errors="coerce").iloc[0]
+        a = pd.to_numeric(pd.Series([r.get("Accel")]), errors="coerce").iloc[0]
+        g = pd.to_numeric(pd.Series([r.get(GR_COL)]), errors="coerce").iloc[0]
+        if not all(np.isfinite(v) for v in (f, t, a, g)):
+            return 0.0
+        speed_build = 0.20*(f-100.0) + 0.35*(t-100.0) + 0.45*(a-100.0)
+        conversion_gap = max(0.0, speed_build - (g-100.0))
+        return float(CONVERSION_K * conversion_gap)
+
     def _pi_pts_row(r):
         acc = r.get("Accel"); mid = r.get("tsSPI"); f = r.get("F200_idx"); gr = r.get(GR_COL)
         parts = []
@@ -1512,9 +1542,17 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         # mass penalty in PI_pts (kg heavier than ref lowers PI_pts)
         idx = r.name
         md = float(mass_delta.loc[idx]) if idx in mass_delta.index else 0.0
-        return base - (PER_KG_PTS * md)
+        conversion_penalty = _sprint_conversion_penalty(r)
+        return base - (PER_KG_PTS * md) - conversion_penalty
 
+    w["Sprint_Conversion_Penalty"] = w.apply(_sprint_conversion_penalty, axis=1).round(3)
     w["PI_pts"] = w.apply(_pi_pts_row, axis=1)
+    w.attrs["PI_REFINED_META"] = {
+        "distance_m": int(D),
+        "weights": PI_W.copy(),
+        "conversion_k": round(float(CONVERSION_K), 4),
+        "perkg_pts": round(float(PER_KG_PTS), 4),
+    }
 
     # 4) Convert PI_pts → PI 0..10 (same centering/scaling you use)
     pts = pd.to_numeric(w["PI_pts"], errors="coerce")
@@ -1546,12 +1584,14 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         w["Mass_PIc"] = (pi_scale * (-PER_KG_PTS * mass_delta)).round(3)
     except Exception:
         w["Mass_PIc"] = 0.0
+    w["Conversion_PIc"] = (-pi_scale * pd.to_numeric(w.get("Sprint_Conversion_Penalty", 0.0), errors="coerce").fillna(0.0)).round(3)
 
     phase_cols_calc = ["F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc"]
     w["PI_Phase_Total"] = (
         pd.to_numeric(w["PI_Base"], errors="coerce")
         + w[phase_cols_calc].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
         + pd.to_numeric(w.get("Mass_PIc", 0.0), errors="coerce").fillna(0)
+        + pd.to_numeric(w.get("Conversion_PIc", 0.0), errors="coerce").fillna(0)
     ).clip(0.0, 10.0).round(2)
 
     def _main_phase_from_row(r):
@@ -1572,79 +1612,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w.attrs["PI_PHASE_BASE"] = float(pi_intercept) if np.isfinite(pi_intercept) else np.nan
 # ---------- /Mass-aware PI points ----------
 
-    # ----- GCI (time + shape + efficiency) -----
-    winner_time = None
-    if "RaceTime_s" in w.columns and w["RaceTime_s"].notna().any():
-        try:
-            winner_time = float(w["RaceTime_s"].min())
-        except Exception:
-            winner_time = None
-
-    wT = 0.25
-    Wg = pi_weights_distance_and_context(
-        D,
-        pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True),
-        pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True)
-    )  # (no going arg -> defaults to Good)
-
-    wPACE = Wg["Accel"] + Wg["Grind"]
-    wSS   = Wg["tsSPI"]
-    wEFF  = max(0.0, 1.0 - (wT + wPACE + wSS))
-
-    def _map_pct(x, lo=98.0, hi=104.0):
-        x = float(x) if pd.notna(x) else np.nan
-        return 0.0 if not np.isfinite(x) else clamp((x-lo)/(hi-lo), 0.0, 1.0)
-
-    gci_vals = []
-    for _, r in w.iterrows():
-        T = 0.0
-        if winner_time is not None and pd.notna(r.get("RaceTime_s")):
-            d = float(r["RaceTime_s"]) - winner_time
-            T = 1.0 if d <= 0.30 else (0.7 if d <= 0.60 else (0.4 if d <= 1.00 else 0.2))
-        LQ = 0.6*_map_pct(r.get("Accel")) + 0.4*_map_pct(r.get(GR_COL))
-        SS = _map_pct(r.get("tsSPI"))
-        acc, grd_eff = r.get("Accel"), r.get(GR_COL)
-        if pd.isna(acc) or pd.isna(grd_eff):
-            EFF = 0.0
-        else:
-            dev = (abs(acc-100.0) + abs(grd_eff-100.0))/2.0
-            EFF = clamp(1.0 - dev/8.0, 0.0, 1.0)
-        gci_vals.append(round(10.0 * (wT*T + wPACE*LQ + wSS*SS + wEFF*EFF), 3))
-    w["GCI"] = gci_vals
-
-    # ---- GCI refinement by Race Shape (GCI_RS) ----
-    # RSI sign: + = slow-early (late favoured), - = fast-early (early favoured)
-    RSI_val = float(w.attrs.get("RSI", 0.0))
-    SCI_val = float(w.attrs.get("SCI", 0.0))
-
-    # per-horse exposure along same axis (late-minus-mid already computed for RS_Component)
-    dLM = (pd.to_numeric(w["Accel"], errors="coerce") -
-           pd.to_numeric(w["tsSPI"], errors="coerce"))
-
-    # normalise exposure into [-1, +1] softly (bigger fields → slightly stronger signal)
-    field_n = max(1, len(w))
-    expo = np.tanh((dLM / 6.0)) * np.sign(RSI_val)
-
-    # gate by consensus; reduce if consensus is weak
-    consensus = 0.60 + 0.40 * max(0.0, min(1.0, SCI_val))
-    expo *= consensus
-
-    # soft-sigmoid attenuation: trim “with-shape”, boost “against-shape”
-    # cap adjustment to ±0.60 GCI points
-    with_shape  = np.clip(expo, 0.0, 1.0)
-    against     = np.clip(-expo, 0.0, 1.0)
-    adj = 0.35*against - 0.22*with_shape
-
-    # small distance seasoning (mile gets a touch more)
-    Dm = float(D_actual_m)
-    dist_gain = 1.00 + (0.06 if 1400 <= Dm <= 1800 else 0.00)
-    adj *= dist_gain
-
-    # SCI failsafe: damp everything if SCI is very low
-    if SCI_val < 0.40:
-        adj *= 0.5
-
-    w["GCI_RS"] = (pd.to_numeric(w["GCI"], errors="coerce") + adj).clip(0.0, 10.0).round(3)                           
+    # GCI removed: PI is now the sole overall performance rating.
         # ----- EARLY/LATE (blended, for display only) -----
     w["EARLY_idx"] = (0.65*pd.to_numeric(w["F200_idx"], errors="coerce") +
                       0.35*pd.to_numeric(w["tsSPI"],    errors="coerce"))
@@ -1808,7 +1776,7 @@ def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
     """
     RQS v2 (0..100): single-race class/quality indicator, handicap-friendly.
 
-    Ingredients (no GCI in the core):
+    Ingredients (PI-only core):
       • Peak talent  (S1): p90(PI_RS or PI) scaled to 0..100
       • Depth        (S2): share with PI_RS >= 6.8 (good/strong mark)
       • Dispersion   (S3): how healthy the spread is (MAD target ≈ 1.0)
@@ -2062,7 +2030,7 @@ if _view_is("Dashboard", "Full Report"):
     render_dashboard(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
 
 if _view_is("Core Metrics", "Full Report"):
-    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape + SRI + TOF)")
+    st.markdown("## Sectional Metrics (Refined PI + CG + Race Shape + SRI + TOF)")
 
 if _view_is("Core Metrics", "Full Report"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
@@ -2073,7 +2041,7 @@ if _view_is("Core Metrics", "Full Report"):
         "EARLY_idx","LATE_idx",
         "Peak_Speed","Peak_Location","SRI","SRI_Profile",
         "GrindAdjPts","DeltaG",
-        "PI","GCI","GCI_RS",
+        "PI","PI_pts","Sprint_Conversion_Penalty",
         "RSI","RS_Component","RSI_Cue"
     ]
 
@@ -2117,38 +2085,7 @@ if _view_is("Core Metrics", "Full Report"):
 
     render_rpss_section(RPSS_INFO)
 
-    # ======================= Race Class Summary (pure stats) =======================
-    st.markdown("## Race Class Summary")
-
-    # Prefer GCI_RS, fall back to GCI
-    gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else "GCI"
-    s = pd.to_numeric(metrics.get(gci_col, pd.Series(dtype=float)), errors="coerce").dropna()
-
-    if s.empty:
-        st.info("No valid GCI values found for this race.")
-    else:
-        mean_v   = float(s.mean())
-        med_v    = float(s.median())
-        # Robust spread stats (raw MAD, not 1.4826 scaled; and IQR)
-        mad_raw  = float(np.nanmedian(np.abs(s - med_v)))
-        try:
-            q75, q25 = np.nanpercentile(s, 75), np.nanpercentile(s, 25)
-            iqr_v    = float(q75 - q25)
-        except Exception:
-            iqr_v    = float("nan")
-
-        c1, c2, c3, c4 = st.columns([1,1,1,1])
-        with c1:
-            st.metric("Mean GCI", f"{mean_v:.2f}")
-        with c2:
-            st.metric("Median GCI", f"{med_v:.2f}")
-        with c3:
-            st.metric("Spread (MAD)", f"{mad_raw:.2f}")
-        with c4:
-            st.metric("IQR", f"{iqr_v:.2f}" if np.isfinite(iqr_v) else "—")
-
-        st.caption(f"Source: **{gci_col}** (pure stats; no class labels).")
-    # =================== /Race Class Summary ===================
+    # GCI-based Race Class Summary removed.
 
     # ======================= Ahead of the Handicap — One-Run Weight Intelligence =======================
     st.markdown("## Ahead of the Handicap — One-Run (Race-local)")
@@ -2754,165 +2691,242 @@ if _view_is("Visuals", "Full Report"):
             st.caption("SRI = average speed from the horse’s peak sectional through the finish ÷ peak speed × 100. Size=PI.")
 
 
-# ======================= Phase PI Analysis =======================
-if _view_is("Phase PI Analysis", "Full Report"):
-    st.markdown("## Phase PI Analysis")
+# ======================= Ability Radar =======================
+if _view_is("Ability Radar", "Full Report"):
+    st.markdown("## Ability Radar")
     st.caption(
-        "Breaks each horse's PI into the same weighted phase contributions used in the PI calculation. "
-        "This shows how each horse built its PI and where the race separated."
+        "Compare horses from the same race using the core Race Edge indexed values. "
+        "The radar uses F200, tsSPI, Accel and Grind on an 80–110 scale, where 100 is race-average/par."
     )
 
-    phase_map = {
-        "F200": "F200_PIc",
-        "tsSPI": "tsSPI_PIc",
-        "Accel": "Accel_PIc",
-        "Grind": "Grind_PIc",
+    radar_phases = ["F200", "tsSPI", "Accel", "Grind"]
+
+    def _pick_numeric_col(df, candidates):
+        """Return the first candidate column that exists and has at least one numeric value."""
+        for c in candidates:
+            if c in df.columns:
+                vals = pd.to_numeric(df[c], errors="coerce")
+                if vals.notna().any():
+                    return c
+        # If the column exists but is empty, still return it as a last resort so the warning is precise.
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    gr_attr = metrics.attrs.get("GR_COL", None)
+    grind_candidates = []
+    if gr_attr:
+        grind_candidates.append(gr_attr)
+    grind_candidates += ["Grind_CG", "Grind", "Grind_idx", "Corrected_Grind"]
+
+    radar_cols = {
+        "F200": _pick_numeric_col(metrics, ["F200_idx", "F200", "F200_Index", "F200 index", "F200_score"]),
+        "tsSPI": _pick_numeric_col(metrics, ["tsSPI", "tsSPI_idx", "tsSPI_Index"]),
+        "Accel": _pick_numeric_col(metrics, ["Accel", "Accel_idx", "Acceleration", "Acceleration_idx"]),
+        "Grind": _pick_numeric_col(metrics, grind_candidates),
     }
-    phase_cols = list(phase_map.values())
 
-    if not all(c in metrics.columns for c in phase_cols):
-        st.warning("Phase PI Analysis needs F200_PIc, tsSPI_PIc, Accel_PIc and Grind_PIc. Re-run metrics with the updated app file.")
+    missing = [label for label, col in radar_cols.items() if col is None]
+    if missing:
+        st.warning(
+            "Ability Radar needs usable F200, tsSPI, Accel and Grind columns. "
+            f"Missing: {', '.join(missing)}"
+        )
     else:
-        phase_df = metrics.copy()
-        for c in phase_cols + ["PI", "PI_Phase_Total", "Mass_PIc", "Finish_Pos"]:
-            if c in phase_df.columns:
-                phase_df[c] = pd.to_numeric(phase_df[c], errors="coerce")
+        radar_df = metrics.copy()
+        radar_value_cols = []
+        for phase, col in radar_cols.items():
+            radar_col = f"{phase}_Radar"
+            plot_col = f"{phase}_Plot"
+            radar_df[radar_col] = pd.to_numeric(radar_df[col], errors="coerce")
+            radar_df[plot_col] = radar_df[radar_col].clip(80, 110)
+            radar_value_cols.append(radar_col)
 
-        # Race-level phase separation: where the field was split most.
-        phase_summary_rows = []
-        for phase, col in phase_map.items():
-            vals = pd.to_numeric(phase_df[col], errors="coerce")
-            avg = float(vals.mean()) if vals.notna().any() else np.nan
-            spread = float(vals.std(ddof=1)) if vals.notna().sum() > 1 else np.nan
-            avg_abs = float(vals.abs().mean()) if vals.notna().any() else np.nan
-            phase_summary_rows.append({
-                "Phase": phase,
-                "Avg PI contribution": avg,
-                "Avg absolute contribution": avg_abs,
-                "Separation": spread,
-            })
-        phase_summary = pd.DataFrame(phase_summary_rows)
+        radar_numeric = radar_df[radar_value_cols].apply(pd.to_numeric, errors="coerce")
+        valid_rows = radar_numeric.notna().any(axis=1)
 
-        valid_sep = phase_summary.dropna(subset=["Separation"])
-        winning_phase = "-"
-        if not valid_sep.empty:
-            winning_phase = str(valid_sep.loc[valid_sep["Separation"].idxmax(), "Phase"])
-
-        sep_sum = phase_summary["Separation"].replace([np.inf, -np.inf], np.nan).fillna(0).sum()
-        if sep_sum > 0:
-            phase_summary["Separation share"] = phase_summary["Separation"] / sep_sum * 100.0
+        if not valid_rows.any():
+            st.warning(
+                "Ability Radar could not find numeric values for F200, tsSPI, Accel or Grind in this race. "
+                "Check that the metrics table has been calculated before opening this module."
+            )
         else:
-            phase_summary["Separation share"] = np.nan
+            radar_df["Radar_Avg"] = radar_numeric.mean(axis=1, skipna=True)
+            radar_df["Radar_Spread"] = radar_numeric.max(axis=1, skipna=True) - radar_numeric.min(axis=1, skipna=True)
 
-        def _phase_meaning(row):
-            phase = row["Phase"]
-            if phase == winning_phase:
-                return "Race separated here"
-            if pd.notna(row.get("Separation")) and sep_sum > 0 and row.get("Separation share", 0) >= 25:
-                return "Important support phase"
-            return "Secondary phase"
+            def _safe_main_weapon(row):
+                vals = row.dropna()
+                if vals.empty:
+                    return "Unknown"
+                return str(vals.idxmax()).replace("_Radar", "")
 
-        phase_summary["Race meaning"] = phase_summary.apply(_phase_meaning, axis=1)
+            radar_df["Main Weapon"] = radar_numeric.apply(_safe_main_weapon, axis=1)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        card_map = {"F200": c1, "tsSPI": c2, "Accel": c3, "Grind": c4}
-        for phase, col in phase_map.items():
-            vals = pd.to_numeric(phase_df[col], errors="coerce")
-            avg = vals.mean() if vals.notna().any() else np.nan
-            spread = vals.std(ddof=1) if vals.notna().sum() > 1 else np.nan
-            card_map[phase].metric(
-                f"{phase} avg",
-                "-" if not np.isfinite(avg) else f"{avg:+.2f}",
-                "spread -" if not np.isfinite(spread) else f"spread {spread:.2f}"
+            def _radar_profile_100(row):
+                vals = {p: row.get(f"{p}_Radar") for p in radar_phases}
+                vals = {k: float(v) for k, v in vals.items() if pd.notna(v) and np.isfinite(float(v))}
+                if not vals:
+                    return "Unknown"
+                f = vals.get("F200", np.nan)
+                t = vals.get("tsSPI", np.nan)
+                a = vals.get("Accel", np.nan)
+                g = vals.get("Grind", np.nan)
+                avg = float(np.mean(list(vals.values())))
+                spread = float(np.nanmax(list(vals.values())) - np.nanmin(list(vals.values())))
+                top_phase = max(vals, key=vals.get)
+
+                if avg >= 101.0 and min(vals.values()) >= 100.0:
+                    return "Complete horse"
+                if np.isfinite(a) and np.isfinite(g) and a >= 101.0 and g >= 101.0:
+                    return "Power finisher"
+                if np.isfinite(t) and np.isfinite(g) and t >= 101.0 and g >= 101.0:
+                    return "Sustained galloper"
+                if np.isfinite(f) and np.isfinite(a) and f >= 101.0 and a >= 101.0:
+                    return "Speed / tactical horse"
+                if top_phase == "Accel" and vals[top_phase] >= 100.5:
+                    return "Turn-of-foot horse"
+                if top_phase == "Grind" and vals[top_phase] >= 100.5:
+                    return "Grinder / sustainer"
+                if top_phase == "tsSPI" and vals[top_phase] >= 100.5:
+                    return "Strong traveller"
+                if top_phase == "F200" and vals[top_phase] >= 100.5:
+                    return "Early-speed horse"
+                if spread <= 1.0:
+                    return "Balanced / neutral"
+                return "Mixed profile"
+
+            radar_df["Profile"] = radar_df.apply(_radar_profile_100, axis=1)
+
+            # Sensible default: top PI horses with usable radar values, otherwise first few usable horses.
+            horse_list = radar_df["Horse"].astype(str).tolist() if "Horse" in radar_df.columns else []
+            default_horses = []
+            usable_radar_df = radar_df[valid_rows].copy()
+            if "PI" in usable_radar_df.columns:
+                tmp = usable_radar_df.copy()
+                tmp["PI"] = pd.to_numeric(tmp["PI"], errors="coerce")
+                default_horses = tmp.sort_values("PI", ascending=False)["Horse"].astype(str).head(3).tolist()
+            if not default_horses and "Horse" in usable_radar_df.columns:
+                default_horses = usable_radar_df["Horse"].astype(str).head(3).tolist()
+
+            selected_horses = st.multiselect(
+                "Select horses to compare",
+                options=horse_list,
+                default=default_horses,
+                help="Choose 1–5 horses for a clean radar comparison."
             )
-        c5.metric("Winning phase", winning_phase)
+            if len(selected_horses) > 5:
+                st.warning("For readability, the radar chart shows the first 5 selected horses.")
+                selected_horses = selected_horses[:5]
 
-        st.info(
-            f"**Race read:** The largest Phase PI separation was in **{winning_phase}**. "
-            "That is the phase where the field's PI profiles spread out most, so it is the most likely phase where the race was won or lost."
-        )
+            c1, c2, c3, c4 = st.columns(4)
+            leaders = []
+            for phase in radar_phases:
+                vals = pd.to_numeric(radar_df[f"{phase}_Radar"], errors="coerce")
+                if vals.notna().any():
+                    idx = vals.idxmax()
+                    leaders.append((phase, radar_df.loc[idx, "Horse"], float(vals.loc[idx])))
+                else:
+                    leaders.append((phase, "No data", np.nan))
+            for col, item in zip([c1, c2, c3, c4], leaders):
+                phase, horse, score = item
+                col.metric(f"Best {phase}", str(horse), "—" if not np.isfinite(score) else f"{score:.2f}")
 
-        st.markdown("### Horse Phase PI table")
-        horse_cols = ["Horse", "Finish_Pos", "F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc", "Mass_PIc", "PI_Phase_Total", "PI", "Main_PI_Phase"]
-        horse_cols = [c for c in horse_cols if c in phase_df.columns]
-        view_df = phase_df[horse_cols].copy()
-        sort_col = "PI" if "PI" in view_df.columns else "PI_Phase_Total"
-        if sort_col in view_df.columns:
-            view_df = view_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
-        for c in ["F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc", "Mass_PIc", "PI_Phase_Total", "PI"]:
-            if c in view_df.columns:
-                view_df[c] = pd.to_numeric(view_df[c], errors="coerce").round(2)
-        st.dataframe(view_df, use_container_width=True, hide_index=True)
+            st.caption("Radar scale: 80–110. The 100 ring is race-average/par. Values outside 80–110 are clipped on the chart only; the table keeps the real values.")
 
-        st.markdown("### Race Phase PI table")
-        show_summary = phase_summary.copy()
-        for c in ["Avg PI contribution", "Avg absolute contribution", "Separation", "Separation share"]:
-            show_summary[c] = pd.to_numeric(show_summary[c], errors="coerce").round(2)
-        st.dataframe(show_summary, use_container_width=True, hide_index=True)
+            if not selected_horses:
+                st.info("Select at least one horse to draw the Ability Radar.")
+            else:
+                plot_df = radar_df[radar_df["Horse"].astype(str).isin(selected_horses)].copy()
+                order_map = {h: i for i, h in enumerate(selected_horses)}
+                plot_df["_sel_order"] = plot_df["Horse"].astype(str).map(order_map)
+                plot_df = plot_df.sort_values("_sel_order")
 
-        csv_phase = view_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Phase PI table (CSV)",
-            data=csv_phase,
-            file_name="phase_pi_analysis.csv",
-            mime="text/csv"
-        )
+                try:
+                    labels = radar_phases
+                    n = len(labels)
+                    angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
+                    angles += angles[:1]
 
-        st.markdown("### Race phase separation")
-        try:
-            fig, ax = plt.subplots(figsize=(7.8, 4.8))
-            phases = phase_summary["Phase"].astype(str).to_list()
-            sep_vals = pd.to_numeric(phase_summary["Separation"], errors="coerce").fillna(0).to_numpy(dtype=float)
-            ax.bar(phases, sep_vals)
-            ax.set_ylabel("Std dev of phase PI contribution")
-            ax.set_title("Where the race separated")
-            ax.grid(axis="y", linestyle=":", alpha=0.35)
-            for i, v in enumerate(sep_vals):
-                ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
-            st.pyplot(fig)
-            st.caption("The highest bar is the phase where the field spread out most on the PI scale.")
-        except Exception as e:
-            st.info(f"Race phase separation chart could not be drawn: {e}")
+                    fig, ax = plt.subplots(figsize=(7.8, 7.8), subplot_kw=dict(polar=True))
+                    ax.set_theta_offset(np.pi / 2)
+                    ax.set_theta_direction(-1)
+                    ax.set_xticks(angles[:-1])
+                    ax.set_xticklabels(labels, fontsize=11)
+                    ax.set_ylim(80, 110)
+                    ax.set_yticks([80, 90, 100, 105, 110])
+                    ax.set_yticklabels(["80", "90", "100", "105", "110"], fontsize=8, alpha=0.78)
+                    ax.grid(True, linestyle=":", alpha=0.45)
 
-        st.markdown("### Horse phase contribution heatmap")
-        try:
-            dplot = phase_df[["Horse"] + phase_cols].copy()
-            for c in phase_cols:
-                dplot[c] = pd.to_numeric(dplot[c], errors="coerce")
-            dplot["_total_abs"] = dplot[phase_cols].abs().sum(axis=1)
-            dplot = dplot.sort_values("_total_abs", ascending=False).head(16).reset_index(drop=True)
-            mat = dplot[phase_cols].to_numpy(dtype=float)
-            vmax = float(np.nanmax(np.abs(mat))) if np.isfinite(mat).any() else 1.0
-            vmax = max(vmax, 0.5)
-            fig, ax = plt.subplots(figsize=(8.5, max(4.8, 0.38 * len(dplot) + 1.6)))
-            im = ax.imshow(mat, aspect="auto", cmap="coolwarm", vmin=-vmax, vmax=vmax)
-            ax.set_xticks(range(len(phase_map)))
-            ax.set_xticklabels(list(phase_map.keys()))
-            ax.set_yticks(range(len(dplot)))
-            ax.set_yticklabels(dplot["Horse"].astype(str).to_list())
-            ax.set_title("How each horse built its PI")
-            for i in range(mat.shape[0]):
-                for j in range(mat.shape[1]):
-                    val = mat[i, j]
-                    if np.isfinite(val):
-                        ax.text(j, i, f"{val:+.2f}", ha="center", va="center", fontsize=8)
-            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label("PI contribution")
-            st.pyplot(fig)
-            st.caption("Positive cells show where a horse added to PI. Negative cells show where it lost PI.")
-        except Exception as e:
-            st.info(f"Phase contribution heatmap could not be drawn: {e}")
+                    theta = np.linspace(0, 2 * np.pi, 240)
+                    ax.plot(theta, np.full_like(theta, 100.0), linewidth=1.6, linestyle="--", alpha=0.65)
 
-        with st.expander("How to read Phase PI"):
-            st.markdown(
-                """
-- **F200 PIc / tsSPI PIc / Accel PIc / Grind PIc** are additive PI-scale contributions using the same weights, centre and scaling as the main PI.
-- **Main PI Phase** is the phase that added the most to that horse's PI.
-- **Avg PI contribution** shows what the field generally gained or lost in that phase.
-- **Separation** is the standard deviation of that phase's contribution. The highest separation is where the race most likely split.
-- **PI Phase Total** is a rebuild check against the displayed PI. Small differences can occur because the official PI is clipped to 0–10 and rounded.
-                """
-            )
+                    plotted_any = False
+                    for _, row in plot_df.iterrows():
+                        raw_values = [row.get(f"{p}_Radar", np.nan) for p in radar_phases]
+                        if not pd.Series(raw_values).notna().any():
+                            continue
+                        # Use 100 as a neutral visual placeholder for a missing phase so one blank value doesn't break the chart.
+                        values = []
+                        for p in radar_phases:
+                            v = row.get(f"{p}_Plot", np.nan)
+                            values.append(100.0 if pd.isna(v) or not np.isfinite(float(v)) else float(v))
+                        values += values[:1]
+                        label = str(row.get("Horse", "Horse"))
+                        ax.plot(angles, values, linewidth=2.2, marker="o", label=label)
+                        ax.fill(angles, values, alpha=0.10)
+                        plotted_any = True
+
+                    if plotted_any:
+                        ax.set_title("Ability Radar — indexed values", pad=24, fontsize=15)
+                        ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.18), ncol=2, frameon=False)
+                        st.pyplot(fig)
+                    else:
+                        st.info("The selected horses do not have enough numeric radar values to draw the chart.")
+                except Exception as e:
+                    st.info(f"Ability Radar could not be drawn: {e}")
+
+                st.markdown("### Radar comparison table")
+                show_cols = ["Horse", "Finish_Pos"] if "Finish_Pos" in radar_df.columns else ["Horse"]
+                if "PI" in radar_df.columns:
+                    show_cols.append("PI")
+                show_cols += [f"{p}_Radar" for p in radar_phases]
+                show_cols += ["Radar_Avg", "Radar_Spread", "Main Weapon", "Profile"]
+                view = plot_df[[c for c in show_cols if c in plot_df.columns]].copy()
+                rename_map = {f"{p}_Radar": p for p in radar_phases}
+                view = view.rename(columns=rename_map)
+                for c in ["F200", "tsSPI", "Accel", "Grind", "Radar_Avg", "Radar_Spread", "PI"]:
+                    if c in view.columns:
+                        view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
+                st.dataframe(view, use_container_width=True, hide_index=True)
+
+            st.markdown("### Full Ability Radar table")
+            full_cols = ["Horse", "Finish_Pos"] if "Finish_Pos" in radar_df.columns else ["Horse"]
+            if "PI" in radar_df.columns:
+                full_cols.append("PI")
+            full_cols += [f"{p}_Radar" for p in radar_phases]
+            full_cols += ["Radar_Avg", "Radar_Spread", "Main Weapon", "Profile"]
+            full_view = radar_df[[c for c in full_cols if c in radar_df.columns]].copy().rename(columns={f"{p}_Radar": p for p in radar_phases})
+            for c in ["F200", "tsSPI", "Accel", "Grind", "Radar_Avg", "Radar_Spread", "PI"]:
+                if c in full_view.columns:
+                    full_view[c] = pd.to_numeric(full_view[c], errors="coerce").round(2)
+            if "Radar_Avg" in full_view.columns:
+                full_view = full_view.sort_values("Radar_Avg", ascending=False, na_position="last").reset_index(drop=True)
+            st.dataframe(full_view, use_container_width=True, hide_index=True)
+
+            with st.expander("How to read Ability Radar"):
+                st.markdown(
+                    """
+- **F200** = early/first-section ability.
+- **tsSPI** = sustained travelling strength.
+- **Accel** = ability to quicken when the race lifts.
+- **Grind** = ability to keep sustaining after the move.
+- **100** is the race average/par line.
+- **Above 100** means the horse was stronger than the race average in that phase.
+- **Below 100** means the horse was weaker than the race average in that phase.
+- The radar uses raw indexed metrics, so it works consistently with both 100m and 200m split files.
+                    """
+                )
 
 # ======================= Race Plane Analysis — Experimental =======================
 if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
@@ -3565,22 +3579,12 @@ if _view_is("Advanced Models", "Full Report"):
         if not np.isfinite(hs):
             return ""
 
-        # Baseline performance gates (robust to missing GCI_RS)
+        # PI-only baseline gate so weak raw performances are not crowned as hidden horses.
         pi_val = as_num(r.get("PI"))
-        gci_rs = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
 
-        # Mild gates so we don't crown complete outliers with zero baseline
         def baseline_ok_for(top: bool) -> bool:
-            if top:
-                return (
-                    (np.isfinite(pi_val)  and pi_val  >= 5.4) or
-                    (np.isfinite(gci_rs) and gci_rs >= 4.8)
-                )
-            else:
-                return (
-                    (np.isfinite(pi_val)  and pi_val  >= 4.8) or
-                    (np.isfinite(gci_rs) and gci_rs >= 4.2)
-                )
+            threshold = 5.4 if top else 4.8
+            return bool(np.isfinite(pi_val) and pi_val >= threshold)
 
         if hs >= 1.8 and baseline_ok_for(top=True):
             return "🔥 Top Hidden"
@@ -3591,10 +3595,10 @@ if _view_is("Advanced Models", "Full Report"):
 
     # --- Descriptive note ---
     def hh_note(r):
-        pi, gci_rs = as_num(r.get("PI")), as_num(r.get("GCI_RS"))
+        pi = as_num(r.get("PI"))
         bits=[]
-        if np.isfinite(pi) and np.isfinite(gci_rs):
-            bits.append(f"PI {pi:.2f}, GCI_RS {gci_rs:.2f}")
+        if np.isfinite(pi):
+            bits.append(f"PI {pi:.2f}")
         else:
             if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
             asi2 = as_num(r.get("ASI2"))
@@ -3606,14 +3610,14 @@ if _view_is("Advanced Models", "Full Report"):
     hh["Note"] = hh.apply(hh_note, axis=1)
 
     # ---- Build ranked, presentation-friendly Hidden Horses table ----
-    cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,
+    cols_hh = ["Horse","Finish_Pos","PI","tsSPI","Accel",gr_col,
                "SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
     for c in cols_hh:
         if c not in hh.columns:
             hh[c] = np.nan
 
     # numeric hygiene
-    num_cols = ["PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore"]
+    num_cols = ["PI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore"]
     for c in num_cols:
         hh[c] = pd.to_numeric(hh[c], errors="coerce")
 
@@ -3629,7 +3633,7 @@ if _view_is("Advanced Models", "Full Report"):
     )
 
     # --- Build final table -------------------------------------------------
-    cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+    cols_hh = ["Horse","Finish_Pos","PI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
     for c in cols_hh:
         if c not in hh.columns:
             hh[c] = np.nan
@@ -3649,7 +3653,7 @@ if _view_is("Advanced Models", "Full Report"):
         s = pd.Series(np.ravel(df[col].values), index=df.index)
         df[col] = pd.to_numeric(s, errors="coerce").round(2)
 
-    for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI","HiddenScore"]:
+    for c in ["PI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI","HiddenScore"]:
         _cast_round(hh_view, c)
 
     st.dataframe(hh_view, use_container_width=True)
@@ -3856,11 +3860,8 @@ if _view_is("Advanced Models", "Full Report"):
     mv01 = 1.0 - _robust01(mv)     # steadiness (0..1, higher = steadier)
     rc01 = _robust01(rc)           # rebound (0..1, higher = more kick late)
 
-    # Class lens: use PI if available, else GCI
-    if "PI" in df.columns and pd.to_numeric(df["PI"], errors="coerce").notna().any():
-        cls = _winsor(pd.to_numeric(df["PI"], errors="coerce"), q=0.02)
-    else:
-        cls = _winsor(pd.to_numeric(df.get("GCI", np.nan), errors="coerce"), q=0.02)
+    # Class lens: refined PI.
+    cls = _winsor(pd.to_numeric(df.get("PI", np.nan), errors="coerce"), q=0.02)
 
     cls01 = _robust01(cls)
 
@@ -3894,17 +3895,14 @@ if _view_is("Advanced Models", "Full Report"):
     # Add PI for context if present
     if "PI" in df.columns:
         out["PI"] = np.round(pd.to_numeric(df["PI"], errors="coerce"), 2)
-    elif "GCI" in df.columns:
-        out["GCI"] = np.round(pd.to_numeric(df["GCI"], errors="coerce"), 2)
 
     # Sort by most reliable first, then strongest class
     sort_cols = ["R&V"]
     if "PI" in out.columns: sort_cols += ["PI"]
-    elif "GCI" in out.columns: sort_cols += ["GCI"]
     out = out.sort_values(sort_cols, ascending=[False] + [False]*(len(sort_cols)-1), kind="mergesort").reset_index(drop=True)
 
     st.dataframe(out, use_container_width=True)
-    st.caption("CAR = class-aware reliability: blends Steadiness (MV), Rebound (RC) and Class (PI/GCI). "
+    st.caption("CAR = class-aware reliability: blends Steadiness (MV), Rebound (RC) and Class (PI). "
                "High CAR → repeatable pattern you can trust; low CAR → fragile/shape-dependent.")
     # ======================= /R&V (CAR) =======================
 
