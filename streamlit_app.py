@@ -2800,12 +2800,11 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                     opacity=0.9,
                     line=dict(color="rgba(245,248,252,0.88)", width=1.2),
                     colorbar=dict(
-                        title=colour_title,
+                        title=dict(text=colour_title, font=dict(color="#dbe5ef")),
                         thickness=13,
                         len=0.62,
                         x=1.02,
                         tickfont=dict(color="#dbe5ef"),
-                        titlefont=dict(color="#dbe5ef"),
                     ),
                 )
                 if cmid is not None:
@@ -2860,14 +2859,14 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                     showlegend=False,
                     uirevision="race-plane-camera",
                 )
-                st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
+                st.plotly_chart(fig, width="stretch", config={"displaylogo": False, "scrollZoom": True})
                 st.caption(
                     "The strongest horses are those occupying the upper performance region of the plane. "
                     "Residual colour and lines are supporting diagnostics, not the primary ranking."
                 )
 
             except ImportError:
-                st.error("Plotly is required for the interactive Race Plane. Add `plotly>=5.24` to requirements.txt.")
+                st.error("Plotly is required for the interactive Race Plane. Add `plotly==5.24.1` to requirements.txt.")
             except Exception as e:
                 st.info(f"Interactive 3D plane could not be rendered: {e}")
 
