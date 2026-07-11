@@ -1332,25 +1332,25 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     # ----- PI v4.3: distance-aware four-core model -----
     # PI is based only on F200, tsSPI, Accel and raw Grind.
     # F200 remains proportional to the race distance. The remaining influence
-    # is divided in the ratio tsSPI : Accel : Grind = 1 : 1.5 : 1.
+    # is divided in the ratio tsSPI : Accel : Grind = 1 : 1.2 : 1.
     GR_COL = "Grind"
 
     race_distance = max(float(D), 200.0)
     w_f200 = float(np.clip(200.0 / race_distance, 0.0, 1.0))
     remaining = max(0.0, 1.0 - w_f200)
-    ratio_total = 3.5
+    ratio_total = 3.2
 
     PI_W = {
         "F200_idx": w_f200,
         "tsSPI": remaining * (1.0 / ratio_total),
-        "Accel": remaining * (1.5 / ratio_total),
+        "Accel": remaining * (1.2 / ratio_total),
         "Grind": remaining * (1.0 / ratio_total),
     }
 
     # Keep metadata available to the dashboard, exports and reports.
     w.attrs["GOING"] = GOING_TYPE if "GOING_TYPE" in globals() else "Good"
     w.attrs["PI_GOING_META"] = {
-        "method": "distance_f200_ratio_1_1.5_1",
+        "method": "distance_f200_ratio_1_1.2_1",
         "distance_m": int(round(race_distance)),
     }
     w.attrs["PI_MASS_NOTE"] = {
@@ -1380,7 +1380,7 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w.attrs["PI_REFINED_META"] = {
         "distance_m": int(round(race_distance)),
         "weights": PI_W.copy(),
-        "method": "f200_distance_proportional_remaining_ratio_1_1.5_1",
+        "method": "f200_distance_proportional_remaining_ratio_1_1.2_1",
         "inputs": ["F200_idx", "tsSPI", "Accel", "Grind"],
         "uses_race_time": False,
         "uses_corrected_grind": False,
