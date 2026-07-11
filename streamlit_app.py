@@ -2474,7 +2474,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
     if not req.issubset(metrics.columns):
         st.warning("Race Plane Analysis needs Horse, tsSPI, Accel and Grind columns.")
     else:
-        cpa1, cpa2, cpa3 = st.columns([1.1, 1.0, 1.0])
+        cpa1, cpa2 = st.columns([1.1, 1.0])
         with cpa1:
             grind_options = ["Grind"]
             if "Grind_CG" in metrics.columns:
@@ -2491,8 +2491,6 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                 value=True,
                 help="Recommended. Fits tsSPI−100, Accel−100 and Grind−100 for cleaner coefficients."
             )
-        with cpa3:
-            show_3d_plane = st.toggle("Show 3D plane", value=True)
 
         plane_df = metrics.loc[:, ["Horse", "tsSPI", "Accel", plane_grind_col]].copy()
         extra_cols = [c for c in ["TOF", "PI", "SRI", "Peak_Location", "Finish_Pos"] if c in metrics.columns]
@@ -2619,10 +2617,283 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
             if rank < 3:
                 st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
 
-            st.markdown("### Class Residual ranking")
-            out_cols = ["Horse", "Finish_Pos", "tsSPI", "Accel", plane_grind_col, "Expected_Grind", "Class_Residual", "CR_Profile"]
-            out_cols += [c for c in ["TOF", "SRI", "Peak_Location", "PI"] if c in plane_df.columns and c not in out_cols]
-            rank_df = plane_df.sort_values("Class_Residual", ascending=False).reset_index(drop=True)
+            # --- Plane prominence: identifies horses operating in the strongest region of the plane ---
+            def _std_score(values):
+                arr = np.asarray(values, dtype=float)
+                mu = float(np.nanmean(arr))
+                sd = float(np.nanstd(arr, ddof=0))
+                if not np.isfinite(sd) or sd <= 1e-12:
+                    return np.zeros_like(arr, dtype=float)
+                return (arr - mu) / sd
+
+            plane_df["Plane_Prominence"] = (
+                _std_score(plane_df["tsSPI"]) +
+                _std_score(plane_df["Accel"]) +
+                _std_score(plane_df[plane_grind_col])
+            ) / 3.0
+            plane_df["Plane_Rank"] = (
+                plane_df["Plane_Prominence"].rank(method="min", ascending=False).astype(int)
+            )
+
+            phase_matrix = np.column_stack([
+                _std_score(plane_df["tsSPI"]),
+                _std_score(plane_df["Accel"]),
+                _std_score(plane_df[plane_grind_col]),
+            ])
+            plane_df["Phase_Balance"] = np.nanstd(phase_matrix, axis=1)
+
+            st.markdown("### Interactive 3D Race Plane")
+            ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.25, 1.0, 1.0, 1.0])
+            with ctrl1:
+                focus_horse = st.selectbox(
+                    "Horse focus",
+                    ["None"] + plane_df.sort_values("Plane_Rank")["Horse"].astype(str).tolist(),
+                    index=0,
+                    key="race_plane_focus_horse",
+                )
+            with ctrl2:
+                label_mode = st.selectbox(
+                    "Labels",
+                    ["Top plane horses", "Selected horse", "All", "Hover only"],
+                    index=0,
+                    key="race_plane_label_mode",
+                )
+            with ctrl3:
+                marker_mode = st.selectbox(
+                    "Marker size",
+                    ["PI", "Fixed"],
+                    index=0,
+                    key="race_plane_marker_mode",
+                )
+            with ctrl4:
+                colour_mode = st.selectbox(
+                    "Colour",
+                    ["Plane position", "Class residual"],
+                    index=0,
+                    key="race_plane_colour_mode",
+                )
+
+            show_residual_lines = st.toggle(
+                "Show residual lines",
+                value=True,
+                help="Shows the vertical distance between each horse and the fitted race plane.",
+                key="race_plane_residual_lines",
+            )
+
+            try:
+                import plotly.graph_objects as go
+
+                plot_df = plane_df.copy()
+                plot_df["_x"] = x
+                plot_df["_y"] = y
+                plot_df["_z"] = z
+                plot_df["_expected_z"] = expected_z
+
+                # Labels prioritise horses in the strongest region of the plane, not residual outliers.
+                labels = np.array([""] * len(plot_df), dtype=object)
+                if label_mode == "Top plane horses":
+                    top_n = min(5, len(plot_df))
+                    top_idx = plot_df.nsmallest(top_n, "Plane_Rank").index
+                    labels[top_idx] = plot_df.loc[top_idx, "Horse"].astype(str)
+                elif label_mode == "Selected horse" and focus_horse != "None":
+                    idx = plot_df.index[plot_df["Horse"].astype(str) == focus_horse]
+                    labels[idx] = plot_df.loc[idx, "Horse"].astype(str)
+                elif label_mode == "All":
+                    labels = plot_df["Horse"].astype(str).to_numpy(dtype=object)
+
+                if focus_horse != "None":
+                    focus_idx = plot_df.index[plot_df["Horse"].astype(str) == focus_horse]
+                    labels[focus_idx] = plot_df.loc[focus_idx, "Horse"].astype(str)
+
+                if marker_mode == "PI" and "PI" in plot_df.columns:
+                    pi_vals = pd.to_numeric(plot_df["PI"], errors="coerce")
+                    if pi_vals.notna().any():
+                        lo, hi = float(pi_vals.min()), float(pi_vals.max())
+                        if hi > lo:
+                            marker_sizes = 8.0 + 10.0 * (pi_vals.fillna(lo).to_numpy() - lo) / (hi - lo)
+                        else:
+                            marker_sizes = np.full(len(plot_df), 12.0)
+                    else:
+                        marker_sizes = np.full(len(plot_df), 12.0)
+                else:
+                    marker_sizes = np.full(len(plot_df), 12.0)
+
+                if focus_horse != "None":
+                    is_focus = plot_df["Horse"].astype(str).eq(focus_horse).to_numpy()
+                    marker_sizes = np.where(is_focus, marker_sizes + 8.0, marker_sizes)
+                    marker_opacity = np.where(is_focus, 1.0, 0.42)
+                else:
+                    marker_opacity = np.full(len(plot_df), 0.9)
+
+                if colour_mode == "Plane position":
+                    colour_values = plot_df["Plane_Prominence"].to_numpy(dtype=float)
+                    colour_title = "Plane position"
+                    colourscale = "Turbo"
+                    cmin = float(np.nanmin(colour_values))
+                    cmax = float(np.nanmax(colour_values))
+                    cmid = None
+                else:
+                    colour_values = plot_df["Class_Residual"].to_numpy(dtype=float)
+                    colour_title = "Residual"
+                    colourscale = "RdBu_r"
+                    vmax = max(float(np.nanmax(np.abs(colour_values))), 1.0)
+                    cmin, cmax, cmid = -vmax, vmax, 0.0
+
+                custom_cols = [
+                    plot_df["Horse"].astype(str).to_numpy(),
+                    plot_df["tsSPI"].to_numpy(dtype=float),
+                    plot_df["Accel"].to_numpy(dtype=float),
+                    plot_df[plane_grind_col].to_numpy(dtype=float),
+                    plot_df["Expected_Grind"].to_numpy(dtype=float),
+                    plot_df["Class_Residual"].to_numpy(dtype=float),
+                    plot_df["Plane_Rank"].to_numpy(dtype=int),
+                    plot_df["Plane_Prominence"].to_numpy(dtype=float),
+                ]
+                if "PI" in plot_df.columns:
+                    custom_cols.append(pd.to_numeric(plot_df["PI"], errors="coerce").to_numpy(dtype=float))
+                else:
+                    custom_cols.append(np.full(len(plot_df), np.nan))
+                customdata = np.column_stack(custom_cols)
+
+                fig = go.Figure()
+
+                # Translucent fitted performance plane.
+                x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 28)
+                y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 28)
+                Xg, Yg = np.meshgrid(x_grid, y_grid)
+                Zg = intercept + b_tsspi * Xg + c_accel * Yg
+                fig.add_trace(go.Surface(
+                    x=Xg,
+                    y=Yg,
+                    z=Zg,
+                    surfacecolor=np.zeros_like(Zg),
+                    colorscale=[[0, "#6f8ea6"], [1, "#6f8ea6"]],
+                    opacity=0.28,
+                    showscale=False,
+                    hoverinfo="skip",
+                    name="Race plane",
+                    contours={"x": {"show": False}, "y": {"show": False}, "z": {"show": False}},
+                ))
+
+                # Thin vertical residual lines from the plane to each horse.
+                if show_residual_lines:
+                    for _, row in plot_df.iterrows():
+                        is_selected = focus_horse != "None" and str(row["Horse"]) == focus_horse
+                        line_colour = "rgba(255,255,255,0.92)" if is_selected else "rgba(180,195,210,0.34)"
+                        line_width = 5 if is_selected else 2
+                        fig.add_trace(go.Scatter3d(
+                            x=[row["_x"], row["_x"]],
+                            y=[row["_y"], row["_y"]],
+                            z=[row["_expected_z"], row["_z"]],
+                            mode="lines",
+                            line=dict(color=line_colour, width=line_width),
+                            hoverinfo="skip",
+                            showlegend=False,
+                        ))
+
+                marker_dict = dict(
+                    size=marker_sizes,
+                    color=colour_values,
+                    colorscale=colourscale,
+                    cmin=cmin,
+                    cmax=cmax,
+                    opacity=0.9,
+                    line=dict(color="rgba(245,248,252,0.88)", width=1.2),
+                    colorbar=dict(
+                        title=colour_title,
+                        thickness=13,
+                        len=0.62,
+                        x=1.02,
+                        tickfont=dict(color="#dbe5ef"),
+                        titlefont=dict(color="#dbe5ef"),
+                    ),
+                )
+                if cmid is not None:
+                    marker_dict["cmid"] = cmid
+
+                fig.add_trace(go.Scatter3d(
+                    x=plot_df["_x"],
+                    y=plot_df["_y"],
+                    z=plot_df["_z"],
+                    mode="markers+text" if label_mode != "Hover only" or focus_horse != "None" else "markers",
+                    text=labels,
+                    textposition="top center",
+                    textfont=dict(size=11, color="#f3f7fb"),
+                    marker=marker_dict,
+                    customdata=customdata,
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>"
+                        "PI: %{customdata[8]:.2f}<br>"
+                        "tsSPI: %{customdata[1]:.2f}<br>"
+                        "Accel: %{customdata[2]:.2f}<br>"
+                        f"{plane_grind_col}: %{{customdata[3]:.2f}}<br>"
+                        "Expected Grind: %{customdata[4]:.2f}<br>"
+                        "Residual: %{customdata[5]:+.2f}<br>"
+                        "Plane rank: %{customdata[6]}<br>"
+                        "Plane position: %{customdata[7]:+.2f}<extra></extra>"
+                    ),
+                    showlegend=False,
+                    name="Horses",
+                ))
+
+                axis_common = dict(
+                    backgroundcolor="#0d131c",
+                    gridcolor="rgba(150,170,190,0.20)",
+                    zerolinecolor="rgba(210,225,240,0.34)",
+                    showbackground=True,
+                    tickfont=dict(color="#c9d5e2", size=11),
+                    titlefont=dict(color="#f2f6fa", size=13),
+                )
+                fig.update_layout(
+                    height=760,
+                    margin=dict(l=0, r=20, t=20, b=0),
+                    paper_bgcolor="#080d14",
+                    plot_bgcolor="#080d14",
+                    font=dict(color="#e8eef5"),
+                    scene=dict(
+                        xaxis={**axis_common, "title": "Sustained Speed (tsSPI)"},
+                        yaxis={**axis_common, "title": "Acceleration"},
+                        zaxis={**axis_common, "title": "Finishing Strength (Grind)"},
+                        camera=dict(eye=dict(x=1.55, y=1.55, z=1.05)),
+                        aspectmode="cube",
+                    ),
+                    showlegend=False,
+                    uirevision="race-plane-camera",
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
+                st.caption(
+                    "The strongest horses are those occupying the upper performance region of the plane. "
+                    "Residual colour and lines are supporting diagnostics, not the primary ranking."
+                )
+
+            except ImportError:
+                st.error("Plotly is required for the interactive Race Plane. Add `plotly>=5.24` to requirements.txt.")
+            except Exception as e:
+                st.info(f"Interactive 3D plane could not be rendered: {e}")
+
+            # --- Compact race-plane summary ---
+            top_plane_row = plane_df.sort_values("Plane_Rank").iloc[0]
+            top_half = plane_df.nsmallest(max(1, int(np.ceil(len(plane_df) / 2))), "Plane_Rank")
+            balanced_row = top_half.sort_values(["Phase_Balance", "Plane_Rank"]).iloc[0]
+
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Top of Plane", str(top_plane_row["Horse"]), f"Rank {int(top_plane_row['Plane_Rank'])}")
+            s2.metric("Best Balanced", str(balanced_row["Horse"]), f"Spread {balanced_row['Phase_Balance']:.2f}")
+            if focus_horse != "None":
+                selected_row = plane_df.loc[plane_df["Horse"].astype(str) == focus_horse].iloc[0]
+                s3.metric("Selected Position", focus_horse, f"Plane rank {int(selected_row['Plane_Rank'])}")
+            else:
+                s3.metric("Selected Position", "None", "Choose a horse above")
+
+            st.markdown("### Plane ranking")
+            out_cols = [
+                "Plane_Rank", "Horse", "Finish_Pos", "PI", "tsSPI", "Accel", plane_grind_col,
+                "Plane_Prominence", "Expected_Grind", "Class_Residual", "CR_Profile"
+            ]
+            out_cols += [c for c in ["TOF", "SRI", "Peak_Location"] if c in plane_df.columns and c not in out_cols]
+            out_cols = [c for c in out_cols if c in plane_df.columns]
+            rank_df = plane_df.sort_values(["Plane_Rank", "Class_Residual"], ascending=[True, False]).reset_index(drop=True)
+            rank_df["Plane_Prominence"] = rank_df["Plane_Prominence"].round(2)
             st.dataframe(rank_df[out_cols], use_container_width=True, hide_index=True)
 
             csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
@@ -2632,39 +2903,6 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                 file_name="race_plane_analysis.csv",
                 mime="text/csv"
             )
-
-            if show_3d_plane:
-                st.markdown("### 3D Race Plane")
-                try:
-                    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-                    fig = plt.figure(figsize=(8.8, 6.6))
-                    ax = fig.add_subplot(111, projection="3d")
-
-                    cr_vals = plane_df["Class_Residual"].to_numpy(dtype=float)
-                    vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
-                    vmax = max(vmax, 1.0)
-                    sc = ax.scatter(x, y, z, c=cr_vals, cmap="coolwarm", vmin=-vmax, vmax=vmax,
-                                    s=55, edgecolor="black", linewidth=0.5, depthshade=True)
-
-                    for xi, yi, zi, name in zip(x, y, z, plane_df["Horse"].astype(str)):
-                        ax.text(xi, yi, zi, name, fontsize=7)
-
-                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 15)
-                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 15)
-                    Xg, Yg = np.meshgrid(x_grid, y_grid)
-                    Zg = intercept + b_tsspi * Xg + c_accel * Yg
-                    ax.plot_surface(Xg, Yg, Zg, alpha=0.22, linewidth=0, antialiased=True)
-
-                    ax.set_xlabel(x_label)
-                    ax.set_ylabel(y_label)
-                    ax.set_zlabel(z_label)
-                    ax.set_title("Race-specific race plane")
-                    cbar = fig.colorbar(sc, ax=ax, shrink=0.65, pad=0.08)
-                    cbar.set_label("Class Residual")
-                    st.pyplot(fig)
-                    st.caption("Points above the race plane sustained better than expected after their travel and acceleration effort.")
-                except Exception as e:
-                    st.info(f"3D plane could not be rendered: {e}")
 
             with st.expander("How to read this module"):
                 st.markdown(
