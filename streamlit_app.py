@@ -2633,39 +2633,6 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                 mime="text/csv"
             )
 
-            st.markdown("### TOF vs Race Residual")
-            if "TOF" not in plane_df.columns:
-                st.info("TOF is not available, so the TOF vs CR map cannot be drawn.")
-            else:
-                d2 = plane_df.dropna(subset=["TOF", "Class_Residual"]).copy()
-                if d2.empty:
-                    st.info("Not enough TOF/CR data to draw the map.")
-                else:
-                    fig, ax = plt.subplots(figsize=(8.2, 5.8))
-                    xv = d2["TOF"].to_numpy(dtype=float)
-                    yv = d2["Class_Residual"].to_numpy(dtype=float)
-                    pi_vals = pd.to_numeric(d2.get("PI", pd.Series(np.nan, index=d2.index)), errors="coerce")
-                    if pi_vals.notna().any() and float(pi_vals.max()) != float(pi_vals.min()):
-                        sizes = 50.0 + (pi_vals.fillna(pi_vals.median()).to_numpy() - float(pi_vals.min())) / (float(pi_vals.max()) - float(pi_vals.min()) + 1e-9) * 120.0
-                    else:
-                        sizes = np.full(len(d2), 80.0)
-                    cv = yv
-                    vmax = float(np.nanmax(np.abs(cv))) if np.isfinite(cv).any() else 1.0
-                    vmax = max(vmax, 1.0)
-                    sc = ax.scatter(xv, yv, c=cv, s=sizes, cmap="coolwarm", vmin=-vmax, vmax=vmax,
-                                    alpha=0.92, edgecolor="black", linewidth=0.6)
-                    label_points_neatly(ax, xv, yv, d2["Horse"].astype(str).to_list())
-                    ax.axhline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
-                    ax.axvline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
-                    ax.set_xlabel("TOF = Accel − tsSPI")
-                    ax.set_ylabel("Class Residual")
-                    ax.set_title("Top-right = turn of foot + above-plane sustain")
-                    ax.grid(True, linestyle=":", alpha=0.25)
-                    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-                    cbar.set_label("Class Residual")
-                    st.pyplot(fig)
-                    st.caption("High TOF + high CR = acceleration weapon that still sustained better than expected.")
-
             if show_3d_plane:
                 st.markdown("### 3D Race Plane")
                 try:
