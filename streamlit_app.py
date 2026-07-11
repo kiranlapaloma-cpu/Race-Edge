@@ -606,7 +606,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Core Metrics", "Visuals", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Core Metrics", "Visuals", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -2223,6 +2223,496 @@ if _view_is("Visuals", "Full Report"):
             ax.grid(True, linestyle=":", alpha=0.25)
             st.pyplot(fig)
             st.caption("SRI = average speed from the horse’s peak sectional through the finish ÷ peak speed × 100. Size=PI.")
+
+
+# ======================= Ability Radar =======================
+if _view_is("Ability Radar", "Full Report"):
+    st.markdown("## Ability Radar")
+    st.caption(
+        "Compare horses from the same race using the core Race Edge indexed values. "
+        "The radar uses F200, tsSPI, Accel and Grind on an 80–110 scale, where 100 is race-average/par."
+    )
+
+    radar_phases = ["F200", "tsSPI", "Accel", "Grind"]
+
+    def _pick_numeric_col(df, candidates):
+        """Return the first candidate column that exists and has at least one numeric value."""
+        for c in candidates:
+            if c in df.columns:
+                vals = pd.to_numeric(df[c], errors="coerce")
+                if vals.notna().any():
+                    return c
+        # If the column exists but is empty, still return it as a last resort so the warning is precise.
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    gr_attr = metrics.attrs.get("GR_COL", None)
+    grind_candidates = []
+    if gr_attr:
+        grind_candidates.append(gr_attr)
+    grind_candidates += ["Grind_CG", "Grind", "Grind_idx", "Corrected_Grind"]
+
+    radar_cols = {
+        "F200": _pick_numeric_col(metrics, ["F200_idx", "F200", "F200_Index", "F200 index", "F200_score"]),
+        "tsSPI": _pick_numeric_col(metrics, ["tsSPI", "tsSPI_idx", "tsSPI_Index"]),
+        "Accel": _pick_numeric_col(metrics, ["Accel", "Accel_idx", "Acceleration", "Acceleration_idx"]),
+        "Grind": _pick_numeric_col(metrics, grind_candidates),
+    }
+
+    missing = [label for label, col in radar_cols.items() if col is None]
+    if missing:
+        st.warning(
+            "Ability Radar needs usable F200, tsSPI, Accel and Grind columns. "
+            f"Missing: {', '.join(missing)}"
+        )
+    else:
+        radar_df = metrics.copy()
+        radar_value_cols = []
+        for phase, col in radar_cols.items():
+            radar_col = f"{phase}_Radar"
+            plot_col = f"{phase}_Plot"
+            radar_df[radar_col] = pd.to_numeric(radar_df[col], errors="coerce")
+            radar_df[plot_col] = radar_df[radar_col].clip(80, 110)
+            radar_value_cols.append(radar_col)
+
+        radar_numeric = radar_df[radar_value_cols].apply(pd.to_numeric, errors="coerce")
+        valid_rows = radar_numeric.notna().any(axis=1)
+
+        if not valid_rows.any():
+            st.warning(
+                "Ability Radar could not find numeric values for F200, tsSPI, Accel or Grind in this race. "
+                "Check that the metrics table has been calculated before opening this module."
+            )
+        else:
+            radar_df["Radar_Avg"] = radar_numeric.mean(axis=1, skipna=True)
+            radar_df["Radar_Spread"] = radar_numeric.max(axis=1, skipna=True) - radar_numeric.min(axis=1, skipna=True)
+
+            def _safe_main_weapon(row):
+                vals = row.dropna()
+                if vals.empty:
+                    return "Unknown"
+                return str(vals.idxmax()).replace("_Radar", "")
+
+            radar_df["Main Weapon"] = radar_numeric.apply(_safe_main_weapon, axis=1)
+
+            def _radar_profile_100(row):
+                vals = {p: row.get(f"{p}_Radar") for p in radar_phases}
+                vals = {k: float(v) for k, v in vals.items() if pd.notna(v) and np.isfinite(float(v))}
+                if not vals:
+                    return "Unknown"
+                f = vals.get("F200", np.nan)
+                t = vals.get("tsSPI", np.nan)
+                a = vals.get("Accel", np.nan)
+                g = vals.get("Grind", np.nan)
+                avg = float(np.mean(list(vals.values())))
+                spread = float(np.nanmax(list(vals.values())) - np.nanmin(list(vals.values())))
+                top_phase = max(vals, key=vals.get)
+
+                if avg >= 101.0 and min(vals.values()) >= 100.0:
+                    return "Complete horse"
+                if np.isfinite(a) and np.isfinite(g) and a >= 101.0 and g >= 101.0:
+                    return "Power finisher"
+                if np.isfinite(t) and np.isfinite(g) and t >= 101.0 and g >= 101.0:
+                    return "Sustained galloper"
+                if np.isfinite(f) and np.isfinite(a) and f >= 101.0 and a >= 101.0:
+                    return "Speed / tactical horse"
+                if top_phase == "Accel" and vals[top_phase] >= 100.5:
+                    return "Turn-of-foot horse"
+                if top_phase == "Grind" and vals[top_phase] >= 100.5:
+                    return "Grinder / sustainer"
+                if top_phase == "tsSPI" and vals[top_phase] >= 100.5:
+                    return "Strong traveller"
+                if top_phase == "F200" and vals[top_phase] >= 100.5:
+                    return "Early-speed horse"
+                if spread <= 1.0:
+                    return "Balanced / neutral"
+                return "Mixed profile"
+
+            radar_df["Profile"] = radar_df.apply(_radar_profile_100, axis=1)
+
+            # Sensible default: top PI horses with usable radar values, otherwise first few usable horses.
+            horse_list = radar_df["Horse"].astype(str).tolist() if "Horse" in radar_df.columns else []
+            default_horses = []
+            usable_radar_df = radar_df[valid_rows].copy()
+            if "PI" in usable_radar_df.columns:
+                tmp = usable_radar_df.copy()
+                tmp["PI"] = pd.to_numeric(tmp["PI"], errors="coerce")
+                default_horses = tmp.sort_values("PI", ascending=False)["Horse"].astype(str).head(3).tolist()
+            if not default_horses and "Horse" in usable_radar_df.columns:
+                default_horses = usable_radar_df["Horse"].astype(str).head(3).tolist()
+
+            selected_horses = st.multiselect(
+                "Select horses to compare",
+                options=horse_list,
+                default=default_horses,
+                help="Choose 1–5 horses for a clean radar comparison."
+            )
+            if len(selected_horses) > 5:
+                st.warning("For readability, the radar chart shows the first 5 selected horses.")
+                selected_horses = selected_horses[:5]
+
+            c1, c2, c3, c4 = st.columns(4)
+            leaders = []
+            for phase in radar_phases:
+                vals = pd.to_numeric(radar_df[f"{phase}_Radar"], errors="coerce")
+                if vals.notna().any():
+                    idx = vals.idxmax()
+                    leaders.append((phase, radar_df.loc[idx, "Horse"], float(vals.loc[idx])))
+                else:
+                    leaders.append((phase, "No data", np.nan))
+            for col, item in zip([c1, c2, c3, c4], leaders):
+                phase, horse, score = item
+                col.metric(f"Best {phase}", str(horse), "—" if not np.isfinite(score) else f"{score:.2f}")
+
+            st.caption("Radar scale: 80–110. The 100 ring is race-average/par. Values outside 80–110 are clipped on the chart only; the table keeps the real values.")
+
+            if not selected_horses:
+                st.info("Select at least one horse to draw the Ability Radar.")
+            else:
+                plot_df = radar_df[radar_df["Horse"].astype(str).isin(selected_horses)].copy()
+                order_map = {h: i for i, h in enumerate(selected_horses)}
+                plot_df["_sel_order"] = plot_df["Horse"].astype(str).map(order_map)
+                plot_df = plot_df.sort_values("_sel_order")
+
+                try:
+                    labels = radar_phases
+                    n = len(labels)
+                    angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
+                    angles += angles[:1]
+
+                    fig, ax = plt.subplots(figsize=(7.8, 7.8), subplot_kw=dict(polar=True))
+                    ax.set_theta_offset(np.pi / 2)
+                    ax.set_theta_direction(-1)
+                    ax.set_xticks(angles[:-1])
+                    ax.set_xticklabels(labels, fontsize=11)
+                    ax.set_ylim(80, 110)
+                    ax.set_yticks([80, 90, 100, 105, 110])
+                    ax.set_yticklabels(["80", "90", "100", "105", "110"], fontsize=8, alpha=0.78)
+                    ax.grid(True, linestyle=":", alpha=0.45)
+
+                    theta = np.linspace(0, 2 * np.pi, 240)
+                    ax.plot(theta, np.full_like(theta, 100.0), linewidth=1.6, linestyle="--", alpha=0.65)
+
+                    plotted_any = False
+                    for _, row in plot_df.iterrows():
+                        raw_values = [row.get(f"{p}_Radar", np.nan) for p in radar_phases]
+                        if not pd.Series(raw_values).notna().any():
+                            continue
+                        # Use 100 as a neutral visual placeholder for a missing phase so one blank value doesn't break the chart.
+                        values = []
+                        for p in radar_phases:
+                            v = row.get(f"{p}_Plot", np.nan)
+                            values.append(100.0 if pd.isna(v) or not np.isfinite(float(v)) else float(v))
+                        values += values[:1]
+                        label = str(row.get("Horse", "Horse"))
+                        ax.plot(angles, values, linewidth=2.2, marker="o", label=label)
+                        ax.fill(angles, values, alpha=0.10)
+                        plotted_any = True
+
+                    if plotted_any:
+                        ax.set_title("Ability Radar — indexed values", pad=24, fontsize=15)
+                        ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.18), ncol=2, frameon=False)
+                        st.pyplot(fig)
+                    else:
+                        st.info("The selected horses do not have enough numeric radar values to draw the chart.")
+                except Exception as e:
+                    st.info(f"Ability Radar could not be drawn: {e}")
+
+                st.markdown("### Radar comparison table")
+                show_cols = ["Horse", "Finish_Pos"] if "Finish_Pos" in radar_df.columns else ["Horse"]
+                if "PI" in radar_df.columns:
+                    show_cols.append("PI")
+                show_cols += [f"{p}_Radar" for p in radar_phases]
+                show_cols += ["Radar_Avg", "Radar_Spread", "Main Weapon", "Profile"]
+                view = plot_df[[c for c in show_cols if c in plot_df.columns]].copy()
+                rename_map = {f"{p}_Radar": p for p in radar_phases}
+                view = view.rename(columns=rename_map)
+                for c in ["F200", "tsSPI", "Accel", "Grind", "Radar_Avg", "Radar_Spread", "PI"]:
+                    if c in view.columns:
+                        view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
+                st.dataframe(view, use_container_width=True, hide_index=True)
+
+            st.markdown("### Full Ability Radar table")
+            full_cols = ["Horse", "Finish_Pos"] if "Finish_Pos" in radar_df.columns else ["Horse"]
+            if "PI" in radar_df.columns:
+                full_cols.append("PI")
+            full_cols += [f"{p}_Radar" for p in radar_phases]
+            full_cols += ["Radar_Avg", "Radar_Spread", "Main Weapon", "Profile"]
+            full_view = radar_df[[c for c in full_cols if c in radar_df.columns]].copy().rename(columns={f"{p}_Radar": p for p in radar_phases})
+            for c in ["F200", "tsSPI", "Accel", "Grind", "Radar_Avg", "Radar_Spread", "PI"]:
+                if c in full_view.columns:
+                    full_view[c] = pd.to_numeric(full_view[c], errors="coerce").round(2)
+            if "Radar_Avg" in full_view.columns:
+                full_view = full_view.sort_values("Radar_Avg", ascending=False, na_position="last").reset_index(drop=True)
+            st.dataframe(full_view, use_container_width=True, hide_index=True)
+
+            with st.expander("How to read Ability Radar"):
+                st.markdown(
+                    """
+- **F200** = early/first-section ability.
+- **tsSPI** = sustained travelling strength.
+- **Accel** = ability to quicken when the race lifts.
+- **Grind** = ability to keep sustaining after the move.
+- **100** is the race average/par line.
+- **Above 100** means the horse was stronger than the race average in that phase.
+- **Below 100** means the horse was weaker than the race average in that phase.
+- The radar uses raw indexed metrics, so it works consistently with both 100m and 200m split files.
+                    """
+                )
+
+# ======================= Race Plane Analysis — Experimental =======================
+if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
+    st.markdown("## Race Plane Analysis")
+    st.caption(
+        "Experimental module. The Race Plane Formula describes what this race rewarded from tsSPI and Accel, "
+        "then the residual ranks horses by how far above or below that race expectation they sustained."
+    )
+
+    req = {"Horse", "tsSPI", "Accel", "Grind"}
+    if not req.issubset(metrics.columns):
+        st.warning("Race Plane Analysis needs Horse, tsSPI, Accel and Grind columns.")
+    else:
+        cpa1, cpa2, cpa3 = st.columns([1.1, 1.0, 1.0])
+        with cpa1:
+            grind_options = ["Grind"]
+            if "Grind_CG" in metrics.columns:
+                grind_options.append("Grind_CG")
+            plane_grind_col = st.selectbox(
+                "Grind target",
+                grind_options,
+                index=0,
+                help="Use raw Grind by default. Grind_CG is available if you want the plane to use corrected grind."
+            )
+        with cpa2:
+            centre_values = st.toggle(
+                "Use centred values",
+                value=True,
+                help="Recommended. Fits tsSPI−100, Accel−100 and Grind−100 for cleaner coefficients."
+            )
+        with cpa3:
+            show_3d_plane = st.toggle("Show 3D plane", value=True)
+
+        plane_df = metrics.loc[:, ["Horse", "tsSPI", "Accel", plane_grind_col]].copy()
+        extra_cols = [c for c in ["TOF", "PI", "SRI", "Peak_Location", "Finish_Pos"] if c in metrics.columns]
+        for c in extra_cols:
+            plane_df[c] = metrics[c]
+
+        for c in ["tsSPI", "Accel", plane_grind_col, "TOF", "PI", "SRI", "Finish_Pos"]:
+            if c in plane_df.columns:
+                plane_df[c] = pd.to_numeric(plane_df[c], errors="coerce")
+
+        plane_df = plane_df.dropna(subset=["tsSPI", "Accel", plane_grind_col]).reset_index(drop=True)
+
+        if len(plane_df) < 4:
+            st.info("Need at least 4 runners with tsSPI, Accel and Grind to fit a stable plane.")
+        else:
+            if centre_values:
+                x = (plane_df["tsSPI"] - 100.0).to_numpy(dtype=float)
+                y = (plane_df["Accel"] - 100.0).to_numpy(dtype=float)
+                z = (plane_df[plane_grind_col] - 100.0).to_numpy(dtype=float)
+                x_label = "tsSPI − 100"
+                y_label = "Accel − 100"
+                z_label = f"{plane_grind_col} − 100"
+                formula_target = f"{plane_grind_col}Δ"
+            else:
+                x = plane_df["tsSPI"].to_numpy(dtype=float)
+                y = plane_df["Accel"].to_numpy(dtype=float)
+                z = plane_df[plane_grind_col].to_numpy(dtype=float)
+                x_label = "tsSPI"
+                y_label = "Accel"
+                z_label = plane_grind_col
+                formula_target = plane_grind_col
+
+            Xmat = np.column_stack([np.ones(len(plane_df)), x, y])
+            coef, residuals, rank, singular_vals = np.linalg.lstsq(Xmat, z, rcond=None)
+            intercept, b_tsspi, c_accel = [float(v) for v in coef]
+            expected_z = Xmat @ coef
+
+            if centre_values:
+                plane_df["Expected_Grind"] = 100.0 + expected_z
+                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+            else:
+                plane_df["Expected_Grind"] = expected_z
+                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+
+            z_mean = float(np.nanmean(z))
+            ss_res = float(np.nansum((z - expected_z) ** 2))
+            ss_tot = float(np.nansum((z - z_mean) ** 2))
+            r2 = np.nan if ss_tot <= 1e-12 else 1.0 - ss_res / ss_tot
+
+            def _cr_profile(v):
+                try:
+                    v = float(v)
+                except Exception:
+                    return "-"
+                if v >= 3.0:
+                    return "🔥 Major above-plane"
+                if v >= 1.5:
+                    return "🟢 Above expectation"
+                if v > -1.5:
+                    return "⚪ Around expectation"
+                if v > -3.0:
+                    return "🟠 Below expectation"
+                return "🔴 Emptied / weak sustain"
+
+            plane_df["CR_Profile"] = plane_df["Class_Residual"].map(_cr_profile)
+            plane_df["Expected_Grind"] = plane_df["Expected_Grind"].round(2)
+            plane_df["Class_Residual"] = plane_df["Class_Residual"].round(2)
+
+            # --- Race DNA: relative contribution of each race-plane input ---
+            denom = abs(b_tsspi) + abs(c_accel)
+            if denom > 1e-12:
+                travel_share = abs(b_tsspi) / denom
+                accel_share = abs(c_accel) / denom
+            else:
+                travel_share = np.nan
+                accel_share = np.nan
+
+            residual_std = float(np.nanstd(plane_df["Class_Residual"].to_numpy(dtype=float), ddof=1)) if len(plane_df) > 1 else np.nan
+            residual_range = float(np.nanmax(plane_df["Class_Residual"]) - np.nanmin(plane_df["Class_Residual"])) if len(plane_df) else np.nan
+
+            def _influence_label(coef, name):
+                sign = "positive" if coef > 0 else "negative" if coef < 0 else "neutral"
+                return f"{name} {sign}"
+
+            def _race_identity(r2_val, travel_sh, accel_sh, b_coef, c_coef):
+                if not np.isfinite(r2_val):
+                    return "Unclear race plane"
+                if r2_val < 0.30:
+                    return "Low-explainability / hidden-quality race"
+                if np.isfinite(accel_sh) and accel_sh >= 0.70 and c_coef > 0:
+                    return "Acceleration-dominated race"
+                if np.isfinite(travel_sh) and travel_sh >= 0.70 and b_coef > 0:
+                    return "Travel-dominated race"
+                if b_coef > 0 and c_coef > 0:
+                    return "Balanced travel + acceleration race"
+                if c_coef > 0 and b_coef <= 0:
+                    return "Acceleration-led / travel not rewarded"
+                return "Mixed race plane"
+
+            race_identity = _race_identity(r2, travel_share, accel_share, b_tsspi, c_accel)
+
+            st.markdown("### Race Plane Formula")
+            st.code(
+                f"{formula_target} = {intercept:.3f} + ({b_tsspi:.3f} × {x_label}) + ({c_accel:.3f} × {y_label})",
+                language="text"
+            )
+            st.caption(
+                f"R² = {r2:.3f} · runners used = {len(plane_df)} · rank = {rank}. "
+                "Class Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
+            )
+
+            st.markdown("### Race DNA")
+            dna_cols = st.columns(4)
+            dna_cols[0].metric("Travel influence", "-" if not np.isfinite(travel_share) else f"{travel_share*100:.0f}%", f"coef {b_tsspi:+.2f}")
+            dna_cols[1].metric("Acceleration influence", "-" if not np.isfinite(accel_share) else f"{accel_share*100:.0f}%", f"coef {c_accel:+.2f}")
+            dna_cols[2].metric("Explainability", "-" if not np.isfinite(r2) else f"{r2*100:.0f}%", "R²")
+            dna_cols[3].metric("Residual spread", "-" if not np.isfinite(residual_std) else f"{residual_std:.2f}", "std dev")
+
+            st.info(
+                f"**Race identity:** {race_identity}. "
+                f"Travel coefficient is {b_tsspi:+.3f}; Accel coefficient is {c_accel:+.3f}. "
+                "The percentages use absolute coefficient size, while the sign tells whether that influence was positive or negative."
+            )
+            if rank < 3:
+                st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
+
+            st.markdown("### Class Residual ranking")
+            out_cols = ["Horse", "Finish_Pos", "tsSPI", "Accel", plane_grind_col, "Expected_Grind", "Class_Residual", "CR_Profile"]
+            out_cols += [c for c in ["TOF", "SRI", "Peak_Location", "PI"] if c in plane_df.columns and c not in out_cols]
+            rank_df = plane_df.sort_values("Class_Residual", ascending=False).reset_index(drop=True)
+            st.dataframe(rank_df[out_cols], use_container_width=True, hide_index=True)
+
+            csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Race Plane table (CSV)",
+                data=csv,
+                file_name="race_plane_analysis.csv",
+                mime="text/csv"
+            )
+
+            st.markdown("### TOF vs Race Residual")
+            if "TOF" not in plane_df.columns:
+                st.info("TOF is not available, so the TOF vs CR map cannot be drawn.")
+            else:
+                d2 = plane_df.dropna(subset=["TOF", "Class_Residual"]).copy()
+                if d2.empty:
+                    st.info("Not enough TOF/CR data to draw the map.")
+                else:
+                    fig, ax = plt.subplots(figsize=(8.2, 5.8))
+                    xv = d2["TOF"].to_numpy(dtype=float)
+                    yv = d2["Class_Residual"].to_numpy(dtype=float)
+                    pi_vals = pd.to_numeric(d2.get("PI", pd.Series(np.nan, index=d2.index)), errors="coerce")
+                    if pi_vals.notna().any() and float(pi_vals.max()) != float(pi_vals.min()):
+                        sizes = 50.0 + (pi_vals.fillna(pi_vals.median()).to_numpy() - float(pi_vals.min())) / (float(pi_vals.max()) - float(pi_vals.min()) + 1e-9) * 120.0
+                    else:
+                        sizes = np.full(len(d2), 80.0)
+                    cv = yv
+                    vmax = float(np.nanmax(np.abs(cv))) if np.isfinite(cv).any() else 1.0
+                    vmax = max(vmax, 1.0)
+                    sc = ax.scatter(xv, yv, c=cv, s=sizes, cmap="coolwarm", vmin=-vmax, vmax=vmax,
+                                    alpha=0.92, edgecolor="black", linewidth=0.6)
+                    label_points_neatly(ax, xv, yv, d2["Horse"].astype(str).to_list())
+                    ax.axhline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
+                    ax.axvline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
+                    ax.set_xlabel("TOF = Accel − tsSPI")
+                    ax.set_ylabel("Class Residual")
+                    ax.set_title("Top-right = turn of foot + above-plane sustain")
+                    ax.grid(True, linestyle=":", alpha=0.25)
+                    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                    cbar.set_label("Class Residual")
+                    st.pyplot(fig)
+                    st.caption("High TOF + high CR = acceleration weapon that still sustained better than expected.")
+
+            if show_3d_plane:
+                st.markdown("### 3D Race Plane")
+                try:
+                    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+                    fig = plt.figure(figsize=(8.8, 6.6))
+                    ax = fig.add_subplot(111, projection="3d")
+
+                    cr_vals = plane_df["Class_Residual"].to_numpy(dtype=float)
+                    vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
+                    vmax = max(vmax, 1.0)
+                    sc = ax.scatter(x, y, z, c=cr_vals, cmap="coolwarm", vmin=-vmax, vmax=vmax,
+                                    s=55, edgecolor="black", linewidth=0.5, depthshade=True)
+
+                    for xi, yi, zi, name in zip(x, y, z, plane_df["Horse"].astype(str)):
+                        ax.text(xi, yi, zi, name, fontsize=7)
+
+                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 15)
+                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 15)
+                    Xg, Yg = np.meshgrid(x_grid, y_grid)
+                    Zg = intercept + b_tsspi * Xg + c_accel * Yg
+                    ax.plot_surface(Xg, Yg, Zg, alpha=0.22, linewidth=0, antialiased=True)
+
+                    ax.set_xlabel(x_label)
+                    ax.set_ylabel(y_label)
+                    ax.set_zlabel(z_label)
+                    ax.set_title("Race-specific race plane")
+                    cbar = fig.colorbar(sc, ax=ax, shrink=0.65, pad=0.08)
+                    cbar.set_label("Class Residual")
+                    st.pyplot(fig)
+                    st.caption("Points above the race plane sustained better than expected after their travel and acceleration effort.")
+                except Exception as e:
+                    st.info(f"3D plane could not be rendered: {e}")
+
+            with st.expander("How to read this module"):
+                st.markdown(
+                    """
+- **Race Plane Formula:** the race-specific expected relationship between travel strength, acceleration strength and grind.
+- **Expected Grind:** what the model predicts a horse should have produced from its tsSPI and Accel.
+- **Class Residual:** actual Grind minus expected Grind.
+- **Positive CR:** the horse sustained better than expected.
+- **Negative CR:** the horse did less late than its travel/acceleration profile suggested.
+
+- **Race DNA:** relative contribution of tsSPI and Accel to the formula, plus R² explainability and residual spread.
+
+This is experimental. In small fields or unusual race shapes, use it as a guide rather than a final rating.
+                    """
+                )
 
 
 # ======================= Advanced Models =======================
