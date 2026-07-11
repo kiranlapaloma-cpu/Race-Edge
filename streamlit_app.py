@@ -177,7 +177,7 @@ def label_points_neatly(ax, x, y, labels):
 
 # ----------------------- Page config -----------------------
 st.set_page_config(
-    page_title="Race Edge — PI v4 + Hidden v2 + Ability v2 + CG + Race Shape + DB",
+    page_title="Race Edge — PI v3.2 + Hidden v2 + Ability v2 + CG + Race Shape + DB",
     layout="wide"
 )
 
@@ -688,8 +688,8 @@ with st.sidebar:
     race_distance_input = st.number_input("Race Distance (m)", min_value=800, max_value=4000, step=50, value=1600)
 
     with st.expander("Advanced settings", expanded=False):
-        USE_CG = st.toggle("Use Corrected Grind (CG) in diagnostics", value=True, help="Uses CG in diagnostic charts only. PI v4 always uses raw Grind.")
-        DAMPEN_CG = st.toggle("Show collapse-aware CG diagnostics", value=True, help="Retained for diagnostic compatibility; it does not alter PI v4.")
+        USE_CG = st.toggle("Use Corrected Grind (CG)", value=True, help="Adjust Grind when the field finish collapses; preserves finisher credit.")
+        DAMPEN_CG = st.toggle("Dampen Grind weight if collapsed", value=True, help="Shift a little weight Grind→Accel/tsSPI on collapse races.")
         USE_RACE_SHAPE = st.toggle("Use Race Shape module (SED/FRA/SCI)", value=True,
                                    help="Detect slow-early/sprint-home and apply False-Run Adjustment and consistency guardrails.")
         USE_GOING_ADJUST = st.toggle(
@@ -1059,33 +1059,46 @@ def _speed_to_idx(spd_series):
     idx = _variance_floor(idx)
     return idx
 
-# -------- Distance/context weights for PI v4 --------
+# -------- Distance/context weights for PI --------
 def _lerp(a, b, t): return a + (b - a) * float(t)
 
 def _interp_weights(dm, a_dm, a_w, b_dm, b_w):
     span = float(b_dm - a_dm)
     t = 0.0 if span <= 0 else (float(dm) - a_dm) / span
-    return {k: _lerp(a_w[k], b_w[k], t) for k in a_w}
+    return {
+        "F200_idx": _lerp(a_w["F200_idx"], b_w["F200_idx"], t),
+        "tsSPI":    _lerp(a_w["tsSPI"],    b_w["tsSPI"],    t),
+        "Accel":    _lerp(a_w["Accel"],    b_w["Accel"],    t),
+        "Grind":    _lerp(a_w["Grind"],    b_w["Grind"],    t),
+    }
 
 def pi_weights_distance_and_context(
     distance_m: float,
-    acc_med: float|None = None,
-    grd_med: float|None = None,
+    acc_med: float|None,
+    grd_med: float|None,
     going: str = "Good",
     field_n: int | None = None,
     return_meta: bool = False
 ) -> dict | tuple[dict, dict]:
-    """PI v4 weights. Total race performance is the anchor; sectional phases refine it."""
+    """
+    Returns PI weights (sum=1). If return_meta=True, also returns a meta dict
+    describing the going multipliers actually applied.
+    Going affects PI weighting only; the underlying sectional indices remain unchanged.
+    """
+
     dm = float(distance_m or 1200)
+
+    # ---- Continuous base weights by distance ----
+    # Refined to reward complete sprint performances and genuine staying strength.
+    # Values between anchors are linearly interpolated, avoiding abrupt distance bands.
     anchors = [
-        (1000.0, {"Time_Index":0.30, "F200_idx":0.25, "tsSPI":0.15, "Accel":0.20, "Grind":0.10}),
-        (1200.0, {"Time_Index":0.30, "F200_idx":0.25, "tsSPI":0.15, "Accel":0.20, "Grind":0.10}),
-        (1400.0, {"Time_Index":0.35, "F200_idx":0.15, "tsSPI":0.20, "Accel":0.15, "Grind":0.15}),
-        (1800.0, {"Time_Index":0.35, "F200_idx":0.15, "tsSPI":0.20, "Accel":0.15, "Grind":0.15}),
-        (2000.0, {"Time_Index":0.30, "F200_idx":0.10, "tsSPI":0.25, "Accel":0.15, "Grind":0.20}),
-        (2400.0, {"Time_Index":0.30, "F200_idx":0.10, "tsSPI":0.25, "Accel":0.15, "Grind":0.20}),
-        (2500.0, {"Time_Index":0.25, "F200_idx":0.05, "tsSPI":0.30, "Accel":0.15, "Grind":0.25}),
-        (3200.0, {"Time_Index":0.25, "F200_idx":0.05, "tsSPI":0.30, "Accel":0.15, "Grind":0.25}),
+        (1000.0, {"F200_idx":0.12, "tsSPI":0.23, "Accel":0.30, "Grind":0.35}),
+        (1200.0, {"F200_idx":0.10, "tsSPI":0.25, "Accel":0.32, "Grind":0.33}),
+        (1400.0, {"F200_idx":0.10, "tsSPI":0.30, "Accel":0.35, "Grind":0.25}),
+        (1600.0, {"F200_idx":0.08, "tsSPI":0.34, "Accel":0.34, "Grind":0.24}),
+        (2000.0, {"F200_idx":0.07, "tsSPI":0.37, "Accel":0.31, "Grind":0.25}),
+        (2400.0, {"F200_idx":0.05, "tsSPI":0.40, "Accel":0.28, "Grind":0.27}),
+        (3000.0, {"F200_idx":0.03, "tsSPI":0.42, "Accel":0.23, "Grind":0.32}),
     ]
     if dm <= anchors[0][0]:
         base = anchors[0][1].copy()
@@ -1097,25 +1110,63 @@ def pi_weights_distance_and_context(
             if d0 <= dm <= d1:
                 base = _interp_weights(dm, d0, w0, d1, w1)
                 break
+    F200, ts, ACC, GR = (base["F200_idx"], base["tsSPI"], base["Accel"], base["Grind"])
 
-    # Going makes only a restrained adjustment. Time remains the anchor.
+    # ---- Mild context nudge (your bias step) ----
+    if acc_med is not None and grd_med is not None and math.isfinite(acc_med) and math.isfinite(grd_med):
+        bias = acc_med - grd_med
+        scale = math.tanh(abs(bias) / 6.0)
+        max_shift = 0.02 * scale
+        F200, ts, ACC, GR = base["F200_idx"], base["tsSPI"], base["Accel"], base["Grind"]
+        if bias > 0:
+            delta = min(max_shift, ACC - 0.26); ACC -= delta; GR += delta
+        elif bias < 0:
+            delta = min(max_shift, GR - 0.18); GR -= delta; ACC += delta
+        GR = min(GR, 0.40); ts = max(0.0, 1.0 - F200 - ACC - GR)
+        base = {"F200_idx":F200,"tsSPI":ts,"Accel":ACC,"Grind":GR}
+
+    # ---- Going modulation (affects PI weighting ONLY) ----
+    # Field-size damper: full effect by 12+ runners; scale down in small fields
     n = max(1, int(field_n or 12))
     field_scale = min(1.0, n / 12.0)
-    mult = {k: 1.0 for k in base}
-    if going == "Firm":
-        mult["Accel"] = 1.0 + 0.03 * field_scale
-    elif going == "Soft":
-        mult["Grind"] = 1.0 + 0.03 * field_scale
-    elif going == "Heavy":
-        mult["Grind"] = 1.0 + 0.05 * field_scale
-        mult["tsSPI"] = 1.0 + 0.02 * field_scale
 
-    weighted = {k: base[k] * mult[k] for k in base}
-    total = sum(weighted.values()) or 1.0
-    out = {k: v / total for k, v in weighted.items()}
+    # Going multipliers (before renormalization)
+    # Good = neutral (all 1.0)
+    # Firm: reward Accel & F200; soften Grind & tsSPI
+    # Soft: reward Grind & tsSPI; soften Accel & F200
+    # Heavy: stronger version of Soft
+    if going == "Firm":
+        # Firm: boost Accel ONLY
+        amp = 0.03 * field_scale
+        mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0 + amp, "Grind": 1.0}
+
+    elif going == "Soft":
+        # Soft: boost Grind ONLY
+        amp = 0.03 * field_scale
+        mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0 + amp}
+
+    elif going == "Heavy":
+        # Heavy: boost Grind ONLY (stronger)
+        amp = 0.05 * field_scale
+        mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0 + amp}
+
+    else:  # "Good" or unknown
+        mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0}
+
+    weighted = {k: base[k] * mult[k] for k in base.keys()}
+    s = sum(weighted.values()) or 1.0
+    out = {k: v / s for k, v in weighted.items()}
+
     if not return_meta:
         return out
-    return out, {"going": going, "field_n": n, "multipliers": mult, "base": base.copy(), "final": out.copy()}
+    meta = {
+        "going": going,
+        "field_n": n,
+        "multipliers": mult,
+        "base": base.copy(),
+        "final": out.copy()
+    }
+    return out, meta
 
 # -------- Core builder --------
 def build_metrics_and_shape(df_in: pd.DataFrame,
@@ -1278,157 +1329,120 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         return 100.0 + 0.5*(g-100.0) if (dg < 97.0 and g > 100.0) else g
     w["Grind_CG"] = [ _fade_cap(g, dg) for g, dg in zip(w["Grind_CG"], w["DeltaG"]) ]
 
-    # ----- PI v4: total performance anchored, robust and compressed -----
-    # Corrected Grind remains available as a diagnostic, but PI always uses raw Grind.
+    # ----- PI v4.3: distance-aware four-core model -----
+    # PI is based only on F200, tsSPI, Accel and raw Grind.
+    # F200 remains proportional to the race distance. The remaining influence
+    # is divided in the ratio tsSPI : Accel : Grind = 1 : 1.5 : 1.
     GR_COL = "Grind"
 
-    global GOING_TYPE, USE_GOING_ADJUST
-    going_for_pi = GOING_TYPE if ('USE_GOING_ADJUST' in globals() and USE_GOING_ADJUST) else "Good"
-    PI_W, PI_META = pi_weights_distance_and_context(
-        D, going=going_for_pi, field_n=len(w), return_meta=True
-    )
-    w.attrs["GOING"] = going_for_pi
-    w.attrs["PI_GOING_META"] = PI_META
+    race_distance = max(float(D), 200.0)
+    w_f200 = float(np.clip(200.0 / race_distance, 0.0, 1.0))
+    remaining = max(0.0, 1.0 - w_f200)
+    ratio_total = 3.5
 
-    # Total-time anchor: faster than the field median scores above 100.
-    race_times = pd.to_numeric(w["RaceTime_s"], errors="coerce")
-    valid_times = race_times.where(race_times > 0)
-    median_time = float(np.nanmedian(valid_times)) if valid_times.notna().any() else np.nan
-    if np.isfinite(median_time) and median_time > 0:
-        w["Time_Index"] = 100.0 * median_time / valid_times
-    else:
-        w["Time_Index"] = np.nan
-
-    def _robust_z(series: pd.Series, cap: float = 2.5) -> pd.Series:
-        x = pd.to_numeric(series, errors="coerce")
-        med = float(np.nanmedian(x)) if x.notna().any() else np.nan
-        if not np.isfinite(med):
-            return pd.Series(np.nan, index=x.index, dtype=float)
-        mad = float(np.nanmedian(np.abs(x - med)))
-        scale = 1.4826 * mad
-        if not np.isfinite(scale) or scale < 0.20:
-            # Fallback prevents tiny fields/ties from exploding the score.
-            std = float(np.nanstd(x, ddof=0))
-            scale = std if np.isfinite(std) and std >= 0.20 else 1.0
-        return ((x - med) / scale).clip(-cap, cap)
-
-    z_map = {
-        "Time_Index": "z_Time",
-        "F200_idx": "z_F200",
-        "tsSPI": "z_tsSPI",
-        "Accel": "z_Accel",
-        "Grind": "z_Grind",
+    PI_W = {
+        "F200_idx": w_f200,
+        "tsSPI": remaining * (1.0 / ratio_total),
+        "Accel": remaining * (1.5 / ratio_total),
+        "Grind": remaining * (1.0 / ratio_total),
     }
-    for src, dst in z_map.items():
-        w[dst] = _robust_z(w[src])
 
-    # Balance control: only sectional phases are included, not total time.
-    phase_z_cols = ["z_F200", "z_tsSPI", "z_Accel", "z_Grind"]
-    w["Phase_Variability"] = w[phase_z_cols].std(axis=1, ddof=0, skipna=True).fillna(0.0)
-    BALANCE_K = 0.15
+    # Keep metadata available to the dashboard, exports and reports.
+    w.attrs["GOING"] = GOING_TYPE if "GOING_TYPE" in globals() else "Good"
+    w.attrs["PI_GOING_META"] = {
+        "method": "distance_f200_ratio_1_1.5_1",
+        "distance_m": int(round(race_distance)),
+    }
+    w.attrs["PI_MASS_NOTE"] = {
+        "mass_col": "(not used in PI)",
+        "ref_kg": None,
+        "perkg_pts": 0.0,
+        "distance_m": int(round(race_distance)),
+    }
 
-    # Carried mass remains a restrained adjustment against the race median.
-    def _mass_kg_series(df: pd.DataFrame) -> tuple[pd.Series, str]:
-        candidates = ["Carried_kg", "Weight", "Wt", "Carried", "WeightCarried", "Weight Allocated"]
-        src = next((c for c in candidates if c in df.columns), None)
-        if src is None:
-            return pd.Series(np.nan, index=df.index, dtype=float), "none"
+    def _pi_pts_row(r):
+        values = {
+            "F200_idx": pd.to_numeric(pd.Series([r.get("F200_idx")]), errors="coerce").iloc[0],
+            "tsSPI": pd.to_numeric(pd.Series([r.get("tsSPI")]), errors="coerce").iloc[0],
+            "Accel": pd.to_numeric(pd.Series([r.get("Accel")]), errors="coerce").iloc[0],
+            "Grind": pd.to_numeric(pd.Series([r.get("Grind")]), errors="coerce").iloc[0],
+        }
+        valid = {k: v for k, v in values.items() if np.isfinite(v)}
+        if not valid:
+            return np.nan
 
-        def _to_kg(v):
-            if v is None:
-                return np.nan
-            s = str(v).strip().lower()
-            if not s or s == "nan":
-                return np.nan
-            m = re.match(r"^\s*(\d+)\s*(?:st|stone)?\s*[-\s]?\s*(\d+)\s*(?:lb|lbs)?\s*$", s)
-            if m and ("st" in s or "-" in s):
-                return (float(m.group(1)) * 14.0 + float(m.group(2))) * 0.45359237
-            m = re.search(r"([-+]?\d+(?:\.\d+)?)", s)
-            if not m:
-                return np.nan
-            val = float(m.group(1))
-            if "lb" in s or val > 130:
-                return val * 0.45359237
-            return val
+        valid_weight = sum(PI_W[k] for k in valid) or 1.0
+        return sum(PI_W[k] * (v - 100.0) for k, v in valid.items()) / valid_weight
 
-        return pd.to_numeric(df[src].map(_to_kg), errors="coerce"), src
+    w["Sprint_Conversion_Penalty"] = 0.0
+    w["PI_pts"] = w.apply(_pi_pts_row, axis=1)
 
-    mass_kg, mass_src = _mass_kg_series(w)
-    w.attrs["MASS_SRC"] = mass_src
-    mass_ref = float(np.nanmedian(mass_kg)) if mass_kg.notna().any() else np.nan
-    mass_delta = (mass_kg - mass_ref) if np.isfinite(mass_ref) else pd.Series(0.0, index=w.index, dtype=float)
+    w.attrs["PI_REFINED_META"] = {
+        "distance_m": int(round(race_distance)),
+        "weights": PI_W.copy(),
+        "method": "f200_distance_proportional_remaining_ratio_1_1.5_1",
+        "inputs": ["F200_idx", "tsSPI", "Accel", "Grind"],
+        "uses_race_time": False,
+        "uses_corrected_grind": False,
+        "uses_weight_adjustment": False,
+    }
 
-    # Core-space mass penalty is deliberately small; sectionals and time remain primary.
-    def _mass_core_per_kg(dm: float) -> float:
-        knots = [(1000,0.035),(1200,0.040),(1600,0.050),(2000,0.060),(2400,0.070),(3200,0.085)]
-        dm = float(dm)
-        if dm <= knots[0][0]: return knots[0][1]
-        if dm >= knots[-1][0]: return knots[-1][1]
-        for (a,va),(b,vb) in zip(knots, knots[1:]):
-            if a <= dm <= b:
-                t = (dm-a)/(b-a)
-                return va + (vb-va)*t
-        return 0.05
+    # Race-relative 0-10 scale. The field median centres on 5, while the
+    # non-linear mapping preserves separation without forcing the leader to 10.
+    pts = pd.to_numeric(w["PI_pts"], errors="coerce")
+    finite_pts = pts[np.isfinite(pts)]
+    med = float(np.nanmedian(finite_pts)) if len(finite_pts) else 0.0
+    centered = pts - med
+    sigma = mad_std(centered)
+    sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else float(sigma)
 
-    MASS_K = _mass_core_per_kg(D)
-    w["Mass_Core_Penalty"] = (MASS_K * mass_delta).fillna(0.0)
+    w["PI"] = (
+        5.0 + 2.75 * np.tanh((centered / sigma) / 1.35)
+    ).clip(0.0, 10.0).round(2)
 
-    weighted_core = (
-        PI_W["Time_Index"] * w["z_Time"].fillna(0.0)
-        + PI_W["F200_idx"] * w["z_F200"].fillna(0.0)
-        + PI_W["tsSPI"] * w["z_tsSPI"].fillna(0.0)
-        + PI_W["Accel"] * w["z_Accel"].fillna(0.0)
-        + PI_W["Grind"] * w["z_Grind"].fillna(0.0)
-    )
-    w["Balance_Penalty"] = BALANCE_K * w["Phase_Variability"]
-    w["Sprint_Conversion_Penalty"] = 0.0  # retained for export compatibility; no longer used by PI v4
-    w["PI_pts"] = weighted_core - w["Balance_Penalty"] - w["Mass_Core_Penalty"]
+    # ----- Phase PI decomposition -----
+    # Diagnostic weighted contributions. Final PI is non-linear, so these
+    # components explain influence but are not expected to add exactly to PI.
+    total_pi_w = sum(PI_W.values()) or 1.0
+    pi_scale = 1.0
+    pi_intercept = 5.0
 
-    # Compressed scale: field-best is not automatically 10 and small gaps stay small.
-    w["PI"] = (7.0 + 1.2 * np.tanh(pd.to_numeric(w["PI_pts"], errors="coerce") / 1.6)).clip(0.0, 10.0).round(2)
+    def _phase_component(series, weight):
+        vals = pd.to_numeric(series, errors="coerce")
+        return (weight * (vals - 100.0)) / total_pi_w
 
-    # Phase contributions are shown in core-score space. PI_Phase_Total equals the nonlinear final PI.
-    w["PI_Base"] = 7.0
-    w["Time_PIc"] = (PI_W["Time_Index"] * w["z_Time"].fillna(0.0)).round(3)
-    w["F200_PIc"] = (PI_W["F200_idx"] * w["z_F200"].fillna(0.0)).round(3)
-    w["tsSPI_PIc"] = (PI_W["tsSPI"] * w["z_tsSPI"].fillna(0.0)).round(3)
-    w["Accel_PIc"] = (PI_W["Accel"] * w["z_Accel"].fillna(0.0)).round(3)
-    w["Grind_PIc"] = (PI_W["Grind"] * w["z_Grind"].fillna(0.0)).round(3)
-    w["Mass_PIc"] = (-w["Mass_Core_Penalty"]).round(3)
-    w["Balance_PIc"] = (-w["Balance_Penalty"]).round(3)
+    w["PI_Base"] = 5.0
+    w["F200_PIc"] = _phase_component(w.get("F200_idx"), PI_W["F200_idx"]).round(3)
+    w["tsSPI_PIc"] = _phase_component(w.get("tsSPI"), PI_W["tsSPI"]).round(3)
+    w["Accel_PIc"] = _phase_component(w.get("Accel"), PI_W["Accel"]).round(3)
+    w["Grind_PIc"] = _phase_component(w.get("Grind"), PI_W["Grind"]).round(3)
+    w["Mass_PIc"] = 0.0
     w["Conversion_PIc"] = 0.0
-    w["PI_Phase_Total"] = w["PI"]
+
+    phase_cols_calc = ["F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc"]
+    w["PI_Phase_Total"] = (
+        5.0
+        + w[phase_cols_calc].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+    ).clip(0.0, 10.0).round(2)
 
     def _main_phase_from_row(r):
         vals = {
-            "Time": r.get("Time_PIc"),
             "F200": r.get("F200_PIc"),
             "tsSPI": r.get("tsSPI_PIc"),
             "Accel": r.get("Accel_PIc"),
             "Grind": r.get("Grind_PIc"),
         }
-        vals = {k: float(v) for k, v in vals.items() if pd.notna(v) and np.isfinite(float(v))}
+        vals = {
+            k: float(v) for k, v in vals.items()
+            if pd.notna(v) and np.isfinite(float(v))
+        }
         return max(vals, key=vals.get) if vals else "-"
 
     w["Main_PI_Phase"] = w.apply(_main_phase_from_row, axis=1)
     w.attrs["PI_PHASE_WEIGHTS"] = PI_W.copy()
-    w.attrs["PI_PHASE_SCALE"] = 1.2
-    w.attrs["PI_PHASE_BASE"] = 7.0
-    w.attrs["PI_REFINED_META"] = {
-        "version": "PI v4",
-        "distance_m": int(D),
-        "weights": PI_W.copy(),
-        "balance_k": BALANCE_K,
-        "mass_core_per_kg": round(float(MASS_K), 4),
-        "grind_source": "raw Grind",
-        "scale": "7 + 1.2*tanh(core/1.6)",
-    }
-    w.attrs["PI_MASS_NOTE"] = {
-        "mass_col": mass_src,
-        "ref_kg": round(mass_ref, 2) if np.isfinite(mass_ref) else None,
-        "perkg_pts": round(float(MASS_K), 3),
-        "distance_m": int(D),
-    }
+    w.attrs["PI_PHASE_SCALE"] = float(pi_scale)
+    w.attrs["PI_PHASE_BASE"] = float(pi_intercept)
+# ---------- /Mass-aware PI points ----------
 
     # GCI removed: PI is now the sole overall performance rating.
         # ----- EARLY/LATE (blended, for display only) -----
@@ -1848,7 +1862,7 @@ if _view_is("Dashboard", "Full Report"):
     render_dashboard(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
 
 if _view_is("Core Metrics", "Full Report"):
-    st.markdown("## Sectional Metrics (PI v4 + CG Diagnostics + Race Shape + SRI + TOF)")
+    st.markdown("## Sectional Metrics (Refined PI + CG + Race Shape + SRI + TOF)")
 
 if _view_is("Core Metrics", "Full Report"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
