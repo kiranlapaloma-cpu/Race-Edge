@@ -1592,7 +1592,8 @@ def build_pri_table(raw_df: pd.DataFrame, metrics_df: pd.DataFrame, distance_m: 
     """
     Pressure phase: after the opening 200m until 400m from home.
     Retention phase: final 400m.
-    PRI is independent of PI and uses 60% absorbed pressure, 40% late retention.
+    PRI is independent of PI. Positive pressure only earns full credit when
+    the horse retains that effort through the final 400m.
     """
     D = float(distance_m)
     out = pd.DataFrame(index=raw_df.index)
@@ -1632,7 +1633,19 @@ def build_pri_table(raw_df: pd.DataFrame, metrics_df: pd.DataFrame, distance_m: 
 
     out["Pressure_z"] = _pri_robust_z(out["Pressure_Delta_pct"])
     out["Retention_z"] = _pri_robust_z(out["Retention_pct"])
-    out["PRI_Core"] = 0.60 * out["Pressure_z"] + 0.40 * out["Retention_z"]
+
+    # Retained-pressure model:
+    # - Only above-field pressure creates positive pressure credit.
+    # - That credit is gated by how much speed the horse retained late.
+    # - 90% retention gives no retained-pressure credit; 100% gives full credit.
+    #   Values outside that band are clipped for stability.
+    out["Positive_Pressure_z"] = pd.to_numeric(out["Pressure_z"], errors="coerce").clip(lower=0.0)
+    out["Retention_Gate"] = (
+        (pd.to_numeric(out["Retention_pct"], errors="coerce") - 90.0) / 10.0
+    ).clip(lower=0.0, upper=1.0)
+    out["Retained_Pressure"] = out["Positive_Pressure_z"] * out["Retention_Gate"]
+
+    out["PRI_Core"] = 0.50 * out["Retained_Pressure"] + 0.50 * out["Retention_z"]
     out["PRI"] = (5.0 + 2.5 * np.tanh(out["PRI_Core"] / 1.35)).clip(0.0, 10.0)
 
     retention_median = float(np.nanmedian(out["Retention_pct"])) if out["Retention_pct"].notna().any() else np.nan
@@ -2603,8 +2616,8 @@ if _view_is("Pressure Retention", "Full Report"):
     st.markdown("## Pressure Retention Index (PRI)")
     st.caption(
         "PRI measures how much sustained pressure a horse absorbed after the opening 200m "
-        "and how well it retained speed through the final 400m. It is a standalone diagnostic "
-        "and does not alter PI."
+        "and, crucially, how much of that pressure it retained through the final 400m. "
+        "Pressure credit is reduced when a horse fades. PRI remains separate from PI."
     )
 
     pri = PRI_TABLE.copy()
@@ -2656,7 +2669,8 @@ if _view_is("Pressure Retention", "Full Report"):
         pri_view_cols = [
             "PRI_Rank", "Horse", "Finish_Pos", "PI",
             "Pressure_Speed", "Late_Speed",
-            "Pressure_Delta_pct", "Retention_pct", "PRI", "Profile"
+            "Pressure_Delta_pct", "Retention_pct", "Retention_Gate",
+            "Retained_Pressure", "PRI", "Profile"
         ]
         pri_view = pri[[c for c in pri_view_cols if c in pri.columns]].copy()
         pri_view = pri_view.sort_values(["PRI", "Pressure_Delta_pct"], ascending=[False, False], na_position="last")
@@ -2666,9 +2680,11 @@ if _view_is("Pressure Retention", "Full Report"):
             "Late_Speed": "Late speed (m/s)",
             "Pressure_Delta_pct": "Pressure vs field (%)",
             "Retention_pct": "Retention (%)",
+            "Retention_Gate": "Retention gate",
+            "Retained_Pressure": "Retained pressure",
         }
         pri_view = pri_view.rename(columns=rename)
-        for col in ["PI", "Pressure speed (m/s)", "Late speed (m/s)", "Pressure vs field (%)", "Retention (%)", "PRI"]:
+        for col in ["PI", "Pressure speed (m/s)", "Late speed (m/s)", "Pressure vs field (%)", "Retention (%)", "Retention gate", "Retained pressure", "PRI"]:
             if col in pri_view.columns:
                 pri_view[col] = pd.to_numeric(pri_view[col], errors="coerce").round(2)
         st.dataframe(pri_view, width="stretch", hide_index=True)
@@ -2686,11 +2702,13 @@ if _view_is("Pressure Retention", "Full Report"):
                 """
 - **Pressure vs field (%)** measures the horse's speed through the pressure phase against the field median.
 - **Retention (%)** compares final-400 speed with the horse's own pressure-phase speed.
+- **Retention gate** controls how much positive pressure credit survives: 90% retention gives no pressure credit, while 100% gives full credit.
+- **Retained pressure** is the horse's positive pressure score multiplied by that retention gate.
 - **Pressure resistant**: above-median pressure and above-median retention.
-- **Brave but faded**: absorbed above-median pressure but retained less late.
+- **Brave but faded**: absorbed above-median pressure but retained less late; its pressure credit is therefore reduced.
 - **Pace-assisted closer**: absorbed less pressure but retained strongly late.
 - **Low-pressure performer**: below median in both dimensions.
-- PRI uses a **60% pressure / 40% retention** blend and remains separate from PI.
+- PRI combines **50% retained pressure and 50% race-relative retention** and remains separate from PI.
                 """
             )
 
