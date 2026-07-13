@@ -606,7 +606,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Core Metrics", "Visuals", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Core Metrics", "Pressure Retention", "Visuals", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -1524,6 +1524,142 @@ except Exception as e:
     st.error("Metric computation failed.")
     st.exception(e)
     st.stop()
+
+# ======================= Pressure Retention Index (PRI) =======================
+def _pri_robust_z(series: pd.Series) -> pd.Series:
+    """Race-relative robust z-score with a standard-deviation fallback."""
+    s = pd.to_numeric(series, errors="coerce")
+    med = float(np.nanmedian(s)) if s.notna().any() else np.nan
+    mad = float(np.nanmedian(np.abs(s - med))) if np.isfinite(med) else np.nan
+    if np.isfinite(mad) and mad > 1e-9:
+        z = (s - med) / (1.4826 * mad)
+    else:
+        std = float(np.nanstd(s, ddof=0))
+        mean = float(np.nanmean(s)) if s.notna().any() else np.nan
+        z = (s - mean) / std if np.isfinite(std) and std > 1e-9 else pd.Series(0.0, index=s.index)
+    return pd.to_numeric(z, errors="coerce").clip(-3.5, 3.5)
+
+def _phase_speed_from_raw(row: pd.Series, distance_m: float, phase_low: float, phase_high: float):
+    """
+    Compute speed inside a phase expressed as distance remaining.
+    Segment times are apportioned by overlap, which supports 100m, 200m,
+    and odd opening segments without changing the source interpretation.
+    """
+    D = float(distance_m)
+    low = max(0.0, float(phase_low))
+    high = min(D, float(phase_high))
+    if high <= low:
+        return np.nan, 0.0
+
+    markers = []
+    for c in row.index:
+        if isinstance(c, str) and c.endswith("_Time") and c != "Finish_Time":
+            try:
+                markers.append(int(c.split("_")[0]))
+            except Exception:
+                pass
+    markers = sorted({m for m in markers if 0 < m < D}, reverse=True)
+
+    segments = []
+    prev = D
+    for marker in markers:
+        col = f"{marker}_Time"
+        if marker >= prev:
+            continue
+        segments.append((float(prev), float(marker), col))
+        prev = float(marker)
+    if "Finish_Time" in row.index and prev > 0:
+        segments.append((float(prev), 0.0, "Finish_Time"))
+
+    total_dist = 0.0
+    total_time = 0.0
+    for seg_high, seg_low, col in segments:
+        overlap = max(0.0, min(seg_high, high) - max(seg_low, low))
+        if overlap <= 0:
+            continue
+        t = pd.to_numeric(row.get(col), errors="coerce")
+        seg_dist = seg_high - seg_low
+        if pd.isna(t) or float(t) <= 0 or seg_dist <= 0:
+            continue
+        total_dist += overlap
+        total_time += float(t) * (overlap / seg_dist)
+
+    if total_dist <= 0 or total_time <= 0:
+        return np.nan, total_dist
+    return total_dist / total_time, total_dist
+
+def build_pri_table(raw_df: pd.DataFrame, metrics_df: pd.DataFrame, distance_m: float) -> pd.DataFrame:
+    """
+    Pressure phase: after the opening 200m until 400m from home.
+    Retention phase: final 400m.
+    PRI is independent of PI and uses 60% absorbed pressure, 40% late retention.
+    """
+    D = float(distance_m)
+    out = pd.DataFrame(index=raw_df.index)
+    out["Horse"] = raw_df["Horse"].astype(str) if "Horse" in raw_df.columns else metrics_df["Horse"].astype(str)
+    if "Finish_Pos" in metrics_df.columns:
+        out["Finish_Pos"] = pd.to_numeric(metrics_df["Finish_Pos"], errors="coerce").to_numpy()
+    if "PI" in metrics_df.columns:
+        out["PI"] = pd.to_numeric(metrics_df["PI"], errors="coerce").to_numpy()
+
+    pressure_low = 400.0
+    pressure_high = max(pressure_low, D - 200.0)
+    middle_speeds, middle_coverage = [], []
+    late_speeds, late_coverage = [], []
+
+    for _, row in raw_df.iterrows():
+        ms, mc = _phase_speed_from_raw(row, D, pressure_low, pressure_high)
+        ls, lc = _phase_speed_from_raw(row, D, 0.0, min(400.0, D))
+        middle_speeds.append(ms); middle_coverage.append(mc)
+        late_speeds.append(ls); late_coverage.append(lc)
+
+    out["Pressure_Speed"] = pd.to_numeric(pd.Series(middle_speeds, index=out.index), errors="coerce")
+    out["Late_Speed"] = pd.to_numeric(pd.Series(late_speeds, index=out.index), errors="coerce")
+    out["Pressure_Coverage_m"] = middle_coverage
+    out["Late_Coverage_m"] = late_coverage
+
+    field_middle = float(np.nanmedian(out["Pressure_Speed"])) if out["Pressure_Speed"].notna().any() else np.nan
+    out["Pressure_Delta_pct"] = np.where(
+        np.isfinite(field_middle) & (field_middle > 0),
+        100.0 * (out["Pressure_Speed"] / field_middle - 1.0),
+        np.nan,
+    )
+    out["Retention_pct"] = np.where(
+        (out["Pressure_Speed"] > 0) & out["Late_Speed"].notna(),
+        100.0 * out["Late_Speed"] / out["Pressure_Speed"],
+        np.nan,
+    )
+
+    out["Pressure_z"] = _pri_robust_z(out["Pressure_Delta_pct"])
+    out["Retention_z"] = _pri_robust_z(out["Retention_pct"])
+    out["PRI_Core"] = 0.60 * out["Pressure_z"] + 0.40 * out["Retention_z"]
+    out["PRI"] = (5.0 + 2.5 * np.tanh(out["PRI_Core"] / 1.35)).clip(0.0, 10.0)
+
+    retention_median = float(np.nanmedian(out["Retention_pct"])) if out["Retention_pct"].notna().any() else np.nan
+    def _pri_profile(row):
+        p = row.get("Pressure_Delta_pct")
+        r = row.get("Retention_pct")
+        if not (pd.notna(p) and pd.notna(r) and np.isfinite(retention_median)):
+            return "Insufficient data"
+        high_p = float(p) >= 0.0
+        high_r = float(r) >= retention_median
+        if high_p and high_r:
+            return "Pressure resistant"
+        if high_p and not high_r:
+            return "Brave but faded"
+        if not high_p and high_r:
+            return "Pace-assisted closer"
+        return "Low-pressure performer"
+
+    out["Profile"] = out.apply(_pri_profile, axis=1)
+    out["PRI_Rank"] = out["PRI"].rank(method="min", ascending=False, na_option="bottom").astype("Int64")
+    out.attrs["pressure_phase"] = f"after first 200m to 400m remaining"
+    out.attrs["retention_phase"] = "final 400m"
+    out.attrs["field_middle_speed"] = field_middle
+    out.attrs["retention_median"] = retention_median
+    return out
+
+PRI_TABLE = build_pri_table(work.reset_index(drop=True), metrics.reset_index(drop=True), float(race_distance_input))
 
 # ----------------------- RPSS (race-level tsSPI benchmark strength) -----------------------
 RPSS_INFO = compute_rpss(metrics, float(race_distance_input), int(split_step), seg_markers)
@@ -2461,6 +2597,102 @@ if _view_is("Ability Radar", "Full Report"):
 - The radar uses raw indexed metrics, so it works consistently with both 100m and 200m split files.
                     """
                 )
+
+# ======================= Pressure Retention module =======================
+if _view_is("Pressure Retention", "Full Report"):
+    st.markdown("## Pressure Retention Index (PRI)")
+    st.caption(
+        "PRI measures how much sustained pressure a horse absorbed after the opening 200m "
+        "and how well it retained speed through the final 400m. It is a standalone diagnostic "
+        "and does not alter PI."
+    )
+
+    pri = PRI_TABLE.copy()
+    valid_pri = pri.dropna(subset=["Pressure_Delta_pct", "Retention_pct", "PRI"]).copy()
+
+    if valid_pri.empty:
+        st.info("PRI could not be calculated from the available sectional columns.")
+    else:
+        top = valid_pri.sort_values("PRI", ascending=False).iloc[0]
+        high_pressure = valid_pri.sort_values("Pressure_Delta_pct", ascending=False).iloc[0]
+        best_retention = valid_pri.sort_values("Retention_pct", ascending=False).iloc[0]
+
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric("Top PRI", str(top["Horse"]), f'{float(top["PRI"]):.2f}')
+        pc2.metric("Most pressure absorbed", str(high_pressure["Horse"]), f'{float(high_pressure["Pressure_Delta_pct"]):+.2f}%')
+        pc3.metric("Best late retention", str(best_retention["Horse"]), f'{float(best_retention["Retention_pct"]):.1f}%')
+
+        st.markdown("### Pressure vs Retention map")
+        fig, ax = plt.subplots(figsize=(10.5, 6.6))
+        x = pd.to_numeric(valid_pri["Pressure_Delta_pct"], errors="coerce").to_numpy(dtype=float)
+        y = pd.to_numeric(valid_pri["Retention_pct"], errors="coerce").to_numpy(dtype=float)
+        c = pd.to_numeric(valid_pri["PRI"], errors="coerce").to_numpy(dtype=float)
+        sizes = 70 + 18 * np.clip(c, 0, 10)
+
+        sc = ax.scatter(x, y, c=c, s=sizes, cmap="viridis", vmin=0, vmax=10,
+                        edgecolors="white", linewidths=0.8, alpha=0.92, zorder=3)
+        retention_med = float(valid_pri.attrs.get("retention_median", np.nanmedian(y)))
+        ax.axvline(0.0, color="grey", lw=1.1, ls="--", alpha=0.75)
+        ax.axhline(retention_med, color="grey", lw=1.1, ls="--", alpha=0.75)
+
+        for _, r in valid_pri.iterrows():
+            ax.annotate(
+                str(r["Horse"]),
+                (float(r["Pressure_Delta_pct"]), float(r["Retention_pct"])),
+                xytext=(5, 5), textcoords="offset points",
+                fontsize=8, alpha=0.9
+            )
+
+        ax.set_xlabel("Pressure absorbed vs field median (%)")
+        ax.set_ylabel("Late retention: final-400 speed / pressure-phase speed (%)")
+        ax.set_title("Pressure Retention Map")
+        ax.grid(alpha=0.18)
+        cb = fig.colorbar(sc, ax=ax, pad=0.02)
+        cb.set_label("PRI (0–10)")
+        st.pyplot(fig, width="stretch")
+        plt.close(fig)
+
+        st.markdown("### PRI leaderboard")
+        pri_view_cols = [
+            "PRI_Rank", "Horse", "Finish_Pos", "PI",
+            "Pressure_Speed", "Late_Speed",
+            "Pressure_Delta_pct", "Retention_pct", "PRI", "Profile"
+        ]
+        pri_view = pri[[c for c in pri_view_cols if c in pri.columns]].copy()
+        pri_view = pri_view.sort_values(["PRI", "Pressure_Delta_pct"], ascending=[False, False], na_position="last")
+        rename = {
+            "PRI_Rank": "Rank",
+            "Pressure_Speed": "Pressure speed (m/s)",
+            "Late_Speed": "Late speed (m/s)",
+            "Pressure_Delta_pct": "Pressure vs field (%)",
+            "Retention_pct": "Retention (%)",
+        }
+        pri_view = pri_view.rename(columns=rename)
+        for col in ["PI", "Pressure speed (m/s)", "Late speed (m/s)", "Pressure vs field (%)", "Retention (%)", "PRI"]:
+            if col in pri_view.columns:
+                pri_view[col] = pd.to_numeric(pri_view[col], errors="coerce").round(2)
+        st.dataframe(pri_view, width="stretch", hide_index=True)
+
+        csv_data = pri_view.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download PRI CSV",
+            data=csv_data,
+            file_name=f"race_edge_PRI_{int(race_distance_input)}m.csv",
+            mime="text/csv",
+        )
+
+        with st.expander("How to read PRI"):
+            st.markdown(
+                """
+- **Pressure vs field (%)** measures the horse's speed through the pressure phase against the field median.
+- **Retention (%)** compares final-400 speed with the horse's own pressure-phase speed.
+- **Pressure resistant**: above-median pressure and above-median retention.
+- **Brave but faded**: absorbed above-median pressure but retained less late.
+- **Pace-assisted closer**: absorbed less pressure but retained strongly late.
+- **Low-pressure performer**: below median in both dimensions.
+- PRI uses a **60% pressure / 40% retention** blend and remains separate from PI.
+                """
+            )
 
 # ======================= Race Plane Analysis — Experimental =======================
 if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
