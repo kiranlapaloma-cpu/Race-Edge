@@ -1645,7 +1645,18 @@ def build_pri_table(raw_df: pd.DataFrame, metrics_df: pd.DataFrame, distance_m: 
     ).clip(lower=0.0, upper=1.0)
     out["Retained_Pressure"] = out["Positive_Pressure_z"] * out["Retention_Gate"]
 
-    out["PRI_Core"] = 0.50 * out["Retained_Pressure"] + 0.50 * out["Retention_z"]
+    # Pressure gate prevents low-pressure closers from topping PRI purely on late retention.
+    # - Clearly negative pressure receives little or no access to a high PRI.
+    # - Neutral pressure receives partial access.
+    # - Strong positive pressure receives full access.
+    out["Pressure_Gate"] = (
+        (pd.to_numeric(out["Pressure_Delta_pct"], errors="coerce") + 0.25) / 1.0
+    ).clip(lower=0.0, upper=1.0)
+
+    out["PRI_Core"] = (
+        0.75 * out["Retained_Pressure"]
+        + 0.25 * out["Retention_z"] * out["Pressure_Gate"]
+    )
     out["PRI"] = (5.0 + 2.5 * np.tanh(out["PRI_Core"] / 1.35)).clip(0.0, 10.0)
 
     retention_median = float(np.nanmedian(out["Retention_pct"])) if out["Retention_pct"].notna().any() else np.nan
@@ -2670,7 +2681,7 @@ if _view_is("Pressure Retention", "Full Report"):
             "PRI_Rank", "Horse", "Finish_Pos", "PI",
             "Pressure_Speed", "Late_Speed",
             "Pressure_Delta_pct", "Retention_pct", "Retention_Gate",
-            "Retained_Pressure", "PRI", "Profile"
+            "Pressure_Gate", "Retained_Pressure", "PRI", "Profile"
         ]
         pri_view = pri[[c for c in pri_view_cols if c in pri.columns]].copy()
         pri_view = pri_view.sort_values(["PRI", "Pressure_Delta_pct"], ascending=[False, False], na_position="last")
@@ -2681,10 +2692,11 @@ if _view_is("Pressure Retention", "Full Report"):
             "Pressure_Delta_pct": "Pressure vs field (%)",
             "Retention_pct": "Retention (%)",
             "Retention_Gate": "Retention gate",
+            "Pressure_Gate": "Pressure gate",
             "Retained_Pressure": "Retained pressure",
         }
         pri_view = pri_view.rename(columns=rename)
-        for col in ["PI", "Pressure speed (m/s)", "Late speed (m/s)", "Pressure vs field (%)", "Retention (%)", "Retention gate", "Retained pressure", "PRI"]:
+        for col in ["PI", "Pressure speed (m/s)", "Late speed (m/s)", "Pressure vs field (%)", "Retention (%)", "Retention gate", "Pressure gate", "Retained pressure", "PRI"]:
             if col in pri_view.columns:
                 pri_view[col] = pd.to_numeric(pri_view[col], errors="coerce").round(2)
         st.dataframe(pri_view, width="stretch", hide_index=True)
@@ -2703,6 +2715,7 @@ if _view_is("Pressure Retention", "Full Report"):
 - **Pressure vs field (%)** measures the horse's speed through the pressure phase against the field median.
 - **Retention (%)** compares final-400 speed with the horse's own pressure-phase speed.
 - **Retention gate** controls how much positive pressure credit survives: 90% retention gives no pressure credit, while 100% gives full credit.
+- **Pressure gate** prevents a horse that sat well off the pace from earning a top PRI purely because it flew home. Negative pressure is heavily restricted; strong positive pressure receives full access.
 - **Retained pressure** is the horse's positive pressure score multiplied by that retention gate.
 - **Pressure resistant**: above-median pressure and above-median retention.
 - **Brave but faded**: absorbed above-median pressure but retained less late; its pressure credit is therefore reduced.
