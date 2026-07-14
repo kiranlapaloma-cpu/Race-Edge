@@ -2729,8 +2729,8 @@ if _view_is("Pressure Retention", "Full Report"):
 if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
     st.markdown("## Race Plane Analysis")
     st.caption(
-        "Experimental module. The Race Plane Formula describes what this race rewarded from tsSPI and Accel, "
-        "then the residual ranks horses by how far above or below that race expectation they sustained."
+        "PPS identifies the strongest overall position in tsSPI–Accel–Grind space. "
+        "Class Residual remains a separate signal of above- or below-plane sustain."
     )
 
     req = {"Horse", "tsSPI", "Accel", "Grind"}
@@ -2882,59 +2882,231 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
             if rank < 3:
                 st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
 
-            st.markdown("### Class Residual ranking")
-            out_cols = ["Horse", "Finish_Pos", "tsSPI", "Accel", plane_grind_col, "Expected_Grind", "Class_Residual", "CR_Profile"]
-            out_cols += [c for c in ["TOF", "SRI", "Peak_Location", "PI"] if c in plane_df.columns and c not in out_cols]
-            rank_df = plane_df.sort_values("Class_Residual", ascending=False).reset_index(drop=True)
+            # --- Plane Position Score (PPS): overall strength of the horse's location in
+            # tsSPI–Accel–Grind space. Residual remains a separate upside/underperformance signal.
+            def _pps_robust_z(series):
+                s = pd.to_numeric(series, errors="coerce").astype(float)
+                med = float(np.nanmedian(s)) if np.isfinite(s).any() else 0.0
+                mad = float(np.nanmedian(np.abs(s - med))) if np.isfinite(s).any() else 0.0
+                if np.isfinite(mad) and mad > 1e-12:
+                    out = (s - med) / (1.4826 * mad)
+                else:
+                    sd = float(np.nanstd(s, ddof=0)) if np.isfinite(s).any() else 0.0
+                    mu = float(np.nanmean(s)) if np.isfinite(s).any() else 0.0
+                    out = (s - mu) / sd if np.isfinite(sd) and sd > 1e-12 else pd.Series(0.0, index=s.index)
+                return pd.Series(out, index=s.index, dtype=float).clip(-3.5, 3.5)
+
+            plane_df["PPS_z_tsSPI"] = _pps_robust_z(plane_df["tsSPI"])
+            plane_df["PPS_z_Accel"] = _pps_robust_z(plane_df["Accel"])
+            plane_df["PPS_z_Grind"] = _pps_robust_z(plane_df[plane_grind_col])
+            plane_df["PPS_Core"] = (
+                0.35 * plane_df["PPS_z_tsSPI"]
+                + 0.35 * plane_df["PPS_z_Accel"]
+                + 0.30 * plane_df["PPS_z_Grind"]
+            )
+            plane_df["PPS"] = np.clip(
+                5.0 + 2.75 * np.tanh(plane_df["PPS_Core"] / 1.35),
+                0.0,
+                10.0,
+            )
+            plane_df["PPS"] = plane_df["PPS"].round(2)
+            plane_df["PPS_Rank"] = plane_df["PPS"].rank(method="min", ascending=False).astype(int)
+
+            st.markdown("### Performance Plane Rankings (PPS)")
+            st.caption(
+                "PPS ranks the strongest overall position in tsSPI–Accel–Grind space. "
+                "Class Residual remains separate: it indicates above- or below-plane performance, not overall plane quality."
+            )
+
+            top_pps_row = plane_df.sort_values(["PPS", "PI" if "PI" in plane_df.columns else "PPS"], ascending=False).iloc[0]
+            high_cr_row = plane_df.sort_values("Class_Residual", ascending=False).iloc[0]
+            low_cr_row = plane_df.sort_values("Class_Residual", ascending=True).iloc[0]
+            pps_cards = st.columns(3)
+            pps_cards[0].metric("Top Plane Position", str(top_pps_row["Horse"]), f"PPS {float(top_pps_row['PPS']):.2f}")
+            pps_cards[1].metric("Highest Positive Residual", str(high_cr_row["Horse"]), f"CR {float(high_cr_row['Class_Residual']):+.2f}")
+            pps_cards[2].metric("Lowest Residual", str(low_cr_row["Horse"]), f"CR {float(low_cr_row['Class_Residual']):+.2f}")
+
+            out_cols = [
+                "PPS_Rank", "Horse", "Finish_Pos", "PPS", "PI",
+                "tsSPI", "Accel", plane_grind_col,
+                "Expected_Grind", "Class_Residual", "CR_Profile",
+            ]
+            out_cols = [c for c in out_cols if c in plane_df.columns]
+            out_cols += [c for c in ["TOF", "SRI", "Peak_Location"] if c in plane_df.columns and c not in out_cols]
+            rank_df = plane_df.sort_values(["PPS", "Class_Residual"], ascending=[False, False]).reset_index(drop=True)
             st.dataframe(rank_df[out_cols], use_container_width=True, hide_index=True)
 
             csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
             st.download_button(
-                "Download Race Plane table (CSV)",
+                "Download Performance Plane table (CSV)",
                 data=csv,
-                file_name="race_plane_analysis.csv",
+                file_name="performance_plane_pps.csv",
                 mime="text/csv"
             )
 
             if show_3d_plane:
-                st.markdown("### 3D Race Plane")
+                st.markdown("### 3D Performance Plane")
                 try:
-                    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-                    fig = plt.figure(figsize=(8.8, 6.6))
-                    ax = fig.add_subplot(111, projection="3d")
+                    from mpl_toolkits.mplot3d import Axes3D, proj3d  # noqa: F401
 
+                    fig = plt.figure(figsize=(10.5, 7.8), facecolor="#0b1220")
+                    ax = fig.add_subplot(111, projection="3d")
+                    ax.set_facecolor("#0b1220")
+
+                    # The plane stays analytical; PPS controls marker size and label priority.
                     cr_vals = plane_df["Class_Residual"].to_numpy(dtype=float)
                     vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
                     vmax = max(vmax, 1.0)
-                    sc = ax.scatter(x, y, z, c=cr_vals, cmap="coolwarm", vmin=-vmax, vmax=vmax,
-                                    s=55, edgecolor="black", linewidth=0.5, depthshade=True)
+                    pps_vals = plane_df["PPS"].to_numpy(dtype=float)
+                    marker_sizes = 55.0 + 95.0 * np.clip((pps_vals - 3.0) / 5.0, 0.0, 1.0)
 
-                    for xi, yi, zi, name in zip(x, y, z, plane_df["Horse"].astype(str)):
-                        ax.text(xi, yi, zi, name, fontsize=7)
+                    sc = ax.scatter(
+                        x, y, z,
+                        c=cr_vals,
+                        cmap="coolwarm",
+                        vmin=-vmax,
+                        vmax=vmax,
+                        s=marker_sizes,
+                        edgecolor="white",
+                        linewidth=0.9,
+                        depthshade=True,
+                        alpha=0.96,
+                    )
 
-                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 15)
-                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 15)
+                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 18)
+                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 18)
                     Xg, Yg = np.meshgrid(x_grid, y_grid)
                     Zg = intercept + b_tsspi * Xg + c_accel * Yg
-                    ax.plot_surface(Xg, Yg, Zg, alpha=0.22, linewidth=0, antialiased=True)
+                    ax.plot_surface(
+                        Xg, Yg, Zg,
+                        color="#5f7896",
+                        alpha=0.20,
+                        linewidth=0,
+                        antialiased=True,
+                        shade=True,
+                    )
 
-                    ax.set_xlabel(x_label)
-                    ax.set_ylabel(y_label)
-                    ax.set_zlabel(z_label)
-                    ax.set_title("Race-specific race plane")
-                    cbar = fig.colorbar(sc, ax=ax, shrink=0.65, pad=0.08)
-                    cbar.set_label("Class Residual")
-                    st.pyplot(fig)
-                    st.caption("Points above the race plane sustained better than expected after their travel and acceleration effort.")
+                    # Premium dark-axis treatment.
+                    ax.set_xlabel("Sustained Speed" if centre_values else x_label, color="#e7eef7", labelpad=10)
+                    ax.set_ylabel("Acceleration" if centre_values else y_label, color="#e7eef7", labelpad=10)
+                    ax.set_zlabel("Finishing Strength" if centre_values else z_label, color="#e7eef7", labelpad=10)
+                    ax.set_title("Performance Plane", color="white", fontsize=16, pad=18, weight="bold")
+                    ax.view_init(elev=22, azim=-58)
+                    ax.tick_params(colors="#b8c5d4", labelsize=8)
+                    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+                        axis.pane.set_facecolor((0.05, 0.08, 0.13, 0.35))
+                        axis.pane.set_edgecolor((0.45, 0.55, 0.68, 0.28))
+                        axis._axinfo["grid"]["color"] = (0.55, 0.62, 0.72, 0.16)
+
+                    # Keep every horse labelled. Project 3D points to a transparent 2D overlay,
+                    # then repel the labels in screen space so names never overwrite each other.
+                    fig.canvas.draw()
+                    label_ax = fig.add_axes(ax.get_position(), frameon=False)
+                    label_ax.set_xlim(0, 1)
+                    label_ax.set_ylim(0, 1)
+                    label_ax.axis("off")
+
+                    projected = []
+                    inv_fig = fig.transFigure.inverted()
+                    for xi, yi, zi in zip(x, y, z):
+                        x2, y2, _ = proj3d.proj_transform(xi, yi, zi, ax.get_proj())
+                        disp = ax.transData.transform((x2, y2))
+                        fig_xy = inv_fig.transform(disp)
+                        axpos = label_ax.get_position()
+                        ux = (fig_xy[0] - axpos.x0) / max(axpos.width, 1e-9)
+                        uy = (fig_xy[1] - axpos.y0) / max(axpos.height, 1e-9)
+                        projected.append([float(ux), float(uy)])
+
+                    # Initial offsets alternate by rank to reduce collisions before repulsion.
+                    order = np.argsort(plane_df["PPS_Rank"].to_numpy(dtype=int))
+                    offsets = [(0.014, 0.012), (-0.014, 0.014), (0.016, -0.012), (-0.016, -0.014)]
+                    label_pos = []
+                    for k, idx in enumerate(order):
+                        px, py = projected[idx]
+                        dx, dy = offsets[k % len(offsets)]
+                        label_pos.append([idx, np.clip(px + dx, 0.03, 0.97), np.clip(py + dy, 0.04, 0.96)])
+
+                    # Deterministic screen-space repulsion.
+                    min_dx, min_dy = 0.12, 0.045
+                    for _ in range(220):
+                        moved = False
+                        for a in range(len(label_pos)):
+                            for b in range(a + 1, len(label_pos)):
+                                _, xa, ya = label_pos[a]
+                                _, xb, yb = label_pos[b]
+                                dx, dy = xa - xb, ya - yb
+                                if abs(dx) < min_dx and abs(dy) < min_dy:
+                                    sx = 1.0 if dx >= 0 else -1.0
+                                    sy = 1.0 if dy >= 0 else -1.0
+                                    if dx == 0:
+                                        sx = 1.0 if (a + b) % 2 == 0 else -1.0
+                                    if dy == 0:
+                                        sy = 1.0 if (a * 3 + b) % 2 == 0 else -1.0
+                                    push_x = (min_dx - abs(dx)) * 0.10
+                                    push_y = (min_dy - abs(dy)) * 0.16
+                                    label_pos[a][1] = np.clip(xa + sx * push_x, 0.03, 0.97)
+                                    label_pos[b][1] = np.clip(xb - sx * push_x, 0.03, 0.97)
+                                    label_pos[a][2] = np.clip(ya + sy * push_y, 0.04, 0.96)
+                                    label_pos[b][2] = np.clip(yb - sy * push_y, 0.04, 0.96)
+                                    moved = True
+                        if not moved:
+                            break
+
+                    horse_names = plane_df["Horse"].astype(str).tolist()
+                    pps_ranks = plane_df["PPS_Rank"].astype(int).tolist()
+                    for idx, lx, ly in label_pos:
+                        px, py = projected[idx]
+                        label_ax.annotate(
+                            f"{horse_names[idx]}  #{pps_ranks[idx]}",
+                            xy=(px, py),
+                            xytext=(lx, ly),
+                            xycoords="axes fraction",
+                            textcoords="axes fraction",
+                            fontsize=7.4,
+                            color="white",
+                            ha="center",
+                            va="center",
+                            bbox=dict(
+                                boxstyle="round,pad=0.26",
+                                facecolor="#121d2d",
+                                edgecolor="#88a0bc",
+                                linewidth=0.55,
+                                alpha=0.88,
+                            ),
+                            arrowprops=dict(
+                                arrowstyle="-",
+                                color="#90a3ba",
+                                lw=0.55,
+                                alpha=0.70,
+                                shrinkA=3,
+                                shrinkB=3,
+                            ),
+                            clip_on=False,
+                        )
+
+                    cbar = fig.colorbar(sc, ax=ax, shrink=0.62, pad=0.09)
+                    cbar.set_label("Class Residual", color="#e7eef7")
+                    cbar.ax.tick_params(colors="#b8c5d4")
+                    for spine in cbar.ax.spines.values():
+                        spine.set_edgecolor("#6f8197")
+
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+                    st.caption(
+                        "Marker size and label rank follow PPS (best overall position on the plane). "
+                        "Colour shows Class Residual separately: positive residual suggests more late sustain than the plane predicted."
+                    )
                 except Exception as e:
                     st.info(f"3D plane could not be rendered: {e}")
 
             with st.expander("How to read this module"):
                 st.markdown(
                     """
-- **Race Plane Formula:** the race-specific expected relationship between travel strength, acceleration strength and grind.
+- **PPS:** overall strength of the horse's position in tsSPI–Accel–Grind space. This is the module's main ranking.
+- **PPS Rank:** where the horse sits from strongest to weakest overall plane position.
+- **Race Plane Formula:** the race-specific expected relationship between sustained speed, acceleration and Grind.
 - **Expected Grind:** what the model predicts a horse should have produced from its tsSPI and Accel.
-- **Class Residual:** actual Grind minus expected Grind.
+- **Class Residual:** actual Grind minus expected Grind. It is a separate upside/underperformance signal, not the best-position ranking.
 - **Positive CR:** the horse sustained better than expected.
 - **Negative CR:** the horse did less late than its travel/acceleration profile suggested.
 
