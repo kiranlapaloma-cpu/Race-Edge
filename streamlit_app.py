@@ -3017,18 +3017,27 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                         uy = (fig_xy[1] - axpos.y0) / max(axpos.height, 1e-9)
                         projected.append([float(ux), float(uy)])
 
-                    # Initial offsets alternate by rank to reduce collisions before repulsion.
+                    # Start labels close to their markers. PPS rank determines placement
+                    # priority only; rank text is deliberately omitted to keep labels compact.
                     order = np.argsort(plane_df["PPS_Rank"].to_numpy(dtype=int))
-                    offsets = [(0.014, 0.012), (-0.014, 0.014), (0.016, -0.012), (-0.016, -0.014)]
+                    offsets = [(0.010, 0.010), (-0.010, 0.011), (0.011, -0.010), (-0.011, -0.011)]
                     label_pos = []
+                    anchors = {}
                     for k, idx in enumerate(order):
                         px, py = projected[idx]
+                        anchors[int(idx)] = (px, py)
                         dx, dy = offsets[k % len(offsets)]
-                        label_pos.append([idx, np.clip(px + dx, 0.03, 0.97), np.clip(py + dy, 0.04, 0.96)])
+                        label_pos.append([
+                            int(idx),
+                            float(np.clip(px + dx, 0.025, 0.975)),
+                            float(np.clip(py + dy, 0.035, 0.965)),
+                        ])
 
-                    # Deterministic screen-space repulsion.
-                    min_dx, min_dy = 0.12, 0.045
-                    for _ in range(220):
+                    # Compact screen-space repulsion with a gentle pull back toward
+                    # each marker. This prevents labels drifting across the chart.
+                    min_dx, min_dy = 0.080, 0.030
+                    max_dx, max_dy = 0.115, 0.085
+                    for _ in range(180):
                         moved = False
                         for a in range(len(label_pos)):
                             for b in range(a + 1, len(label_pos)):
@@ -3038,51 +3047,80 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                                 if abs(dx) < min_dx and abs(dy) < min_dy:
                                     sx = 1.0 if dx >= 0 else -1.0
                                     sy = 1.0 if dy >= 0 else -1.0
-                                    if dx == 0:
+                                    if abs(dx) < 1e-9:
                                         sx = 1.0 if (a + b) % 2 == 0 else -1.0
-                                    if dy == 0:
+                                    if abs(dy) < 1e-9:
                                         sy = 1.0 if (a * 3 + b) % 2 == 0 else -1.0
-                                    push_x = (min_dx - abs(dx)) * 0.10
-                                    push_y = (min_dy - abs(dy)) * 0.16
-                                    label_pos[a][1] = np.clip(xa + sx * push_x, 0.03, 0.97)
-                                    label_pos[b][1] = np.clip(xb - sx * push_x, 0.03, 0.97)
-                                    label_pos[a][2] = np.clip(ya + sy * push_y, 0.04, 0.96)
-                                    label_pos[b][2] = np.clip(yb - sy * push_y, 0.04, 0.96)
+                                    push_x = (min_dx - abs(dx)) * 0.075
+                                    push_y = (min_dy - abs(dy)) * 0.12
+                                    label_pos[a][1] += sx * push_x
+                                    label_pos[b][1] -= sx * push_x
+                                    label_pos[a][2] += sy * push_y
+                                    label_pos[b][2] -= sy * push_y
                                     moved = True
+
+                        # Pull labels back and limit maximum displacement.
+                        for item in label_pos:
+                            idx, lx, ly = item
+                            px, py = anchors[idx]
+                            lx = lx + 0.035 * (px - lx)
+                            ly = ly + 0.035 * (py - ly)
+                            lx = np.clip(lx, px - max_dx, px + max_dx)
+                            ly = np.clip(ly, py - max_dy, py + max_dy)
+                            item[1] = float(np.clip(lx, 0.025, 0.975))
+                            item[2] = float(np.clip(ly, 0.035, 0.965))
                         if not moved:
                             break
 
                     horse_names = plane_df["Horse"].astype(str).tolist()
-                    pps_ranks = plane_df["PPS_Rank"].astype(int).tolist()
                     for idx, lx, ly in label_pos:
                         px, py = projected[idx]
+                        displacement = math.hypot(lx - px, ly - py)
+                        leader = None
+                        if displacement > 0.040:
+                            leader = dict(
+                                arrowstyle="-",
+                                color="#7f93aa",
+                                lw=0.42,
+                                alpha=0.52,
+                                shrinkA=2,
+                                shrinkB=4,
+                            )
                         label_ax.annotate(
-                            f"{horse_names[idx]}  #{pps_ranks[idx]}",
+                            horse_names[idx],
                             xy=(px, py),
                             xytext=(lx, ly),
                             xycoords="axes fraction",
                             textcoords="axes fraction",
-                            fontsize=7.4,
-                            color="white",
+                            fontsize=6.9,
+                            color="#eef4fb",
                             ha="center",
                             va="center",
                             bbox=dict(
-                                boxstyle="round,pad=0.26",
-                                facecolor="#121d2d",
-                                edgecolor="#88a0bc",
-                                linewidth=0.55,
-                                alpha=0.88,
+                                boxstyle="round,pad=0.14",
+                                facecolor="#101a28",
+                                edgecolor="#6e8299",
+                                linewidth=0.38,
+                                alpha=0.76,
                             ),
-                            arrowprops=dict(
-                                arrowstyle="-",
-                                color="#90a3ba",
-                                lw=0.55,
-                                alpha=0.70,
-                                shrinkA=3,
-                                shrinkB=3,
-                            ),
+                            arrowprops=leader,
                             clip_on=False,
                         )
+
+                    # PPS is communicated through marker size. Give the top three
+                    # positions a restrained outer ring rather than longer labels.
+                    top_three_idx = plane_df.nsmallest(3, "PPS_Rank").index.to_numpy(dtype=int)
+                    ax.scatter(
+                        x[top_three_idx],
+                        y[top_three_idx],
+                        z[top_three_idx],
+                        s=marker_sizes[top_three_idx] + 75.0,
+                        facecolors="none",
+                        edgecolors="#f4d77a",
+                        linewidths=1.25,
+                        depthshade=False,
+                        alpha=0.95,
+                    )
 
                     cbar = fig.colorbar(sc, ax=ax, shrink=0.62, pad=0.09)
                     cbar.set_label("Class Residual", color="#e7eef7")
