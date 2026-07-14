@@ -3001,50 +3001,45 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                         axis.pane.set_edgecolor((0.45, 0.55, 0.68, 0.28))
                         axis._axinfo["grid"]["color"] = (0.55, 0.62, 0.72, 0.16)
 
-                    # Keep every horse label immediately beside its marker.
-                    # No collision spreading or leader lines: the horse-point
-                    # relationship stays visually direct.
-                    fig.canvas.draw()
-                    label_ax = fig.add_axes(ax.get_position(), frameon=False)
-                    label_ax.set_xlim(0, 1)
-                    label_ax.set_ylim(0, 1)
-                    label_ax.axis("off")
-
-                    inv_fig = fig.transFigure.inverted()
-                    axpos = label_ax.get_position()
+                    # Place labels directly in the 3D coordinate system so each
+                    # horse name remains visibly attached to its marker.
                     horse_names = plane_df["Horse"].astype(str).tolist()
 
+                    # Small data-space offsets based on the axis spans.
+                    x_span = max(float(np.nanmax(x) - np.nanmin(x)), 1e-6)
+                    y_span = max(float(np.nanmax(y) - np.nanmin(y)), 1e-6)
+                    z_span = max(float(np.nanmax(z) - np.nanmin(z)), 1e-6)
+
+                    dx = 0.018 * x_span
+                    dy = 0.010 * y_span
+                    dz = 0.008 * z_span
+
                     for xi, yi, zi, horse_name in zip(x, y, z, horse_names):
-                        x2, y2, _ = proj3d.proj_transform(xi, yi, zi, ax.get_proj())
-                        disp = ax.transData.transform((x2, y2))
-                        fig_xy = inv_fig.transform(disp)
-
-                        px = (fig_xy[0] - axpos.x0) / max(axpos.width, 1e-9)
-                        py = (fig_xy[1] - axpos.y0) / max(axpos.height, 1e-9)
-
-                        # Use a tiny fixed offset. Flip to the left only when the
-                        # marker is close to the right edge of the plotting area.
-                        if px > 0.82:
-                            lx = px - 0.010
+                        # Default to the right of the marker; flip left only for
+                        # points near the right edge of the x-range.
+                        x_mid = float(np.nanmin(x) + 0.78 * x_span)
+                        if xi >= x_mid:
+                            label_x = xi - dx
                             ha = "right"
                         else:
-                            lx = px + 0.010
+                            label_x = xi + dx
                             ha = "left"
 
-                        ly = py + 0.004
+                        label_y = yi + dy
+                        label_z = zi + dz
 
-                        txt = label_ax.text(
-                            lx,
-                            ly,
+                        txt = ax.text(
+                            label_x,
+                            label_y,
+                            label_z,
                             horse_name,
-                            transform=label_ax.transAxes,
                             fontsize=7.2,
                             fontweight="semibold",
                             color="#f2f6fb",
                             ha=ha,
                             va="center",
+                            zorder=20,
                             clip_on=False,
-                            zorder=3,
                         )
                         txt.set_path_effects([
                             pe.Stroke(linewidth=2.2, foreground="#07101d", alpha=0.98),
