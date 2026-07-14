@@ -3001,132 +3001,48 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                         axis.pane.set_edgecolor((0.45, 0.55, 0.68, 0.28))
                         axis._axinfo["grid"]["color"] = (0.55, 0.62, 0.72, 0.16)
 
-                    # Keep every horse labelled close to its marker.
-                    # Labels use plain text with a dark outline rather than boxes.
-                    # A compact screen-space placement pass selects the nearest
-                    # non-overlapping position from a small set of offsets.
+                    # Keep every horse label immediately beside its marker.
+                    # No collision spreading or leader lines: the horse-point
+                    # relationship stays visually direct.
                     fig.canvas.draw()
                     label_ax = fig.add_axes(ax.get_position(), frameon=False)
                     label_ax.set_xlim(0, 1)
                     label_ax.set_ylim(0, 1)
                     label_ax.axis("off")
 
-                    projected = []
                     inv_fig = fig.transFigure.inverted()
-                    for xi, yi, zi in zip(x, y, z):
-                        x2, y2, depth = proj3d.proj_transform(xi, yi, zi, ax.get_proj())
+                    axpos = label_ax.get_position()
+                    horse_names = plane_df["Horse"].astype(str).tolist()
+
+                    for xi, yi, zi, horse_name in zip(x, y, z, horse_names):
+                        x2, y2, _ = proj3d.proj_transform(xi, yi, zi, ax.get_proj())
                         disp = ax.transData.transform((x2, y2))
                         fig_xy = inv_fig.transform(disp)
-                        axpos = label_ax.get_position()
-                        ux = (fig_xy[0] - axpos.x0) / max(axpos.width, 1e-9)
-                        uy = (fig_xy[1] - axpos.y0) / max(axpos.height, 1e-9)
-                        projected.append((float(ux), float(uy), float(depth)))
 
-                    horse_names = plane_df["Horse"].astype(str).tolist()
-                    pps_values_for_labels = plane_df["PPS"].to_numpy(dtype=float)
+                        px = (fig_xy[0] - axpos.x0) / max(axpos.width, 1e-9)
+                        py = (fig_xy[1] - axpos.y0) / max(axpos.height, 1e-9)
 
-                    # Place the strongest PPS horses first, then the rest by depth.
-                    placement_order = sorted(
-                        range(len(projected)),
-                        key=lambda i: (-pps_values_for_labels[i], projected[i][2]),
-                    )
-
-                    placed_boxes = []
-                    chosen_labels = {}
-
-                    # Candidate offsets stay deliberately close to the marker.
-                    candidate_offsets = [
-                        (0.018, 0.016, "left", "bottom"),
-                        (0.018, -0.016, "left", "top"),
-                        (-0.018, 0.016, "right", "bottom"),
-                        (-0.018, -0.016, "right", "top"),
-                        (0.030, 0.000, "left", "center"),
-                        (-0.030, 0.000, "right", "center"),
-                        (0.000, 0.030, "center", "bottom"),
-                        (0.000, -0.030, "center", "top"),
-                        (0.040, 0.026, "left", "bottom"),
-                        (-0.040, 0.026, "right", "bottom"),
-                        (0.040, -0.026, "left", "top"),
-                        (-0.040, -0.026, "right", "top"),
-                    ]
-
-                    def _box_for_label(name, lx, ly, ha, va):
-                        # Approximate dimensions in overlay-axis units.
-                        width = min(0.235, 0.0102 * len(name) + 0.012)
-                        height = 0.026
-                        if ha == "left":
-                            x0, x1 = lx, lx + width
-                        elif ha == "right":
-                            x0, x1 = lx - width, lx
+                        # Use a tiny fixed offset. Flip to the left only when the
+                        # marker is close to the right edge of the plotting area.
+                        if px > 0.82:
+                            lx = px - 0.010
+                            ha = "right"
                         else:
-                            x0, x1 = lx - width / 2.0, lx + width / 2.0
-                        if va == "bottom":
-                            y0, y1 = ly, ly + height
-                        elif va == "top":
-                            y0, y1 = ly - height, ly
-                        else:
-                            y0, y1 = ly - height / 2.0, ly + height / 2.0
-                        return [x0, y0, x1, y1]
+                            lx = px + 0.010
+                            ha = "left"
 
-                    def _overlap_area(a, b):
-                        dx = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
-                        dy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-                        return dx * dy
-
-                    for idx in placement_order:
-                        px, py, _ = projected[idx]
-                        name = horse_names[idx]
-                        best = None
-
-                        for dx, dy, ha, va in candidate_offsets:
-                            lx = float(np.clip(px + dx, 0.025, 0.975))
-                            ly = float(np.clip(py + dy, 0.035, 0.965))
-                            box = _box_for_label(name, lx, ly, ha, va)
-
-                            # Penalise overlap heavily, then distance, then edge overflow.
-                            overlap = sum(_overlap_area(box, prior) for prior in placed_boxes)
-                            overflow = (
-                                max(0.0, -box[0]) + max(0.0, box[2] - 1.0)
-                                + max(0.0, -box[1]) + max(0.0, box[3] - 1.0)
-                            )
-                            distance = (dx * dx + dy * dy) ** 0.5
-                            score = 5000.0 * overlap + 50.0 * overflow + distance
-
-                            if best is None or score < best[0]:
-                                best = (score, lx, ly, ha, va, box, distance)
-
-                        _, lx, ly, ha, va, box, distance = best
-                        placed_boxes.append(box)
-                        chosen_labels[idx] = (lx, ly, ha, va, distance)
-
-                    for idx in range(len(projected)):
-                        px, py, _ = projected[idx]
-                        lx, ly, ha, va, distance = chosen_labels[idx]
-
-                        # Only use a short, faint leader when the label had to move
-                        # beyond the normal close offset.
-                        if distance > 0.036:
-                            label_ax.plot(
-                                [px, lx],
-                                [py, ly],
-                                transform=label_ax.transAxes,
-                                color="#91a3b8",
-                                linewidth=0.45,
-                                alpha=0.48,
-                                solid_capstyle="round",
-                                zorder=2,
-                            )
+                        ly = py + 0.004
 
                         txt = label_ax.text(
                             lx,
                             ly,
-                            horse_names[idx],
+                            horse_name,
                             transform=label_ax.transAxes,
                             fontsize=7.2,
                             fontweight="semibold",
                             color="#f2f6fb",
                             ha=ha,
-                            va=va,
+                            va="center",
                             clip_on=False,
                             zorder=3,
                         )
