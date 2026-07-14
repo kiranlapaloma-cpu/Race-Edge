@@ -2899,10 +2899,12 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
             plane_df["PPS_z_tsSPI"] = _pps_robust_z(plane_df["tsSPI"])
             plane_df["PPS_z_Accel"] = _pps_robust_z(plane_df["Accel"])
             plane_df["PPS_z_Grind"] = _pps_robust_z(plane_df[plane_grind_col])
+            # PPS weighting ratio: tsSPI : Accel : Grind = 1 : 1.2 : 1
+            # Normalised weights are 31.25%, 37.50%, 31.25%.
             plane_df["PPS_Core"] = (
-                0.35 * plane_df["PPS_z_tsSPI"]
-                + 0.35 * plane_df["PPS_z_Accel"]
-                + 0.30 * plane_df["PPS_z_Grind"]
+                0.3125 * plane_df["PPS_z_tsSPI"]
+                + 0.3750 * plane_df["PPS_z_Accel"]
+                + 0.3125 * plane_df["PPS_z_Grind"]
             )
             plane_df["PPS"] = np.clip(
                 5.0 + 2.75 * np.tanh(plane_df["PPS_Core"] / 1.35),
@@ -2914,7 +2916,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
 
             st.markdown("### Performance Plane Rankings (PPS)")
             st.caption(
-                "PPS ranks the strongest overall position in tsSPI–Accel–Grind space. "
+                "PPS ranks the strongest overall position in tsSPI–Accel–Grind space using a 1:1.2:1 ratio. "
                 "Class Residual remains separate: it indicates above- or below-plane performance, not overall plane quality."
             )
 
@@ -2998,8 +3000,9 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                         axis.pane.set_edgecolor((0.45, 0.55, 0.68, 0.28))
                         axis._axinfo["grid"]["color"] = (0.55, 0.62, 0.72, 0.16)
 
-                    # Keep every horse labelled. Project 3D points to a transparent 2D overlay,
-                    # then repel the labels in screen space so names never overwrite each other.
+                    # Keep every horse labelled using deterministic side rails.
+                    # Free-floating repulsion can still overlap in dense fields; two fixed
+                    # label columns guarantee clean, readable names on every race.
                     fig.canvas.draw()
                     label_ax = fig.add_axes(ax.get_position(), frameon=False)
                     label_ax.set_xlim(0, 1)
@@ -3009,102 +3012,95 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                     projected = []
                     inv_fig = fig.transFigure.inverted()
                     for xi, yi, zi in zip(x, y, z):
-                        x2, y2, _ = proj3d.proj_transform(xi, yi, zi, ax.get_proj())
+                        x2, y2, depth = proj3d.proj_transform(xi, yi, zi, ax.get_proj())
                         disp = ax.transData.transform((x2, y2))
                         fig_xy = inv_fig.transform(disp)
                         axpos = label_ax.get_position()
                         ux = (fig_xy[0] - axpos.x0) / max(axpos.width, 1e-9)
                         uy = (fig_xy[1] - axpos.y0) / max(axpos.height, 1e-9)
-                        projected.append([float(ux), float(uy)])
-
-                    # Start labels close to their markers. PPS rank determines placement
-                    # priority only; rank text is deliberately omitted to keep labels compact.
-                    order = np.argsort(plane_df["PPS_Rank"].to_numpy(dtype=int))
-                    offsets = [(0.010, 0.010), (-0.010, 0.011), (0.011, -0.010), (-0.011, -0.011)]
-                    label_pos = []
-                    anchors = {}
-                    for k, idx in enumerate(order):
-                        px, py = projected[idx]
-                        anchors[int(idx)] = (px, py)
-                        dx, dy = offsets[k % len(offsets)]
-                        label_pos.append([
-                            int(idx),
-                            float(np.clip(px + dx, 0.025, 0.975)),
-                            float(np.clip(py + dy, 0.035, 0.965)),
-                        ])
-
-                    # Compact screen-space repulsion with a gentle pull back toward
-                    # each marker. This prevents labels drifting across the chart.
-                    min_dx, min_dy = 0.080, 0.030
-                    max_dx, max_dy = 0.115, 0.085
-                    for _ in range(180):
-                        moved = False
-                        for a in range(len(label_pos)):
-                            for b in range(a + 1, len(label_pos)):
-                                _, xa, ya = label_pos[a]
-                                _, xb, yb = label_pos[b]
-                                dx, dy = xa - xb, ya - yb
-                                if abs(dx) < min_dx and abs(dy) < min_dy:
-                                    sx = 1.0 if dx >= 0 else -1.0
-                                    sy = 1.0 if dy >= 0 else -1.0
-                                    if abs(dx) < 1e-9:
-                                        sx = 1.0 if (a + b) % 2 == 0 else -1.0
-                                    if abs(dy) < 1e-9:
-                                        sy = 1.0 if (a * 3 + b) % 2 == 0 else -1.0
-                                    push_x = (min_dx - abs(dx)) * 0.075
-                                    push_y = (min_dy - abs(dy)) * 0.12
-                                    label_pos[a][1] += sx * push_x
-                                    label_pos[b][1] -= sx * push_x
-                                    label_pos[a][2] += sy * push_y
-                                    label_pos[b][2] -= sy * push_y
-                                    moved = True
-
-                        # Pull labels back and limit maximum displacement.
-                        for item in label_pos:
-                            idx, lx, ly = item
-                            px, py = anchors[idx]
-                            lx = lx + 0.035 * (px - lx)
-                            ly = ly + 0.035 * (py - ly)
-                            lx = np.clip(lx, px - max_dx, px + max_dx)
-                            ly = np.clip(ly, py - max_dy, py + max_dy)
-                            item[1] = float(np.clip(lx, 0.025, 0.975))
-                            item[2] = float(np.clip(ly, 0.035, 0.965))
-                        if not moved:
-                            break
+                        projected.append((float(ux), float(uy), float(depth)))
 
                     horse_names = plane_df["Horse"].astype(str).tolist()
-                    for idx, lx, ly in label_pos:
-                        px, py = projected[idx]
-                        displacement = math.hypot(lx - px, ly - py)
-                        leader = None
-                        if displacement > 0.040:
-                            leader = dict(
-                                arrowstyle="-",
-                                color="#7f93aa",
-                                lw=0.42,
-                                alpha=0.52,
-                                shrinkA=2,
-                                shrinkB=4,
-                            )
-                        label_ax.annotate(
+                    pps_ranks = plane_df["PPS_Rank"].to_numpy(dtype=int)
+
+                    # Split labels by projected horizontal position. Each side is sorted
+                    # vertically, then fitted into evenly spaced slots with no overlap.
+                    centre_x = float(np.median([p[0] for p in projected]))
+                    left_ids = [i for i, p in enumerate(projected) if p[0] <= centre_x]
+                    right_ids = [i for i, p in enumerate(projected) if p[0] > centre_x]
+
+                    # Prevent a very uneven split in unusual camera projections.
+                    min_side = max(2, len(projected) // 3)
+                    if len(left_ids) < min_side or len(right_ids) < min_side:
+                        by_x = sorted(range(len(projected)), key=lambda i: projected[i][0])
+                        cut = len(by_x) // 2
+                        left_ids, right_ids = by_x[:cut], by_x[cut:]
+
+                    def _rail_positions(ids, x_pos, ha):
+                        if not ids:
+                            return []
+                        ids = sorted(ids, key=lambda i: projected[i][1], reverse=True)
+                        top, bottom = 0.88, 0.12
+                        if len(ids) == 1:
+                            slots = [0.50]
+                        else:
+                            slots = np.linspace(top, bottom, len(ids))
+
+                        # Blend each ideal slot with the point's projected height so the
+                        # leader line remains short while spacing remains guaranteed.
+                        raw = np.array([projected[i][1] for i in ids], dtype=float)
+                        slots = 0.78 * np.asarray(slots) + 0.22 * np.clip(raw, bottom, top)
+
+                        # Enforce a hard minimum vertical gap after blending.
+                        gap = min(0.072, 0.72 / max(len(ids) - 1, 1))
+                        for j in range(1, len(slots)):
+                            if slots[j-1] - slots[j] < gap:
+                                slots[j] = slots[j-1] - gap
+                        if slots[-1] < bottom:
+                            slots += (bottom - slots[-1])
+                        if slots[0] > top:
+                            slots -= (slots[0] - top)
+
+                        return [(idx, float(x_pos), float(ypos), ha) for idx, ypos in zip(ids, slots)]
+
+                    labels = (
+                        _rail_positions(left_ids, 0.055, "left")
+                        + _rail_positions(right_ids, 0.945, "right")
+                    )
+
+                    for idx, lx, ly, ha in labels:
+                        px, py, _ = projected[idx]
+                        # Route the line horizontally first, then into the label rail.
+                        elbow_x = 0.125 if ha == "left" else 0.875
+                        line_color = "#8296ad"
+                        label_ax.plot(
+                            [px, elbow_x, lx],
+                            [py, ly, ly],
+                            transform=label_ax.transAxes,
+                            color=line_color,
+                            linewidth=0.50,
+                            alpha=0.62,
+                            solid_capstyle="round",
+                            zorder=2,
+                        )
+                        label_ax.text(
+                            lx,
+                            ly,
                             horse_names[idx],
-                            xy=(px, py),
-                            xytext=(lx, ly),
-                            xycoords="axes fraction",
-                            textcoords="axes fraction",
-                            fontsize=6.9,
+                            transform=label_ax.transAxes,
+                            fontsize=7.0,
                             color="#eef4fb",
-                            ha="center",
+                            ha=ha,
                             va="center",
                             bbox=dict(
-                                boxstyle="round,pad=0.14",
+                                boxstyle="round,pad=0.16",
                                 facecolor="#101a28",
                                 edgecolor="#6e8299",
-                                linewidth=0.38,
-                                alpha=0.76,
+                                linewidth=0.42,
+                                alpha=0.82,
                             ),
-                            arrowprops=leader,
                             clip_on=False,
+                            zorder=3,
                         )
 
                     # PPS is communicated through marker size. Give the top three
@@ -3131,7 +3127,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                     st.pyplot(fig, use_container_width=True)
                     plt.close(fig)
                     st.caption(
-                        "Marker size and label rank follow PPS (best overall position on the plane). "
+                        "Marker size follows PPS (best overall position on the plane). "
                         "Colour shows Class Residual separately: positive residual suggests more late sustain than the plane predicted."
                     )
                 except Exception as e:
