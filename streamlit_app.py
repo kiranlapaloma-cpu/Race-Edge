@@ -24,16 +24,32 @@ def _is_nanlike(x):
         return False
 
 def _san_df(df: pd.DataFrame) -> pd.DataFrame:
-    clean = df.replace([np.inf, -np.inf], np.nan).where(lambda d: d.notna(), None)
+    # Convert to object first, then mask non-finite numeric values. This avoids
+    # pandas' deprecated silent-downcasting path and keeps Streamlit payloads JSON-safe.
+    clean = df.copy().astype("object")
+    for col in clean.columns:
+        numeric = pd.to_numeric(clean[col], errors="coerce")
+        finite_mask = np.isfinite(numeric.to_numpy(dtype=float, na_value=np.nan))
+        original_notna = pd.Series(clean[col]).notna().to_numpy()
+        bad_mask = original_notna & ~finite_mask
+        if bad_mask.any():
+            clean.loc[bad_mask, col] = None
+        clean.loc[pd.isna(clean[col]), col] = None
     clean.index = [None if _is_nanlike(v) else v for v in clean.index.tolist()]
     clean.columns = [None if _is_nanlike(v) else v for v in clean.columns.tolist()]
-    return clean.astype("object")
+    return clean
 
 def _san_ser(s: pd.Series) -> pd.Series:
-    ss = s.replace([np.inf, -np.inf], np.nan)
-    ss = ss.where(ss.notna(), None)
+    ss = s.copy().astype("object")
+    numeric = pd.to_numeric(ss, errors="coerce")
+    finite_mask = np.isfinite(numeric.to_numpy(dtype=float, na_value=np.nan))
+    original_notna = ss.notna().to_numpy()
+    bad_mask = original_notna & ~finite_mask
+    if bad_mask.any():
+        ss.iloc[bad_mask] = None
+    ss.loc[pd.isna(ss)] = None
     ss.index = [None if _is_nanlike(v) else v for v in ss.index.tolist()]
-    return ss.astype("object")
+    return ss
 
 def _sanitize(obj):
     if isinstance(obj, pd.DataFrame):
@@ -596,7 +612,7 @@ def render_rpss_section(rpss_info: dict | None):
         }.items():
             if _col in phase_df.columns:
                 phase_df[_col] = pd.to_numeric(phase_df[_col], errors="coerce").round(_dp)
-        st.dataframe(phase_df, use_container_width=True, hide_index=True)
+        st.dataframe(phase_df, width="stretch", hide_index=True)
 
     # Runner-level tsSPI detail table intentionally removed to keep the app lighter and faster.
 
@@ -807,7 +823,7 @@ if _view_is("Dashboard", "Exports & Notes", "Full Report"):
         c1.metric("Rows", len(work))
         c2.metric("Columns", len(work.columns))
         c3.metric("Split Step", f"{split_step} m")
-        st.dataframe(work.head(12), use_container_width=True)
+        st.dataframe(work.head(12), width="stretch")
 
 # ----------------------- Integrity helpers (odds-aware) -------------------
 def expected_segments_from_df(df: pd.DataFrame) -> list[str]:
@@ -1765,7 +1781,7 @@ if _view_is("Core Metrics", "Full Report"):
         ["PI","_FinishSort"], ascending=[False, True]
     ).drop(columns=["_FinishSort"])
 
-    st.dataframe(display_df, use_container_width=True)
+    st.dataframe(display_df, width="stretch")
 
     # Going note (PI only)
     pi_meta = metrics.attrs.get("PI_GOING_META", {})
@@ -1893,7 +1909,7 @@ if _view_is("Core Metrics", "Full Report"):
             for c in ["Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]:
                 view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
 
-            st.dataframe(view, use_container_width=True)
+            st.dataframe(view, width="stretch")
 
             # Key readout + tiny legend
             colA, colB, colC = st.columns([1,1,1])
@@ -1915,7 +1931,7 @@ if _view_is("Core Metrics", "Full Report"):
             # Optional CSV download (small footprint)
             csv_bytes = view.to_csv(index=False).encode("utf-8")
             st.download_button("Download Ahead-of-Handicap table (CSV)", csv_bytes,
-                               file_name="ahead_of_handicap_one_run.csv", mime="text/csv", use_container_width=True)
+                               file_name="ahead_of_handicap_one_run.csv", mime="text/csv", width="stretch")
     # ======================= /Ahead of the Handicap =======================
     # ======================= End of Batch 2 =======================
 
@@ -2593,7 +2609,7 @@ if _view_is("Ability Radar", "Full Report"):
                 for c in ["F200", "tsSPI", "Accel", "Grind", "Radar_Avg", "Radar_Spread", "PI"]:
                     if c in view.columns:
                         view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
-                st.dataframe(view, use_container_width=True, hide_index=True)
+                st.dataframe(view, width="stretch", hide_index=True)
 
             st.markdown("### Full Ability Radar table")
             full_cols = ["Horse", "Finish_Pos"] if "Finish_Pos" in radar_df.columns else ["Horse"]
@@ -2607,7 +2623,7 @@ if _view_is("Ability Radar", "Full Report"):
                     full_view[c] = pd.to_numeric(full_view[c], errors="coerce").round(2)
             if "Radar_Avg" in full_view.columns:
                 full_view = full_view.sort_values("Radar_Avg", ascending=False, na_position="last").reset_index(drop=True)
-            st.dataframe(full_view, use_container_width=True, hide_index=True)
+            st.dataframe(full_view, width="stretch", hide_index=True)
 
             with st.expander("How to read Ability Radar"):
                 st.markdown(
@@ -2937,7 +2953,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
             out_cols = [c for c in out_cols if c in plane_df.columns]
             out_cols += [c for c in ["TOF", "SRI", "Peak_Location"] if c in plane_df.columns and c not in out_cols]
             rank_df = plane_df.sort_values(["PPS", "Class_Residual"], ascending=[False, False]).reset_index(drop=True)
-            st.dataframe(rank_df[out_cols], use_container_width=True, hide_index=True)
+            st.dataframe(rank_df[out_cols], width="stretch", hide_index=True)
 
             csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
             st.download_button(
@@ -3067,7 +3083,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
                     for spine in cbar.ax.spines.values():
                         spine.set_edgecolor("#6f8197")
 
-                    st.pyplot(fig, use_container_width=True)
+                    st.pyplot(fig, width="stretch")
                     plt.close(fig)
                     st.caption(
                         "Marker size follows PPS (best overall position on the plane). "
@@ -3299,7 +3315,7 @@ if _view_is("Advanced Models", "Full Report"):
     for c in ["PI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI","HiddenScore"]:
         _cast_round(hh_view, c)
 
-    st.dataframe(hh_view, use_container_width=True)
+    st.dataframe(hh_view, width="stretch")
     st.caption("Hidden Horses v2 — sorted by Tier, then HiddenScore, then PI (Top first).")
 
 
@@ -3536,7 +3552,7 @@ if _view_is("Advanced Models", "Full Report"):
 
     st.dataframe(
         view.style.format({"xWin": "{:.1f}%"}),
-        use_container_width=True
+        width="stretch"
     )
 
     with st.expander("xWin settings & notes"):
@@ -3961,6 +3977,9 @@ th {{ background:#eceff3; }}
                 return buf.getvalue()
 
             st.markdown("### Print & Export")
+            st.caption("Large report assets are prepared only when requested, keeping normal app reruns light.")
+
+            # HTML is already available as a string and is inexpensive to expose.
             ex1, ex2, ex3 = st.columns(3)
             with ex1:
                 st.download_button(
@@ -3970,18 +3989,28 @@ th {{ background:#eceff3; }}
                     mime="text/html",
                     width="stretch",
                 )
+
+            # Build the ReportLab document only after the analyst explicitly asks
+            # for it. Previously this ran on every widget change and every rerun.
+            pdf_state_key = f"fs_pdf_bytes_{fs_report_title}"
             with ex2:
-                try:
-                    fs_pdf_bytes = _fs_build_pdf()
+                if st.button("Prepare Form Study PDF", key="fs_prepare_pdf", width="stretch"):
+                    try:
+                        with st.spinner("Preparing PDF…"):
+                            st.session_state[pdf_state_key] = _fs_build_pdf()
+                    except Exception as exc:
+                        st.session_state.pop(pdf_state_key, None)
+                        st.error(f"PDF export unavailable: {exc}")
+
+                if pdf_state_key in st.session_state:
                     st.download_button(
                         "Download Form Study PDF",
-                        data=fs_pdf_bytes,
+                        data=st.session_state[pdf_state_key],
                         file_name=f"{fs_report_title}.pdf",
                         mime="application/pdf",
                         width="stretch",
                     )
-                except Exception as exc:
-                    st.error(f"PDF export unavailable: {exc}")
+
             with ex3:
                 fs_export_df = fs_follow_display if not fs_follow_df.empty else fs_top_display
                 st.download_button(
@@ -3992,7 +4021,10 @@ th {{ background:#eceff3; }}
                     width="stretch",
                 )
 
-            with st.expander("Print preview", expanded=False):
+            # Streamlit executes the contents of a collapsed expander. Use a
+            # checkbox so the iframe is genuinely absent until requested.
+            fs_show_preview = st.checkbox("Show print preview", value=False, key="fs_show_print_preview")
+            if fs_show_preview:
                 st.components.v1.html(fs_print_html, height=900, scrolling=True)
 
 # ======================= /Form Study module =======================
