@@ -607,7 +607,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Core Metrics", "Pressure Retention", "Visuals", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Core Metrics", "Pressure Retention", "Visuals", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Form Study", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -3547,6 +3547,455 @@ if _view_is("Advanced Models", "Full Report"):
             f"Interpretation: chance to win if this same race were replayed 100 times."
         )
 
+
+
+# ======================= Form Study module =======================
+if _view_is("Form Study"):
+    import html as _html
+    from xml.sax.saxutils import escape as _xml_escape
+
+    st.markdown("# Race Edge Analytics")
+    st.caption("Performance-Based Race Analysis")
+    st.markdown("## Form Study Report")
+
+    # ---------- Race information ----------
+    st.markdown("### Race Information")
+    _fs_c1, _fs_c2, _fs_c3, _fs_c4 = st.columns(4)
+    with _fs_c1:
+        fs_date = st.text_input("Date", value=datetime.now().strftime("%Y-%m-%d"), key="fs_date")
+        fs_track = st.text_input("Track", value="", key="fs_track")
+    with _fs_c2:
+        fs_race_no = st.text_input("Race number", value="", key="fs_race_no")
+        fs_surface = st.selectbox("Surface", ["Turf", "Polytrack", "Dirt", "Other"], key="fs_surface")
+    with _fs_c3:
+        fs_going = st.text_input("Going", value=str(GOING_TYPE), key="fs_going")
+        fs_race_class = st.text_input("Race class", value="", key="fs_race_class")
+    with _fs_c4:
+        _fs_rpss_val = RPSS_INFO.get("rpss", np.nan) if isinstance(RPSS_INFO, dict) else np.nan
+        fs_rpss_text = st.text_input(
+            "RPSS",
+            value=(f"{float(_fs_rpss_val):.2f}" if np.isfinite(_fs_rpss_val) else ""),
+            key="fs_rpss",
+        )
+        fs_race_confidence = st.select_slider(
+            "Race confidence",
+            options=[1, 2, 3, 4, 5],
+            value=3,
+            format_func=lambda n: "★" * n + "☆" * (5 - n),
+            key="fs_race_confidence",
+        )
+
+    # ---------- Reusable PPS calculation (independent of Race Plane page rendering) ----------
+    def _fs_robust_z(series):
+        s = pd.to_numeric(series, errors="coerce").astype(float)
+        valid = s[np.isfinite(s)]
+        if valid.empty:
+            return pd.Series(0.0, index=s.index, dtype=float)
+        med = float(np.nanmedian(valid))
+        mad = float(np.nanmedian(np.abs(valid - med)))
+        if np.isfinite(mad) and mad > 1e-12:
+            z = (s - med) / (1.4826 * mad)
+        else:
+            sd = float(np.nanstd(valid, ddof=0))
+            mu = float(np.nanmean(valid))
+            z = (s - mu) / sd if np.isfinite(sd) and sd > 1e-12 else pd.Series(0.0, index=s.index)
+        return pd.Series(z, index=s.index, dtype=float).clip(-3.5, 3.5)
+
+    fs_grind_col = "Grind"
+    fs_required = ["Horse", "tsSPI", "Accel", fs_grind_col]
+    fs_missing = [c for c in fs_required if c not in metrics.columns]
+
+    if fs_missing:
+        st.warning("Form Study cannot calculate PPS because these columns are missing: " + ", ".join(fs_missing))
+    else:
+        fs_plane = metrics.copy()
+        for c in ["tsSPI", "Accel", fs_grind_col, "PI", "F200_idx", "Finish_Pos"]:
+            if c in fs_plane.columns:
+                fs_plane[c] = pd.to_numeric(fs_plane[c], errors="coerce")
+        fs_plane = fs_plane.dropna(subset=fs_required).copy()
+
+        if len(fs_plane) < 3:
+            st.info("At least three valid runners are required for the Form Study module.")
+        else:
+            # PPS ratio: tsSPI : Accel : Grind = 1 : 1.2 : 1.
+            fs_plane["_z_tsSPI"] = _fs_robust_z(fs_plane["tsSPI"])
+            fs_plane["_z_Accel"] = _fs_robust_z(fs_plane["Accel"])
+            fs_plane["_z_Grind"] = _fs_robust_z(fs_plane[fs_grind_col])
+            fs_plane["PPS_Core"] = (
+                0.3125 * fs_plane["_z_tsSPI"]
+                + 0.3750 * fs_plane["_z_Accel"]
+                + 0.3125 * fs_plane["_z_Grind"]
+            )
+            fs_plane["PPS"] = np.clip(5.0 + 2.75 * np.tanh(fs_plane["PPS_Core"] / 1.35), 0.0, 10.0)
+            fs_plane["PPS_Rank"] = fs_plane["PPS"].rank(method="min", ascending=False).astype(int)
+
+            # Fit the same Performance Plane for residual context.
+            X = np.column_stack([
+                np.ones(len(fs_plane)),
+                fs_plane["tsSPI"].to_numpy(dtype=float) - 100.0,
+                fs_plane["Accel"].to_numpy(dtype=float) - 100.0,
+            ])
+            y = fs_plane[fs_grind_col].to_numpy(dtype=float) - 100.0
+            try:
+                coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+                expected = 100.0 + X @ coef
+                fs_plane["Expected_Grind"] = expected
+                fs_plane["Class_Residual"] = fs_plane[fs_grind_col] - expected
+            except Exception:
+                fs_plane["Expected_Grind"] = np.nan
+                fs_plane["Class_Residual"] = np.nan
+
+            fs_plane = fs_plane.sort_values(["PPS", "PI" if "PI" in fs_plane.columns else "PPS"], ascending=False)
+            fs_top4 = fs_plane.head(4).copy().reset_index(drop=True)
+
+            # ---------- Top 4 PPS ----------
+            st.markdown("### Top 4 Performance Plane Scores (PPS)")
+            st.caption("Automatically selected by PPS. PPS uses tsSPI : Accel : Grind in a 1 : 1.2 : 1 ratio.")
+            fs_top_cols = [
+                "PPS_Rank", "Horse", "Finish_Pos", "PPS", "PI", "F200_idx",
+                "tsSPI", "Accel", fs_grind_col, "Class_Residual",
+            ]
+            fs_top_cols = [c for c in fs_top_cols if c in fs_top4.columns]
+            fs_top_display = fs_top4[fs_top_cols].copy()
+            fs_top_display = fs_top_display.rename(columns={
+                "PPS_Rank": "PPS Rank", "Finish_Pos": "Finish", "F200_idx": "F200",
+                "Class_Residual": "Residual",
+            })
+            for c in ["PPS", "PI", "F200", "tsSPI", "Accel", "Grind", "Residual"]:
+                if c in fs_top_display.columns:
+                    fs_top_display[c] = pd.to_numeric(fs_top_display[c], errors="coerce").round(2)
+            st.dataframe(fs_top_display, width="stretch", hide_index=True)
+
+            # ---------- Analyst assessments ----------
+            st.markdown("### Analyst Assessment")
+            fs_follow_reasons = [
+                "Strong plane position", "Better than result", "Hidden run", "Pace against",
+                "Wants further", "Wants shorter", "Settled poorly", "Wide trip",
+                "Traffic problems", "Strong finish", "Forgive run", "Other",
+            ]
+            fs_surfaces = ["Any", "Turf", "Polytrack", "Dirt", "Other"]
+            fs_paces = ["Any", "Slow/tactical", "Even", "Strong", "Fast/collapse"]
+            fs_follow_rows = []
+
+            for i, row in fs_top4.iterrows():
+                horse = str(row["Horse"])
+                safe_key = re.sub(r"[^A-Za-z0-9]+", "_", horse).strip("_")[:40] or f"horse_{i}"
+                with st.expander(f"#{int(row['PPS_Rank'])} — {horse}", expanded=(i == 0)):
+                    a1, a2, a3 = st.columns([1, 1.4, 1])
+                    with a1:
+                        follow = st.checkbox("Follow horse", value=True, key=f"fs_follow_{safe_key}_{i}")
+                        reason = st.selectbox("Follow reason", fs_follow_reasons, key=f"fs_reason_{safe_key}_{i}")
+                        confidence = st.select_slider(
+                            "Confidence", options=[1, 2, 3, 4, 5], value=3,
+                            format_func=lambda n: "★" * n + "☆" * (5 - n),
+                            key=f"fs_conf_{safe_key}_{i}",
+                        )
+                    with a2:
+                        ideal_distance = st.text_input("Ideal distance", value=f"{int(race_distance_input)}m", key=f"fs_dist_{safe_key}_{i}")
+                        ideal_surface = st.selectbox("Ideal surface", fs_surfaces, key=f"fs_surf_{safe_key}_{i}")
+                        preferred_pace = st.selectbox("Preferred pace", fs_paces, key=f"fs_pace_{safe_key}_{i}")
+                    with a3:
+                        note = st.text_area("Analyst note", height=128, key=f"fs_note_{safe_key}_{i}")
+
+                    fs_follow_rows.append({
+                        "Follow": bool(follow), "Horse": horse,
+                        "PPS": float(row.get("PPS", np.nan)), "PI": float(row.get("PI", np.nan)),
+                        "Finish": row.get("Finish_Pos", np.nan), "F200": row.get("F200_idx", np.nan),
+                        "tsSPI": row.get("tsSPI", np.nan), "Accel": row.get("Accel", np.nan),
+                        "Grind": row.get(fs_grind_col, np.nan), "Residual": row.get("Class_Residual", np.nan),
+                        "Reason": reason, "Ideal distance": ideal_distance, "Ideal surface": ideal_surface,
+                        "Preferred pace": preferred_pace, "Confidence": int(confidence), "Note": note,
+                    })
+
+            # ---------- Handicap Review ----------
+            st.markdown("### Handicap Review")
+            st.caption("The full field is shown. Enter Current MR and MR Achieved; Race Edge calculates the difference.")
+
+            def _fs_beta_base(distance_m):
+                d = float(distance_m)
+                if d <= 1200: return 0.30
+                if d <= 1600: return 0.35
+                if d <= 2000: return 0.40
+                if d <= 2400: return 0.45
+                return 0.50
+
+            fs_weight_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
+            fs_weight_col = next((c for c in fs_weight_candidates if c in metrics.columns), None)
+            fs_handicap = metrics[["Horse", "PI"]].copy()
+            fs_handicap["Weight (kg)"] = (
+                pd.to_numeric(metrics[fs_weight_col], errors="coerce").fillna(60.0)
+                if fs_weight_col else 60.0
+            )
+            fs_handicap["PI"] = pd.to_numeric(fs_handicap["PI"], errors="coerce")
+            fs_pi_med = float(np.nanmedian(fs_handicap["PI"])) if fs_handicap["PI"].notna().any() else np.nan
+            fs_beta = float(np.clip(_fs_beta_base(float(race_distance_input)), 0.22, 0.70))
+            fs_handicap["Ahead (kg)"] = (fs_handicap["PI"] - fs_pi_med) / fs_beta
+            fs_handicap["Ahead (MR)"] = fs_handicap["Ahead (kg)"] * 2.0
+            fs_handicap["Current MR"] = np.nan
+            fs_handicap["MR Achieved"] = np.nan
+            fs_handicap["Handicap Note"] = ""
+            fs_handicap = fs_handicap.sort_values("Ahead (kg)", ascending=False).reset_index(drop=True)
+            for c in ["Weight (kg)", "PI", "Ahead (kg)", "Ahead (MR)"]:
+                fs_handicap[c] = pd.to_numeric(fs_handicap[c], errors="coerce").round(2)
+
+            fs_edited = st.data_editor(
+                fs_handicap,
+                width="stretch",
+                hide_index=True,
+                disabled=["Horse", "Weight (kg)", "PI", "Ahead (kg)", "Ahead (MR)"],
+                column_config={
+                    "Current MR": st.column_config.NumberColumn("Current MR", step=1, format="%.0f"),
+                    "MR Achieved": st.column_config.NumberColumn("MR Achieved", step=1, format="%.0f"),
+                    "Handicap Note": st.column_config.TextColumn("Handicap Note", width="large"),
+                },
+                key="fs_handicap_editor",
+            )
+            fs_edited = fs_edited.copy()
+            fs_edited["Current MR"] = pd.to_numeric(fs_edited["Current MR"], errors="coerce")
+            fs_edited["MR Achieved"] = pd.to_numeric(fs_edited["MR Achieved"], errors="coerce")
+            fs_edited["MR Difference"] = fs_edited["MR Achieved"] - fs_edited["Current MR"]
+
+            fs_mr_view_cols = ["Horse", "Current MR", "MR Achieved", "MR Difference", "Handicap Note"]
+            st.dataframe(fs_edited[fs_mr_view_cols], width="stretch", hide_index=True)
+
+            # ---------- Race Edge Verdict ----------
+            st.markdown("### Race Edge Verdict")
+            fs_horses = [str(h) for h in metrics["Horse"].dropna().astype(str).tolist()]
+            fs_options = ["—"] + fs_horses
+            v1, v2, v3, v4 = st.columns(4)
+            with v1:
+                fs_main_follow = st.selectbox("Main horse to follow", fs_options, key="fs_main_follow")
+            with v2:
+                fs_improver = st.selectbox("Most likely improver", fs_options, key="fs_improver")
+            with v3:
+                fs_best_handicap = st.selectbox("Best handicapped horse", fs_options, key="fs_best_handicap")
+            with v4:
+                fs_forgive = st.selectbox("Horse to forgive", fs_options, key="fs_forgive")
+            fs_race_summary = st.text_area("Race summary", height=150, key="fs_race_summary")
+
+            # ---------- Final follow list ----------
+            st.markdown("### Final Follow List")
+            fs_follow_df = pd.DataFrame([r for r in fs_follow_rows if r["Follow"]])
+            if fs_follow_df.empty:
+                st.info("No horses selected for the final follow list.")
+            else:
+                fs_mr_lookup = fs_edited.set_index("Horse")[["Current MR", "MR Achieved", "MR Difference"]]
+                for c in ["Current MR", "MR Achieved", "MR Difference"]:
+                    fs_follow_df[c] = fs_follow_df["Horse"].map(fs_mr_lookup[c])
+                fs_final_cols = [
+                    "Horse", "PPS", "PI", "Finish", "Current MR", "MR Achieved", "MR Difference",
+                    "Reason", "Ideal distance", "Ideal surface", "Preferred pace", "Confidence", "Note",
+                ]
+                fs_follow_display = fs_follow_df[fs_final_cols].copy()
+                for c in ["PPS", "PI", "Current MR", "MR Achieved", "MR Difference"]:
+                    fs_follow_display[c] = pd.to_numeric(fs_follow_display[c], errors="coerce").round(2)
+                st.dataframe(fs_follow_display, width="stretch", hide_index=True)
+
+            # ---------- Printable HTML ----------
+            def _fs_fmt(v, dp=2):
+                try:
+                    return "" if pd.isna(v) else f"{float(v):.{dp}f}"
+                except Exception:
+                    return _html.escape(str(v))
+
+            def _fs_html_table(df):
+                if df is None or df.empty:
+                    return "<p><em>None selected.</em></p>"
+                cols = list(df.columns)
+                head = "".join(f"<th>{_html.escape(str(c))}</th>" for c in cols)
+                rows = []
+                for _, rr in df.iterrows():
+                    cells = []
+                    for c in cols:
+                        v = rr[c]
+                        if isinstance(v, (float, np.floating)):
+                            txt = _fs_fmt(v)
+                        else:
+                            txt = "" if pd.isna(v) else _html.escape(str(v))
+                        cells.append(f"<td>{txt}</td>")
+                    rows.append("<tr>" + "".join(cells) + "</tr>")
+                return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+
+            fs_report_title = f"{fs_date}_{fs_track or 'Track'}_Race{fs_race_no or 'NA'}_FormStudy"
+            fs_report_title = re.sub(r"[^A-Za-z0-9._-]+", "_", fs_report_title)
+
+            fs_print_html = f'''<!doctype html>
+<html><head><meta charset="utf-8"><title>{_html.escape(fs_report_title)}</title>
+<style>
+@page {{ size: A4; margin: 15mm 12mm 18mm; }}
+body {{ font-family: Arial, Helvetica, sans-serif; color:#111; font-size:10px; margin:0; }}
+h1 {{ font-size:21px; margin:0; letter-spacing:.5px; }}
+h2 {{ font-size:15px; margin:4px 0 12px; }}
+h3 {{ font-size:12px; border-bottom:1px solid #777; padding-bottom:3px; margin-top:14px; }}
+.meta {{ display:grid; grid-template-columns:repeat(4,1fr); gap:5px 12px; margin:8px 0 12px; }}
+table {{ width:100%; border-collapse:collapse; margin:5px 0 10px; font-size:8.4px; }}
+th,td {{ border:1px solid #999; padding:3px 4px; text-align:left; vertical-align:top; }}
+th {{ background:#eceff3; }}
+.verdict {{ display:grid; grid-template-columns:repeat(2,1fr); gap:6px 14px; }}
+.note {{ border:1px solid #999; min-height:46px; padding:6px; white-space:pre-wrap; }}
+.footer {{ position:fixed; left:0; right:0; bottom:-11mm; text-align:center; color:#666; font-size:8px; border-top:1px solid #aaa; padding-top:4px; }}
+.page-break {{ page-break-before:always; }}
+@media print {{ .print-button {{ display:none; }} }}
+</style></head><body>
+<button class="print-button" onclick="window.print()">Print report</button>
+<h1>RACE EDGE ANALYTICS</h1><h2>Performance-Based Race Analysis — Form Study Report</h2>
+<div class="meta">
+<div><b>Date:</b> {_html.escape(fs_date)}</div><div><b>Track:</b> {_html.escape(fs_track)}</div>
+<div><b>Race:</b> {_html.escape(fs_race_no)}</div><div><b>Distance:</b> {int(race_distance_input)}m</div>
+<div><b>Surface:</b> {_html.escape(fs_surface)}</div><div><b>Going:</b> {_html.escape(fs_going)}</div>
+<div><b>Class:</b> {_html.escape(fs_race_class)}</div><div><b>RPSS:</b> {_html.escape(fs_rpss_text)}</div>
+<div><b>Race confidence:</b> {'★' * int(fs_race_confidence)}{'☆' * (5-int(fs_race_confidence))}</div><div><b>Runners:</b> {len(metrics)}</div>
+</div>
+<h3>Top 4 Performance Plane Scores (PPS)</h3>{_fs_html_table(fs_top_display)}
+<h3>Analyst Follow Assessments</h3>{_fs_html_table(pd.DataFrame(fs_follow_rows))}
+<div class="page-break"></div>
+<h3>Handicap Review</h3>{_fs_html_table(fs_edited)}
+<h3>Race Edge Verdict</h3>
+<div class="verdict"><div><b>Main horse to follow:</b> {_html.escape(fs_main_follow)}</div><div><b>Most likely improver:</b> {_html.escape(fs_improver)}</div>
+<div><b>Best handicapped horse:</b> {_html.escape(fs_best_handicap)}</div><div><b>Horse to forgive:</b> {_html.escape(fs_forgive)}</div></div>
+<h3>Race Summary</h3><div class="note">{_html.escape(fs_race_summary)}</div>
+<h3>Final Follow List</h3>{_fs_html_table(fs_follow_display if not fs_follow_df.empty else pd.DataFrame())}
+<div class="footer">Property of Race Edge Analytics &nbsp; | &nbsp; Prepared by Kiran Singh &nbsp; | &nbsp; © Race Edge Analytics. All Rights Reserved.</div>
+</body></html>'''
+
+            # ---------- PDF export ----------
+            def _fs_build_pdf():
+                try:
+                    from reportlab.lib import colors
+                    from reportlab.lib.enums import TA_CENTER
+                    from reportlab.lib.pagesizes import A4, landscape
+                    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+                    from reportlab.lib.units import mm
+                    from reportlab.platypus import (
+                        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, KeepTogether,
+                    )
+                except Exception as exc:
+                    raise RuntimeError("ReportLab is required for PDF export.") from exc
+
+                buf = io.BytesIO()
+                doc = SimpleDocTemplate(
+                    buf, pagesize=landscape(A4), rightMargin=10*mm, leftMargin=10*mm,
+                    topMargin=12*mm, bottomMargin=18*mm,
+                    title="Race Edge Analytics Form Study Report",
+                    author="Kiran Singh",
+                )
+                styles = getSampleStyleSheet()
+                title_style = ParagraphStyle("RETitle", parent=styles["Title"], fontSize=18, leading=21, spaceAfter=2)
+                sub_style = ParagraphStyle("RESub", parent=styles["Normal"], fontSize=9, leading=11, textColor=colors.HexColor("#555555"), spaceAfter=7)
+                h_style = ParagraphStyle("REH", parent=styles["Heading2"], fontSize=11, leading=13, spaceBefore=7, spaceAfter=4)
+                body_style = ParagraphStyle("REBody", parent=styles["BodyText"], fontSize=7.5, leading=9)
+                tiny_style = ParagraphStyle("RETiny", parent=styles["BodyText"], fontSize=6.2, leading=7.2)
+
+                def ptxt(v, style=tiny_style):
+                    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                        s = ""
+                    elif isinstance(v, (float, np.floating)):
+                        s = f"{float(v):.2f}"
+                    else:
+                        s = str(v)
+                    return Paragraph(_xml_escape(s).replace("\n", "<br/>"), style)
+
+                def make_table(df, widths=None, font=6.0):
+                    if df is None or df.empty:
+                        return Paragraph("None selected.", body_style)
+                    data = [[ptxt(c) for c in df.columns]]
+                    for _, rr in df.iterrows():
+                        data.append([ptxt(rr[c]) for c in df.columns])
+                    t = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+                    t.setStyle(TableStyle([
+                        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E8EDF3")),
+                        ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#111111")),
+                        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#888888")),
+                        ("VALIGN", (0,0), (-1,-1), "TOP"),
+                        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0,0), (-1,-1), font),
+                        ("LEFTPADDING", (0,0), (-1,-1), 2.5),
+                        ("RIGHTPADDING", (0,0), (-1,-1), 2.5),
+                        ("TOPPADDING", (0,0), (-1,-1), 2.0),
+                        ("BOTTOMPADDING", (0,0), (-1,-1), 2.0),
+                    ]))
+                    return t
+
+                def footer(canvas, doc_obj):
+                    canvas.saveState()
+                    w, _h = landscape(A4)
+                    canvas.setStrokeColor(colors.HexColor("#999999"))
+                    canvas.setLineWidth(0.4)
+                    canvas.line(10*mm, 12*mm, w-10*mm, 12*mm)
+                    canvas.setFillColor(colors.HexColor("#666666"))
+                    canvas.setFont("Helvetica", 7)
+                    canvas.drawCentredString(
+                        w/2, 7.5*mm,
+                        "Property of Race Edge Analytics  |  Prepared by Kiran Singh  |  © Race Edge Analytics. All Rights Reserved."
+                    )
+                    canvas.setFont("Helvetica", 6.5)
+                    canvas.drawRightString(w-10*mm, 7.5*mm, f"Page {doc_obj.page}")
+                    canvas.restoreState()
+
+                story = [
+                    Paragraph("RACE EDGE ANALYTICS", title_style),
+                    Paragraph("Performance-Based Race Analysis — Form Study Report", sub_style),
+                ]
+                meta = pd.DataFrame([
+                    ["Date", fs_date, "Track", fs_track, "Race", fs_race_no, "Distance", f"{int(race_distance_input)}m"],
+                    ["Surface", fs_surface, "Going", fs_going, "Class", fs_race_class, "RPSS", fs_rpss_text],
+                    ["Race confidence", "★"*int(fs_race_confidence), "Runners", str(len(metrics)), "", "", "", ""],
+                ])
+                story += [make_table(meta, font=7.2), Spacer(1, 3*mm)]
+                story += [Paragraph("Top 4 Performance Plane Scores (PPS)", h_style), make_table(fs_top_display, font=6.4)]
+
+                analyst_df = pd.DataFrame(fs_follow_rows)
+                story += [Paragraph("Analyst Follow Assessments", h_style), make_table(analyst_df, font=5.6)]
+                story += [PageBreak(), Paragraph("Handicap Review", h_style), make_table(fs_edited, font=5.7)]
+
+                verdict_df = pd.DataFrame([
+                    ["Main horse to follow", fs_main_follow, "Most likely improver", fs_improver],
+                    ["Best handicapped horse", fs_best_handicap, "Horse to forgive", fs_forgive],
+                ])
+                story += [Paragraph("Race Edge Verdict", h_style), make_table(verdict_df, font=7.0)]
+                story += [Paragraph("Race Summary", h_style), Paragraph(_xml_escape(fs_race_summary).replace("\n", "<br/>"), body_style)]
+                story += [Paragraph("Final Follow List", h_style), make_table(fs_follow_display if not fs_follow_df.empty else pd.DataFrame(), font=5.7)]
+
+                doc.build(story, onFirstPage=footer, onLaterPages=footer)
+                buf.seek(0)
+                return buf.getvalue()
+
+            st.markdown("### Print & Export")
+            ex1, ex2, ex3 = st.columns(3)
+            with ex1:
+                st.download_button(
+                    "Download print-ready HTML",
+                    data=fs_print_html.encode("utf-8"),
+                    file_name=f"{fs_report_title}.html",
+                    mime="text/html",
+                    width="stretch",
+                )
+            with ex2:
+                try:
+                    fs_pdf_bytes = _fs_build_pdf()
+                    st.download_button(
+                        "Download Form Study PDF",
+                        data=fs_pdf_bytes,
+                        file_name=f"{fs_report_title}.pdf",
+                        mime="application/pdf",
+                        width="stretch",
+                    )
+                except Exception as exc:
+                    st.error(f"PDF export unavailable: {exc}")
+            with ex3:
+                fs_export_df = fs_follow_display if not fs_follow_df.empty else fs_top_display
+                st.download_button(
+                    "Download Form Study CSV",
+                    data=fs_export_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{fs_report_title}.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+
+            with st.expander("Print preview", expanded=False):
+                st.components.v1.html(fs_print_html, height=900, scrolling=True)
+
+# ======================= /Form Study module =======================
 
 if _view_is("Exports & Notes", "Full Report"):
     st.markdown("## Notes & Debug")
