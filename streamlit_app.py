@@ -1878,10 +1878,23 @@ if _view_is("Core Metrics"):
             # 4) Safety rails (avoid crazy kg if β too tiny or huge)
             beta_eff = float(np.clip(beta_eff, 0.22, 0.70))  # keep within realistic PI/kg bounds
 
-            # 5) Convert each horse’s PI to ΔPI vs field median, then to kg & lb
+            # 5) Convert each horse’s PI to ΔPI vs field median, then to kg and MR.
+            #    PI itself remains unchanged. Only the PI-to-weight/MR conversion is
+            #    confidence-adjusted in fields with fewer than 12 valid runners.
             PI_med = float(np.nanmedian(df["PI"]))
             df["ΔPI_vs_med"] = df["PI"] - PI_med
-            df["RanAbove_kg"] = df["ΔPI_vs_med"] / beta_eff
+
+            field_size = int(df["PI"].notna().sum())
+            field_conversion_factor = {
+                7: 0.68,
+                8: 0.76,
+                9: 0.84,
+                10: 0.90,
+                11: 0.95,
+            }.get(field_size, 1.00 if field_size >= 12 else 0.60)
+
+            raw_ran_above_kg = df["ΔPI_vs_med"] / beta_eff
+            df["RanAbove_kg"] = raw_ran_above_kg * field_conversion_factor
             df["RanAbove_MR"] = df["RanAbove_kg"] * 2
         
             # 6) Friendly view
@@ -1909,11 +1922,18 @@ if _view_is("Core Metrics"):
             with colC:
                 st.metric("β_eff (this race)", f"{beta_eff:.2f} PI per kg")
 
+            if field_size < 12:
+                st.caption(
+                    f"Small-field conversion adjustment: {field_size} valid runners → "
+                    f"{field_conversion_factor:.0%} of the raw PI-to-kg/MR conversion. PI scores are unchanged."
+                )
+
             st.caption(
                 "Interpretation: **RanAbove (kg)** estimates how many kilograms a horse effectively ran above/below the "
                 "field median, *within this single race*. Positive = ran as if it could carry more and still match median. "
                 "Slope (β_eff) is distance-based, gently adjusted by (i) how weight correlated with PI in this field and "
-                "(ii) race shape (fast-early increases weight bite; slow-early reduces it)."
+                "(ii) race shape. For fields below 12 valid runners, only the kg/MR conversion is reduced to reflect the "
+                "smaller dataset; the underlying PI scores and rankings remain unchanged."
             )
 
             # Optional CSV download (small footprint)
