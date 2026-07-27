@@ -1314,8 +1314,8 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         "uses_weight_adjustment": False,
     }
 
-    # Race-relative 0-10 scale. The field median centres on 5, while the
-    # non-linear mapping preserves separation without forcing the leader to 10.
+    # Race-relative robust linear scale. The field median centres on 5,
+    # while genuine above- and below-field separation is preserved.
     pts = pd.to_numeric(w["PI_pts"], errors="coerce")
     finite_pts = pts[np.isfinite(pts)]
     med = float(np.nanmedian(finite_pts)) if len(finite_pts) else 0.0
@@ -1323,13 +1323,22 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     sigma = mad_std(centered)
     sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else float(sigma)
 
+    z_score = centered / sigma
     w["PI"] = (
-        5.0 + 2.75 * np.tanh((centered / sigma) / 1.35)
-    ).clip(0.0, 10.0).round(2)
+        5.0 + 1.5 * z_score
+    ).clip(0.5, 9.5).round(2)
+
+    w.attrs["PI_REFINED_META"].update({
+        "scale_method": "robust_linear_median_mad",
+        "scale_slope": 1.5,
+        "scale_floor": 0.5,
+        "scale_ceiling": 9.5,
+        "median_center": 5.0,
+        "mad_floor": 0.75,
+    })
 
     # ----- Phase PI decomposition -----
-    # Diagnostic weighted contributions. Final PI is non-linear, so these
-    # components explain influence but are not expected to add exactly to PI.
+    # Diagnostic weighted contributions showing each phase's raw influence.
     total_pi_w = sum(PI_W.values()) or 1.0
     pi_scale = 1.0
     pi_intercept = 5.0
