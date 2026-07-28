@@ -1196,9 +1196,13 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["_MID_spd"] = w.apply(lambda r: _stage_speed(r, mid_cols, float(step)), axis=1)
 
     if step == 100:
+        # Accel always represents 600m remaining to 200m remaining.
+        # With 100m data this is four consecutive 100m panels.
         acc_cols = [c for c in [f"{m}_Time" for m in [500,400,300,200]] if c in w.columns]
     else:
-        acc_cols = [c for c in [f"{m}_Time" for m in [600,400]] if c in w.columns]
+        # With 200m data the same physical 400m phase is represented by
+        # the 600->400 and 400->200 panels, stored as 400_Time and 200_Time.
+        acc_cols = [c for c in [f"{m}_Time" for m in [400,200]] if c in w.columns]
     w["_ACC_spd"] = w.apply(lambda r: _stage_speed(r, acc_cols, float(step)), axis=1)
 
     w["_GR_spd"]  = w.apply(lambda r: _grind_speed(r, step), axis=1)
@@ -1755,12 +1759,12 @@ if _view_is("Core Metrics"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
 
     show_cols = [
-        "Horse","Finish_Pos","RaceTime_s",
-        "F200_idx","tsSPI","Accel","TOF","TOF_Profile","Grind","Grind_CG",
+        "Horse","Finish_Pos","PI",
+        "RaceTime_s","F200_idx","tsSPI","Accel","TOF","TOF_Profile","Grind","Grind_CG",
         "EARLY_idx","LATE_idx",
         "Peak_Speed","Peak_Location","SRI","SRI_Profile",
         "GrindAdjPts","DeltaG",
-        "PI","PI_pts","Sprint_Conversion_Penalty"
+        "PI_pts","Sprint_Conversion_Penalty"
     ]
 
     # ---- make the column pick robust (no KeyError if some are missing) ----
