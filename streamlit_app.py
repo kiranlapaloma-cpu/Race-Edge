@@ -1253,16 +1253,20 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         return 100.0 + 0.5*(g-100.0) if (dg < 97.0 and g > 100.0) else g
     w["Grind_CG"] = [ _fade_cap(g, dg) for g, dg in zip(w["Grind_CG"], w["DeltaG"]) ]
 
-    # ----- PI v4.3: distance-aware four-core model -----
-    # PI is based only on F200, tsSPI, Accel and raw Grind.
-    # F200 remains proportional to the race distance. The remaining influence
-    # is divided using tsSPI : Accel : Grind = 1 : (1 + 200 / race distance) : 1.
-    # Accel receives extra weight for covering 200 m more than Grind, with the
-    # premium reducing progressively as race distance increases.
+    # ----- PI v4.4: actual-opening-block four-core model -----
+    # PI is based only on the opening-block index, tsSPI, Accel and raw Grind.
+    # The opening index receives the exact percentage of the race represented
+    # by the detected opening block (for example F100, F150, F160, F200 or F250).
+    # The remaining influence is divided using:
+    # tsSPI : Accel : Grind = 1 : (1 + 200 / race distance) : 1.
+    # The Accel premium is therefore tied to the percentage that an additional
+    # 200 m represents of the complete race, while the opening weight remains
+    # faithful to the actual sectional block used.
     GR_COL = "Grind"
 
-    race_distance = max(float(D), 200.0)
-    w_f200 = float(np.clip(200.0 / race_distance, 0.0, 1.0))
+    race_distance = max(float(D), 1.0)
+    opening_block_m = float(np.clip(f_dist, 0.0, race_distance))
+    w_f200 = opening_block_m / race_distance
     remaining = max(0.0, 1.0 - w_f200)
     accel_ratio = 1.0 + (200.0 / race_distance)
     ratio_total = 1.0 + accel_ratio + 1.0
@@ -1277,8 +1281,11 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     # Keep metadata available to the dashboard, exports and reports.
     w.attrs["GOING"] = GOING_TYPE if "GOING_TYPE" in globals() else "Good"
     w.attrs["PI_GOING_META"] = {
-        "method": "distance_f200_ratio_1_1_plus_200_over_distance_1",
+        "method": "actual_opening_block_ratio_1_1_plus_200_over_distance_1",
         "distance_m": int(round(race_distance)),
+        "opening_block_m": round(opening_block_m, 2),
+        "opening_label": f"F{int(round(opening_block_m))}" if opening_block_m > 0 else "Opening",
+        "weights": PI_W.copy(),
     }
     w.attrs["PI_MASS_NOTE"] = {
         "mass_col": "(not used in PI)",
