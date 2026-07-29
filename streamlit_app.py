@@ -2982,8 +2982,187 @@ This is experimental. In small fields or unusual race shapes, use it as a guide 
                 )
 
 
+# ======================= Run Stability (Experimental) =======================
+def compute_run_stability(metrics_df: pd.DataFrame, split_step: int, rpss_info=None) -> pd.DataFrame:
+    """
+    One-run, field-relative effort-state model.
+
+    It classifies meaningful changes in each horse's residual sectional speed as
+    Build / Hold / Weaken, compresses repeated states, and penalises genuine
+    direction reversals rather than sustained acceleration or a clean fade.
+    """
+    if metrics_df is None or metrics_df.empty or "Horse" not in metrics_df.columns:
+        return pd.DataFrame()
+
+    step = int(split_step)
+    marker_cols = []
+    for c in metrics_df.columns:
+        m = re.fullmatch(r"(\d+)_Time", str(c))
+        if m:
+            marker_cols.append((int(m.group(1)), c))
+    marker_cols.sort(reverse=True)  # chronological: largest remaining marker first
+    time_cols = [c for _, c in marker_cols]
+    if "Finish_Time" in metrics_df.columns:
+        time_cols.append("Finish_Time")
+
+    # The opening block is dominated by start/positioning noise and is excluded.
+    if len(time_cols) < 5:
+        return pd.DataFrame()
+    analysis_cols = time_cols[1:]
+
+    speed = pd.DataFrame(index=metrics_df.index)
+    for c in analysis_cols:
+        t = pd.to_numeric(metrics_df[c], errors="coerce")
+        speed[c] = np.where(t > 0, 3.6 * step / t, np.nan)
+
+    # Remove the movement shared by the race at each sectional.
+    field_median = speed.median(axis=0, skipna=True)
+    residual = speed.subtract(field_median, axis=1)
+    changes = residual.diff(axis=1).iloc[:, 1:]
+
+    # Race-adaptive noise threshold, with a practical floor for timing noise.
+    vals = changes.to_numpy(dtype=float).ravel()
+    vals = vals[np.isfinite(vals)]
+    robust_noise = mad_std(vals) if vals.size else np.nan
+    threshold = max(0.50, 0.75 * robust_noise) if np.isfinite(robust_noise) else 0.50
+    threshold = float(np.clip(threshold, 0.50, 1.10))
+
+    # RPSS is only a modest contextual modifier because field residuals already
+    # remove most of the common tactical race shape.
+    rpss = np.nan
+    if isinstance(rpss_info, dict):
+        rpss = pd.to_numeric(rpss_info.get("rpss"), errors="coerce")
+    if np.isfinite(rpss):
+        rpss_factor = float(np.interp(float(rpss), [88, 94, 98, 102], [0.86, 1.00, 1.06, 1.10]))
+    else:
+        rpss_factor = 1.0
+
+    rows = []
+    for idx, r in metrics_df.iterrows():
+        ch = pd.to_numeric(changes.loc[idx], errors="coerce").dropna()
+        raw_states = []
+        meaningful = []
+        for v in ch.tolist():
+            if v > threshold:
+                raw_states.append("Build")
+                meaningful.append(float(v))
+            elif v < -threshold:
+                raw_states.append("Weaken")
+                meaningful.append(float(v))
+            else:
+                raw_states.append("Hold")
+
+        # Hold is neutral. Consecutive same-direction efforts form one sustained state.
+        active = [x for x in raw_states if x != "Hold"]
+        compressed = []
+        for state in active:
+            if not compressed or compressed[-1] != state:
+                compressed.append(state)
+
+        reversals = max(0, len(compressed) - 1)
+        significant_count = len(active)
+        if compressed:
+            pattern = " → ".join(compressed)
+        else:
+            pattern = "Hold"
+
+        mag = np.asarray([abs(v) for v in meaningful], dtype=float)
+        excess_mag = float(np.sum(np.maximum(0.0, mag - threshold))) if mag.size else 0.0
+        largest = float(np.max(mag)) if mag.size else 0.0
+
+        # Clean sustained Build/Hold begins high. One normal Build→Weaken sequence
+        # receives only a moderate deduction; repeated reversals are heavily penalised.
+        penalty = (
+            1.85 * reversals
+            + 0.30 * max(0, significant_count - 2)
+            + 0.24 * excess_mag
+            + 0.12 * max(0.0, largest - threshold)
+        ) * rpss_factor
+        score = float(np.clip(9.2 - penalty, 1.0, 10.0))
+
+        if score >= 8.5:
+            flag = "Clean"
+        elif score >= 7.0:
+            flag = "Controlled"
+        elif score >= 5.5:
+            flag = "Tactical"
+        elif score >= 4.0:
+            flag = "Unstable"
+        else:
+            flag = "High Risk"
+
+        pi = pd.to_numeric(r.get("PI"), errors="coerce")
+        rows.append({
+            "Horse": r.get("Horse"),
+            "Finish": pd.to_numeric(r.get("Finish Position"), errors="coerce"),
+            "PI": pi,
+            "Run Stability": score,
+            "Effort Pattern": pattern,
+            "Gear Changes": reversals,
+            "Meaningful Efforts": significant_count,
+            "Flag": flag,
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    # Strong performance with low stability: warning only, never alters PI.
+    pi_cut = pd.to_numeric(out["PI"], errors="coerce").quantile(2/3)
+    risk = (
+        pd.to_numeric(out["PI"], errors="coerce").ge(pi_cut)
+        & pd.to_numeric(out["Run Stability"], errors="coerce").lt(5.5)
+    )
+    out.loc[risk, "Flag"] = "High-PI Risk"
+    out["Run Stability"] = pd.to_numeric(out["Run Stability"], errors="coerce").round(2)
+    out["PI"] = pd.to_numeric(out["PI"], errors="coerce").round(2)
+    out["Finish"] = pd.to_numeric(out["Finish"], errors="coerce").astype("Int64")
+    out.attrs["threshold"] = threshold
+    out.attrs["rpss_factor"] = rpss_factor
+    out.attrs["rpss"] = rpss
+    return out.sort_values(["Run Stability", "PI"], ascending=[False, False]).reset_index(drop=True)
+
+
 # ======================= Advanced Models =======================
 if _view_is("Advanced Models"):
+    st.markdown("## 🧪 Run Stability (Experimental)")
+    st.caption(
+        "Estimates how cleanly each horse produced this one run relative to the race shape. "
+        "Sustained acceleration is not penalised; repeated Build–Weaken reversals are. "
+        "Use alongside PI while the model is being validated."
+    )
+
+    stability_view = compute_run_stability(metrics, int(split_step), RPSS_INFO)
+    if stability_view.empty:
+        st.info("Run Stability needs at least five usable sectional blocks and could not be calculated for this race.")
+    else:
+        display_cols = [
+            "Horse", "Finish", "PI", "Run Stability", "Effort Pattern",
+            "Gear Changes", "Meaningful Efforts", "Flag"
+        ]
+        st.dataframe(stability_view[display_cols], use_container_width=True, hide_index=True)
+        _thr = stability_view.attrs.get("threshold", np.nan)
+        _rf = stability_view.attrs.get("rpss_factor", 1.0)
+        _rp = stability_view.attrs.get("rpss", np.nan)
+        _rp_txt = f"{float(_rp):.2f}" if np.isfinite(_rp) else "unavailable"
+        st.caption(
+            f"Meaningful-change threshold: {_thr:.2f} km/h • RPSS: {_rp_txt} • "
+            f"context factor: {_rf:.2f}. The opening block is excluded."
+        )
+        with st.expander("How to read Run Stability"):
+            st.markdown(
+                """
+- **Build:** the horse improved relative to the field by a meaningful amount.
+- **Hold:** movement was inside the race-adaptive noise threshold.
+- **Weaken:** the horse lost meaningful momentum relative to the field.
+- **Gear Changes:** direction reversals after neutral Hold sections are removed.
+- **High-PI Risk:** PI is in the top third of the field but Run Stability is below 5.5.
+
+Run Stability does not alter PI and is intentionally confined to Advanced Models while it is tested.
+                """
+            )
+
+    st.divider()
     # ======================= Hidden Horses =======================
     st.markdown("## Hidden Horses v2 (Shape-aware)")
 
