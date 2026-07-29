@@ -2614,6 +2614,142 @@ if _view_is("Pressure Retention"):
                 """
             )
 
+
+# ======================= Shared Race Test Profile =======================
+def compute_race_test_profile(metrics_df: pd.DataFrame, rpss_info=None, grind_col: str = "Grind") -> dict:
+    """Interpret what the fitted Race Plane tested without changing any ratings.
+
+    The profile uses the existing regression relationship:
+        Grind = intercept + b(tsSPI) + c(Accel)
+    Positive coefficient shares describe positive reward only. Negative
+    coefficients are retained as inverse relationships rather than being turned
+    into misleading positive percentages.
+    """
+    out = {
+        "valid": False,
+        "label": "Inconclusive race test",
+        "mode": "Inconclusive",
+        "confidence": "Low",
+        "summary": "The race did not produce a sufficiently stable relationship to identify one clear performance test.",
+        "r2": np.nan,
+        "intercept": np.nan,
+        "travel_coef": np.nan,
+        "accel_coef": np.nan,
+        "travel_reward_share": np.nan,
+        "accel_reward_share": np.nan,
+        "rpss": np.nan,
+        "tempo": "Unknown",
+        "runners": 0,
+        "rank": 0,
+    }
+    if metrics_df is None or metrics_df.empty:
+        return out
+    if grind_col not in metrics_df.columns:
+        grind_col = "Grind" if "Grind" in metrics_df.columns else grind_col
+    required = ["tsSPI", "Accel", grind_col]
+    if any(c not in metrics_df.columns for c in required):
+        return out
+
+    d = metrics_df[required].copy()
+    for c in required:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna()
+    out["runners"] = int(len(d))
+    if len(d) < 4:
+        out["summary"] = "Fewer than four complete runners were available, so the Race Plane test is not considered reliable."
+        return out
+
+    x = (d["tsSPI"] - 100.0).to_numpy(dtype=float)
+    y = (d["Accel"] - 100.0).to_numpy(dtype=float)
+    z = (d[grind_col] - 100.0).to_numpy(dtype=float)
+    X = np.column_stack([np.ones(len(d)), x, y])
+    coef, _, rank, _ = np.linalg.lstsq(X, z, rcond=None)
+    intercept, b_tsspi, c_accel = [float(v) for v in coef]
+    expected = X @ coef
+    ss_res = float(np.nansum((z - expected) ** 2))
+    ss_tot = float(np.nansum((z - float(np.nanmean(z))) ** 2))
+    r2 = np.nan if ss_tot <= 1e-12 else 1.0 - ss_res / ss_tot
+
+    rpss = np.nan
+    if isinstance(rpss_info, dict):
+        rpss = pd.to_numeric(rpss_info.get("rpss"), errors="coerce")
+    if np.isfinite(rpss):
+        tempo = "Slow" if float(rpss) < 94.0 else "Even" if float(rpss) < 98.0 else "Fast"
+    else:
+        tempo = "Unknown"
+
+    pos_travel = max(b_tsspi, 0.0)
+    pos_accel = max(c_accel, 0.0)
+    positive_total = pos_travel + pos_accel
+    if positive_total > 1e-12:
+        travel_share = pos_travel / positive_total
+        accel_share = pos_accel / positive_total
+    else:
+        travel_share = np.nan
+        accel_share = np.nan
+
+    if not np.isfinite(r2) or r2 < 0.30 or rank < 3 or positive_total <= 1e-12:
+        mode = "Inconclusive"
+    elif accel_share >= 0.65:
+        mode = "Acceleration"
+    elif travel_share >= 0.65:
+        mode = "Sustained Pressure"
+    else:
+        mode = "Balanced"
+
+    if not np.isfinite(r2) or r2 < 0.30 or rank < 3:
+        confidence = "Low"
+    elif r2 < 0.50:
+        confidence = "Tentative"
+    elif r2 < 0.70:
+        confidence = "Meaningful"
+    else:
+        confidence = "Strong"
+
+    if mode == "Inconclusive":
+        label = "Inconclusive race test"
+        summary = (
+            "The fitted plane did not explain enough of the field to identify one dependable race requirement. "
+            "Horse-level residuals can still be useful, but the slope should not drive a strong race-shape conclusion."
+        )
+    elif mode == "Acceleration":
+        label = "Tactical sprint test" if tempo == "Slow" else "Acceleration-led test"
+        summary = (
+            f"This {tempo.lower() if tempo != 'Unknown' else 'race'} contest linked finishing strength more closely to acceleration than sustained travelling speed. "
+            "A decisive change of speed was the clearest positive requirement produced by the field."
+        )
+    elif mode == "Sustained Pressure":
+        label = "Sustained-pressure test"
+        summary = (
+            f"This {tempo.lower() if tempo != 'Unknown' else 'race'} contest linked finishing strength most strongly to sustained travelling speed. "
+            "Horses able to carry pressure before the finish were positively rewarded."
+        )
+    else:
+        label = "Balanced all-round test"
+        summary = (
+            f"This {tempo.lower() if tempo != 'Unknown' else 'race'} contest required a combination of sustained travelling speed and acceleration. "
+            "No single earlier phase dominated the positive relationship with finishing strength."
+        )
+
+    out.update({
+        "valid": True,
+        "label": label,
+        "mode": mode,
+        "confidence": confidence,
+        "summary": summary,
+        "r2": r2,
+        "intercept": intercept,
+        "travel_coef": b_tsspi,
+        "accel_coef": c_accel,
+        "travel_reward_share": travel_share,
+        "accel_reward_share": accel_share,
+        "rpss": rpss,
+        "tempo": tempo,
+        "runners": int(len(d)),
+        "rank": int(rank),
+    })
+    return out
+
 # ======================= Race Plane Analysis — Experimental =======================
 if _view_is("Race Plane Analysis", "Class Plane Analysis"):
     st.markdown("## Race Plane Analysis")
@@ -2716,38 +2852,12 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             plane_df["Expected_Grind"] = plane_df["Expected_Grind"].round(2)
             plane_df["Sustain_Residual"] = plane_df["Sustain_Residual"].round(2)
 
-            # --- Race DNA: relative contribution of each race-plane input ---
-            denom = abs(b_tsspi) + abs(c_accel)
-            if denom > 1e-12:
-                travel_share = abs(b_tsspi) / denom
-                accel_share = abs(c_accel) / denom
-            else:
-                travel_share = np.nan
-                accel_share = np.nan
-
+            # --- Race Test Profile: positive reward only; negative coefficients remain inverse relationships. ---
+            race_test_profile = compute_race_test_profile(metrics, RPSS_INFO, plane_grind_col)
+            travel_share = race_test_profile.get("travel_reward_share", np.nan)
+            accel_share = race_test_profile.get("accel_reward_share", np.nan)
             residual_std = float(np.nanstd(plane_df["Sustain_Residual"].to_numpy(dtype=float), ddof=1)) if len(plane_df) > 1 else np.nan
             residual_range = float(np.nanmax(plane_df["Sustain_Residual"]) - np.nanmin(plane_df["Sustain_Residual"])) if len(plane_df) else np.nan
-
-            def _influence_label(coef, name):
-                sign = "positive" if coef > 0 else "negative" if coef < 0 else "neutral"
-                return f"{name} {sign}"
-
-            def _race_identity(r2_val, travel_sh, accel_sh, b_coef, c_coef):
-                if not np.isfinite(r2_val):
-                    return "Unclear race plane"
-                if r2_val < 0.30:
-                    return "Low-explainability / hidden-quality race"
-                if np.isfinite(accel_sh) and accel_sh >= 0.70 and c_coef > 0:
-                    return "Acceleration-dominated race"
-                if np.isfinite(travel_sh) and travel_sh >= 0.70 and b_coef > 0:
-                    return "Travel-dominated race"
-                if b_coef > 0 and c_coef > 0:
-                    return "Balanced travel + acceleration race"
-                if c_coef > 0 and b_coef <= 0:
-                    return "Acceleration-led / travel not rewarded"
-                return "Mixed race plane"
-
-            race_identity = _race_identity(r2, travel_share, accel_share, b_tsspi, c_accel)
 
             st.markdown("### Race Plane Formula")
             st.code(
@@ -2759,18 +2869,24 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                 "Sustain Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
             )
 
-            st.markdown("### Race DNA")
-            dna_cols = st.columns(4)
-            dna_cols[0].metric("Travel influence", "-" if not np.isfinite(travel_share) else f"{travel_share*100:.0f}%", f"coef {b_tsspi:+.2f}")
-            dna_cols[1].metric("Acceleration influence", "-" if not np.isfinite(accel_share) else f"{accel_share*100:.0f}%", f"coef {c_accel:+.2f}")
-            dna_cols[2].metric("Explainability", "-" if not np.isfinite(r2) else f"{r2*100:.0f}%", "R²")
-            dna_cols[3].metric("Residual spread", "-" if not np.isfinite(residual_std) else f"{residual_std:.2f}", "std dev")
+            st.markdown("### Race Test Profile")
+            profile_cols = st.columns(4)
+            profile_cols[0].metric("Travel reward", "-" if not np.isfinite(travel_share) else f"{travel_share*100:.0f}%", f"coef {b_tsspi:+.2f}")
+            profile_cols[1].metric("Acceleration reward", "-" if not np.isfinite(accel_share) else f"{accel_share*100:.0f}%", f"coef {c_accel:+.2f}")
+            profile_cols[2].metric("Explainability", "-" if not np.isfinite(r2) else f"{r2*100:.0f}%", race_test_profile.get("confidence", "Low"))
+            profile_cols[3].metric("Residual spread", "-" if not np.isfinite(residual_std) else f"{residual_std:.2f}", "std dev")
 
             st.info(
-                f"**Race identity:** {race_identity}. "
-                f"Travel coefficient is {b_tsspi:+.3f}; Accel coefficient is {c_accel:+.3f}. "
-                "The percentages use absolute coefficient size, while the sign tells whether that influence was positive or negative."
+                f"**{race_test_profile.get('label', 'Inconclusive race test')} — {race_test_profile.get('confidence', 'Low')} confidence.**  "
+                f"{race_test_profile.get('summary', '')}"
             )
+            inverse_notes = []
+            if b_tsspi < 0:
+                inverse_notes.append(f"tsSPI had an inverse relationship with Grind ({b_tsspi:+.3f})")
+            if c_accel < 0:
+                inverse_notes.append(f"Accel had an inverse relationship with Grind ({c_accel:+.3f})")
+            if inverse_notes:
+                st.caption("Inverse relationship detected: " + "; ".join(inverse_notes) + ". Negative coefficients are not counted as positive reward shares.")
             if rank < 3:
                 st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
 
@@ -3035,7 +3151,8 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
 - **Positive Sustain Residual:** the horse sustained better than expected.
 - **Negative Sustain Residual:** the horse did less late than its travel/acceleration profile suggested.
 
-- **Race DNA:** relative contribution of tsSPI and Accel to the formula, plus R² explainability and residual spread.
+- **Race Test Profile:** what the fitted plane positively rewarded. Reward shares use only positive coefficients; negative coefficients are shown separately as inverse relationships.
+- **Confidence:** based on the plane’s R² and regression stability. A low-confidence profile should not drive a strong conclusion.
 
 This is experimental. In small fields or unusual race shapes, use it as a guide rather than a final rating.
                     """
@@ -3043,11 +3160,12 @@ This is experimental. In small fields or unusual race shapes, use it as a guide 
 
 
 # ======================= Race Shape Verdict =======================
-def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.DataFrame:
+def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None, race_test_profile=None) -> pd.DataFrame:
     """Create RPSS-aware, time-only narrative verdicts for each runner.
 
-    The module interprets the existing Race Edge phase indices. It does not alter
-    PI and deliberately ignores position, draw and positional gains.
+    The module interprets the existing Race Edge phase indices within the shared
+    Race Test Profile. It does not alter PI and deliberately ignores position,
+    draw and positional gains.
     """
     if metrics_df is None or metrics_df.empty or "Horse" not in metrics_df.columns:
         return pd.DataFrame()
@@ -3092,6 +3210,12 @@ def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.D
             context = "Fast"
     else:
         context = "Unknown"
+
+    if not isinstance(race_test_profile, dict):
+        race_test_profile = compute_race_test_profile(df, rpss_info, "Grind")
+    test_mode = str(race_test_profile.get("mode", "Inconclusive"))
+    test_label = str(race_test_profile.get("label", "Inconclusive race test"))
+    test_confidence = str(race_test_profile.get("confidence", "Low"))
 
     rows = []
     for i, r in df.iterrows():
@@ -3245,6 +3369,45 @@ def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.D
                 action = "No major race-shape upgrade or downgrade."
                 confidence = "Moderate"
 
+        # Interpret the horse relative to what the Race Plane says the race tested.
+        if test_mode == "Acceleration":
+            if cruise_led and controlled_finish:
+                verdict = (
+                    f"The Race Plane identifies this as an {test_label.lower()}, which placed greater positive emphasis on acceleration than sustained travelling speed. "
+                    "This horse's stronger evidence came through travelling strength, so the race did not fully test its preferred profile. " + verdict
+                )
+                action = "Upgrade in a truer sustained-pressure race; " + action[:1].lower() + action[1:]
+            elif burst_led:
+                verdict = (
+                    f"The Race Plane identifies this as an {test_label.lower()}, and this horse's acceleration-led profile matched that requirement. " + verdict
+                )
+                action = "The setup suited; seek confirmation when the test changes. " + action
+        elif test_mode == "Sustained Pressure":
+            if cruise_led or (ts >= 0.35 and controlled_finish):
+                verdict = (
+                    f"The Race Plane identifies this as a {test_label.lower()}, and this horse's travelling strength was aligned with the main positive requirement. " + verdict
+                )
+                action = "Treat the performance as supported by the race test. " + action
+            elif burst_led:
+                verdict = (
+                    f"The Race Plane identifies this as a {test_label.lower()}, while this horse relied more heavily on acceleration. "
+                    "Its strongest attribute was not the principal quality rewarded by the race. " + verdict
+                )
+                action = "Consider a more tactical setup; " + action[:1].lower() + action[1:]
+        elif test_mode == "Balanced":
+            if balanced or complete:
+                verdict = (
+                    f"The Race Plane identifies this as a {test_label.lower()}, and this horse produced an appropriately balanced sectional profile. " + verdict
+                )
+            elif burst_led or cruise_led:
+                verdict = (
+                    f"The Race Plane identifies this as a {test_label.lower()}, but this horse's performance was concentrated more heavily in one phase. " + verdict
+                )
+        else:
+            verdict = (
+                f"The Race Test Profile is inconclusive ({test_confidence.lower()} confidence), so the horse-level phase evidence carries more weight than the plane slope. " + verdict
+            )
+
         # Race files used by Race Edge normally store the result as Finish_Pos,
         # while some older imports used Finish Position/Finish. Resolve all known
         # formats so the verdict table never loses finishing-position context.
@@ -3278,26 +3441,41 @@ def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.D
     out.attrs["rpss"] = rpss
     out.attrs["rpss_label"] = rpss_label
     out.attrs["context"] = context
+    out.attrs["race_test_profile"] = race_test_profile
     return out.sort_values(["PI", "Finish"], ascending=[False, True], na_position="last").reset_index(drop=True)
 
 
 # ======================= Advanced Models =======================
 if _view_is("Advanced Models"):
-    st.markdown("## 🧠 Race Shape Verdict")
+    st.markdown("## 🧠 Race Intelligence")
     st.caption(
-        "An RPSS-aware interpretation of what each horse's sectional profile revealed beyond the finishing position. "
-        "The verdict uses time-based phase evidence only and does not alter PI."
+        "Combines RPSS, the Race Plane slope and horse-level phase evidence to explain what the race tested, "
+        "which horses were suited by that test and what the performance may mean next time. No rating calculation is altered."
     )
 
-    verdict_view = compute_race_shape_verdict(metrics, RPSS_INFO)
+    intelligence_profile = compute_race_test_profile(metrics, RPSS_INFO, "Grind")
+    verdict_view = compute_race_shape_verdict(metrics, RPSS_INFO, intelligence_profile)
     if verdict_view.empty:
-        st.info("Race Shape Verdict needs usable tsSPI, Accel and Grind metrics and could not be generated for this race.")
+        st.info("Race Intelligence needs usable tsSPI, Accel and Grind metrics and could not be generated for this race.")
     else:
         _rp = verdict_view.attrs.get("rpss", np.nan)
         _ctx = verdict_view.attrs.get("context", "Unknown")
         _rp_txt = f"{float(_rp):.2f}" if np.isfinite(_rp) else "unavailable"
-        st.info(f"Race context: **{_ctx}** • RPSS: **{_rp_txt}**")
+        st.markdown("### Race Test Profile")
+        test_cols = st.columns(4)
+        _tr = intelligence_profile.get("travel_reward_share", np.nan)
+        _ar = intelligence_profile.get("accel_reward_share", np.nan)
+        _r2 = intelligence_profile.get("r2", np.nan)
+        test_cols[0].metric("Race test", intelligence_profile.get("label", "Inconclusive"))
+        test_cols[1].metric("Travel reward", "-" if not np.isfinite(_tr) else f"{_tr*100:.0f}%")
+        test_cols[2].metric("Acceleration reward", "-" if not np.isfinite(_ar) else f"{_ar*100:.0f}%")
+        test_cols[3].metric("Confidence", intelligence_profile.get("confidence", "Low"), "-" if not np.isfinite(_r2) else f"R² {_r2:.2f}")
+        st.info(
+            f"**Race context: {_ctx} • RPSS: {_rp_txt}.**  "
+            f"{intelligence_profile.get('summary', '')}"
+        )
 
+        st.markdown("### Horse Verdicts")
         horse_options = verdict_view["Horse"].astype(str).tolist()
         default_horses = horse_options[:min(6, len(horse_options))]
         selected_horses = st.multiselect(
@@ -3320,7 +3498,7 @@ if _view_is("Advanced Models"):
             st.write(vr["Narrative"])
             st.markdown(f"**Race Edge action:** {vr['Action']}")
 
-        st.markdown("### All-runner verdict table")
+        st.markdown("### All-runner Race Intelligence table")
         table_cols = ["Horse", "Finish", "PI", "Verdict", "Confidence", "Action"]
         verdict_table = verdict_view[table_cols].copy()
         verdict_table = verdict_table.rename(columns={"Finish": "Pos"})
@@ -3334,13 +3512,13 @@ if _view_is("Advanced Models"):
             },
         )
 
-        with st.expander("How Race Shape Verdict works"):
+        with st.expander("How Race Intelligence works"):
             st.markdown(
                 """
-- **Slow RPSS (<94):** looks for hidden true-run/further improvers, tactical specialists and performances flattered by a short sprint.
-- **Even RPSS (94–98):** looks for balanced, versatile profiles and mild distance or tempo projections.
-- **Fast RPSS (≥98):** reinforces horses proven under sustained pressure and flags profiles exposed by a genuine tempo.
-- Evidence comes from **tsSPI, Accel, Grind/Corrected Grind and PI quality**.
+- **RPSS** establishes whether the race was slow, even or fast.
+- **Race Test Profile** uses the fitted plane coefficients and R² to identify an acceleration-led, sustained-pressure, balanced or inconclusive test.
+- Positive reward percentages use only positive coefficients. Negative coefficients remain visible as inverse relationships and are never presented as positive reward.
+- Each horse is then interpreted relative to that race test using **tsSPI, Accel, Grind/Corrected Grind and PI quality**.
 - The module deliberately ignores position, positional gains and draw.
 - The narrative is an interpretation of this single performance, not a permanent statement about the horse.
                 """
