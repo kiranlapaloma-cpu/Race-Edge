@@ -3185,9 +3185,20 @@ def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.D
                 action = "No major race-shape upgrade or downgrade."
                 confidence = "Moderate"
 
+        # Race files used by Race Edge normally store the result as Finish_Pos,
+        # while some older imports used Finish Position/Finish. Resolve all known
+        # formats so the verdict table never loses finishing-position context.
+        finish_value = np.nan
+        for finish_col in ("Finish_Pos", "Finish Position", "Finish", "Position", "Pos"):
+            if finish_col in df.columns:
+                candidate = pd.to_numeric(r.get(finish_col), errors="coerce")
+                if pd.notna(candidate):
+                    finish_value = candidate
+                    break
+
         rows.append({
             "Horse": horse,
-            "Finish": pd.to_numeric(r.get("Finish Position"), errors="coerce"),
+            "Finish": finish_value,
             "PI": raw_pi,
             "Verdict": label,
             "Confidence": confidence,
@@ -3251,7 +3262,17 @@ if _view_is("Advanced Models"):
 
         st.markdown("### All-runner verdict table")
         table_cols = ["Horse", "Finish", "PI", "Verdict", "Confidence", "Action"]
-        st.dataframe(verdict_view[table_cols], use_container_width=True, hide_index=True)
+        verdict_table = verdict_view[table_cols].copy()
+        verdict_table = verdict_table.rename(columns={"Finish": "Pos"})
+        st.dataframe(
+            verdict_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Pos": st.column_config.NumberColumn("Pos", format="%d"),
+                "PI": st.column_config.NumberColumn("PI", format="%.2f"),
+            },
+        )
 
         with st.expander("How Race Shape Verdict works"):
             st.markdown(
