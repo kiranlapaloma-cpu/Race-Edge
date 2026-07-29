@@ -3159,11 +3159,13 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                             cmin=-sr_abs,
                             cmax=sr_abs,
                             colorbar=dict(
-                                title="Sustain<br>Residual",
+                                title=dict(
+                                    text="Sustain<br>Residual",
+                                    font=dict(color="#e9edf3"),
+                                ),
                                 thickness=14,
                                 len=0.65,
                                 tickfont=dict(color="#c9d2de"),
-                                titlefont=dict(color="#e9edf3"),
                                 outlinecolor="#526174",
                             ),
                             line=dict(color="#f4f6fa", width=1.0),
