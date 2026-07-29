@@ -3011,133 +3011,302 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             )
 
             if show_3d_plane:
-                st.markdown("### 3D Performance Plane")
+                st.markdown("### Interactive 3D Performance Plane")
                 try:
-                    from mpl_toolkits.mplot3d import Axes3D, proj3d  # noqa: F401
+                    import plotly.graph_objects as go
 
-                    fig = plt.figure(figsize=(10.5, 7.8), facecolor="#0b1220")
-                    ax = fig.add_subplot(111, projection="3d")
-                    ax.set_facecolor("#0b1220")
+                    view_col, horse_col, label_col = st.columns([1.15, 1.5, 1.0])
+                    with view_col:
+                        plane_view = st.selectbox(
+                            "Plane view",
+                            ["Performance View", "Sustain View", "Race Test View", "Top View"],
+                            index=0,
+                            help="Preset camera angles. You can still rotate the chart manually.",
+                        )
+                    with horse_col:
+                        horse_choices = ["None"] + plane_df.sort_values("PPS", ascending=False)["Horse"].astype(str).tolist()
+                        highlighted_horse = st.selectbox(
+                            "Highlight horse",
+                            horse_choices,
+                            index=0,
+                            help="Focus on one horse while keeping the full field visible.",
+                        )
+                    with label_col:
+                        label_mode = st.selectbox(
+                            "Labels",
+                            ["Key horses", "All horses", "Hover only"],
+                            index=0,
+                        )
 
-                    # The plane stays analytical; PPS controls marker size and label priority.
+                    # Visual encodings only. The underlying Race Plane calculations are unchanged.
                     cr_vals = plane_df["Sustain_Residual"].to_numpy(dtype=float)
-                    vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
-                    vmax = max(vmax, 1.0)
                     pps_vals = plane_df["PPS"].to_numpy(dtype=float)
-                    marker_sizes = 55.0 + 95.0 * np.clip((pps_vals - 3.0) / 5.0, 0.0, 1.0)
+                    horse_names = plane_df["Horse"].astype(str).to_numpy()
+                    expected_plot_z = expected_z
+                    actual_plot_z = z
 
-                    sc = ax.scatter(
-                        x, y, z,
-                        c=cr_vals,
-                        cmap="coolwarm",
-                        vmin=-vmax,
-                        vmax=vmax,
-                        s=marker_sizes,
-                        edgecolor="white",
-                        linewidth=0.9,
-                        depthshade=True,
-                        alpha=0.96,
-                    )
+                    sr_abs = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
+                    sr_abs = max(sr_abs, 1.0)
+                    marker_sizes = 9.0 + 13.0 * np.clip((pps_vals - 3.0) / 5.0, 0.0, 1.0)
 
-                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 18)
-                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 18)
+                    # Key labels: best PPS, best positive sustain, weakest sustain, winner, and selected horse.
+                    key_names = set()
+                    if len(plane_df):
+                        key_names.add(str(plane_df.loc[plane_df["PPS"].idxmax(), "Horse"]))
+                        key_names.add(str(plane_df.loc[plane_df["Sustain_Residual"].idxmax(), "Horse"]))
+                        key_names.add(str(plane_df.loc[plane_df["Sustain_Residual"].idxmin(), "Horse"]))
+                    if "Finish_Pos" in plane_df.columns:
+                        winners = plane_df[pd.to_numeric(plane_df["Finish_Pos"], errors="coerce") == 1]
+                        key_names.update(winners["Horse"].astype(str).tolist())
+                    if highlighted_horse != "None":
+                        key_names.add(highlighted_horse)
+
+                    if label_mode == "All horses":
+                        text_labels = horse_names.tolist()
+                    elif label_mode == "Hover only":
+                        text_labels = [""] * len(plane_df)
+                    else:
+                        text_labels = [name if name in key_names else "" for name in horse_names]
+
+                    opacity_vals = np.ones(len(plane_df), dtype=float)
+                    line_widths = np.full(len(plane_df), 1.1, dtype=float)
+                    if highlighted_horse != "None":
+                        opacity_vals[:] = 0.34
+                        sel_mask = horse_names == highlighted_horse
+                        opacity_vals[sel_mask] = 1.0
+                        marker_sizes[sel_mask] = marker_sizes[sel_mask] * 1.45
+                        line_widths[sel_mask] = 3.0
+
+                    fig3d = go.Figure()
+
+                    # Neutral fitted plane.
+                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 22)
+                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 22)
                     Xg, Yg = np.meshgrid(x_grid, y_grid)
                     Zg = intercept + b_tsspi * Xg + c_accel * Yg
-                    ax.plot_surface(
-                        Xg, Yg, Zg,
-                        color="#5f7896",
-                        alpha=0.20,
-                        linewidth=0,
-                        antialiased=True,
-                        shade=True,
+                    fig3d.add_trace(go.Surface(
+                        x=Xg,
+                        y=Yg,
+                        z=Zg,
+                        colorscale=[[0, "#41546d"], [1, "#7387a0"]],
+                        showscale=False,
+                        opacity=0.23,
+                        hoverinfo="skip",
+                        name="Expected Grind plane",
+                    ))
+
+                    # Residual lines and expected-position markers.
+                    for i, row in plane_df.iterrows():
+                        positive = float(row["Sustain_Residual"]) >= 0
+                        line_colour = "#d5b45d" if positive else "#a95f5f"
+                        line_alpha = 0.92 if highlighted_horse in ("None", str(row["Horse"])) else 0.22
+                        fig3d.add_trace(go.Scatter3d(
+                            x=[x[i], x[i]],
+                            y=[y[i], y[i]],
+                            z=[expected_plot_z[i], actual_plot_z[i]],
+                            mode="lines",
+                            line=dict(color=line_colour, width=float(line_widths[i]) + 1.0),
+                            opacity=line_alpha,
+                            hoverinfo="skip",
+                            showlegend=False,
+                        ))
+
+                    fig3d.add_trace(go.Scatter3d(
+                        x=x,
+                        y=y,
+                        z=expected_plot_z,
+                        mode="markers",
+                        marker=dict(size=4, color="#8392a6", opacity=0.48, symbol="circle"),
+                        customdata=np.column_stack([horse_names, plane_df["Expected_Grind"].to_numpy(dtype=float)]),
+                        hovertemplate="<b>%{customdata[0]}</b><br>Expected Grind: %{customdata[1]:.2f}<extra></extra>",
+                        name="Expected Grind",
+                    ))
+
+                    finish_vals = plane_df["Finish_Pos"].fillna("").astype(str).to_numpy() if "Finish_Pos" in plane_df.columns else np.array([""] * len(plane_df))
+                    pi_vals = plane_df["PI"].to_numpy(dtype=float) if "PI" in plane_df.columns else np.full(len(plane_df), np.nan)
+                    architecture_vals = plane_df["Performance_Architecture"].astype(str).to_numpy()
+                    customdata = list(zip(
+                        horse_names.tolist(),
+                        finish_vals.tolist(),
+                        pi_vals.tolist(),
+                        pps_vals.tolist(),
+                        plane_df["tsSPI"].to_numpy(dtype=float).tolist(),
+                        plane_df["Accel"].to_numpy(dtype=float).tolist(),
+                        plane_df[plane_grind_col].to_numpy(dtype=float).tolist(),
+                        plane_df["Expected_Grind"].to_numpy(dtype=float).tolist(),
+                        cr_vals.tolist(),
+                        architecture_vals.tolist(),
+                    ))
+
+                    fig3d.add_trace(go.Scatter3d(
+                        x=x,
+                        y=y,
+                        z=actual_plot_z,
+                        mode="markers+text",
+                        text=text_labels,
+                        textposition="top center",
+                        textfont=dict(color="#f4f6fa", size=11),
+                        marker=dict(
+                            size=marker_sizes,
+                            color=cr_vals,
+                            colorscale=[
+                                [0.00, "#8e4e4e"],
+                                [0.42, "#c4cbd4"],
+                                [0.50, "#f2f4f7"],
+                                [0.58, "#d8c58a"],
+                                [1.00, "#c49a32"],
+                            ],
+                            cmin=-sr_abs,
+                            cmax=sr_abs,
+                            colorbar=dict(
+                                title="Sustain<br>Residual",
+                                thickness=14,
+                                len=0.65,
+                                tickfont=dict(color="#c9d2de"),
+                                titlefont=dict(color="#e9edf3"),
+                                outlinecolor="#526174",
+                            ),
+                            line=dict(color="#f4f6fa", width=1.0),
+                            opacity=opacity_vals,
+                        ),
+                        customdata=customdata,
+                        hovertemplate=(
+                            "<b>%{customdata[0]}</b><br>"
+                            "Finish: %{customdata[1]}<br>"
+                            "PI: %{customdata[2]:.2f}<br>"
+                            "PPS: %{customdata[3]:.2f}<br><br>"
+                            "tsSPI: %{customdata[4]:.2f}<br>"
+                            "Accel: %{customdata[5]:.2f}<br>"
+                            "Grind: %{customdata[6]:.2f}<br>"
+                            "Expected Grind: %{customdata[7]:.2f}<br>"
+                            "Sustain Residual: %{customdata[8]:+.2f}<br>"
+                            "Architecture: %{customdata[9]}"
+                            "<extra></extra>"
+                        ),
+                        name="Actual performance",
+                    ))
+
+                    cameras = {
+                        "Performance View": dict(eye=dict(x=1.55, y=-1.65, z=1.15)),
+                        "Sustain View": dict(eye=dict(x=1.10, y=-1.05, z=1.85)),
+                        "Race Test View": dict(
+                            eye=dict(
+                                x=1.85 if abs(b_tsspi) >= abs(c_accel) else 0.85,
+                                y=-0.85 if abs(b_tsspi) >= abs(c_accel) else -1.85,
+                                z=1.10,
+                            )
+                        ),
+                        "Top View": dict(eye=dict(x=0.01, y=0.01, z=2.75)),
+                    }
+
+                    fig3d.update_layout(
+                        height=760,
+                        margin=dict(l=0, r=0, t=42, b=0),
+                        paper_bgcolor="#0b1220",
+                        plot_bgcolor="#0b1220",
+                        font=dict(color="#e8edf4"),
+                        title=dict(
+                            text=f"{race_test_profile.get('label', 'Race Plane')} · R² {r2:.2f}",
+                            x=0.02,
+                            font=dict(size=18, color="#f6f7f9"),
+                        ),
+                        legend=dict(
+                            orientation="h",
+                            x=0.0,
+                            y=1.02,
+                            bgcolor="rgba(0,0,0,0)",
+                            font=dict(color="#d6dee8"),
+                        ),
+                        scene=dict(
+                            xaxis=dict(
+                                title="tsSPI — Travelling Strength" + (" (centred)" if centre_values else ""),
+                                backgroundcolor="#0b1220",
+                                gridcolor="rgba(160,175,195,0.16)",
+                                zerolinecolor="rgba(160,175,195,0.20)",
+                                color="#cfd7e2",
+                            ),
+                            yaxis=dict(
+                                title="Accel — Change of Speed" + (" (centred)" if centre_values else ""),
+                                backgroundcolor="#0b1220",
+                                gridcolor="rgba(160,175,195,0.16)",
+                                zerolinecolor="rgba(160,175,195,0.20)",
+                                color="#cfd7e2",
+                            ),
+                            zaxis=dict(
+                                title="Grind — Finishing Sustain" + (" (centred)" if centre_values else ""),
+                                backgroundcolor="#0b1220",
+                                gridcolor="rgba(160,175,195,0.16)",
+                                zerolinecolor="rgba(160,175,195,0.20)",
+                                color="#cfd7e2",
+                            ),
+                            camera=cameras[plane_view],
+                            aspectmode="auto",
+                        ),
                     )
-
-                    # Premium dark-axis treatment.
-                    ax.set_xlabel("Sustained Speed" if centre_values else x_label, color="#e7eef7", labelpad=10)
-                    ax.set_ylabel("Acceleration" if centre_values else y_label, color="#e7eef7", labelpad=10)
-                    ax.set_zlabel("Finishing Strength" if centre_values else z_label, color="#e7eef7", labelpad=10)
-                    ax.set_title("Performance Plane", color="white", fontsize=16, pad=18, weight="bold")
-                    ax.view_init(elev=22, azim=-58)
-                    ax.tick_params(colors="#b8c5d4", labelsize=8)
-                    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-                        axis.pane.set_facecolor((0.05, 0.08, 0.13, 0.35))
-                        axis.pane.set_edgecolor((0.45, 0.55, 0.68, 0.28))
-                        axis._axinfo["grid"]["color"] = (0.55, 0.62, 0.72, 0.16)
-
-                    # Place labels directly in the 3D coordinate system so each
-                    # horse name remains visibly attached to its marker.
-                    horse_names = plane_df["Horse"].astype(str).tolist()
-
-                    # Small data-space offsets based on the axis spans.
-                    x_span = max(float(np.nanmax(x) - np.nanmin(x)), 1e-6)
-                    y_span = max(float(np.nanmax(y) - np.nanmin(y)), 1e-6)
-                    z_span = max(float(np.nanmax(z) - np.nanmin(z)), 1e-6)
-
-                    dx = 0.018 * x_span
-                    dy = 0.010 * y_span
-                    dz = 0.008 * z_span
-
-                    for xi, yi, zi, horse_name in zip(x, y, z, horse_names):
-                        # Default to the right of the marker; flip left only for
-                        # points near the right edge of the x-range.
-                        x_mid = float(np.nanmin(x) + 0.78 * x_span)
-                        if xi >= x_mid:
-                            label_x = xi - dx
-                            ha = "right"
-                        else:
-                            label_x = xi + dx
-                            ha = "left"
-
-                        label_y = yi + dy
-                        label_z = zi + dz
-
-                        txt = ax.text(
-                            label_x,
-                            label_y,
-                            label_z,
-                            horse_name,
-                            fontsize=7.2,
-                            fontweight="semibold",
-                            color="#f2f6fb",
-                            ha=ha,
-                            va="center",
-                            zorder=20,
-                            clip_on=False,
-                        )
-                        txt.set_path_effects([
-                            pe.Stroke(linewidth=2.2, foreground="#07101d", alpha=0.98),
-                            pe.Normal(),
-                        ])
-
-                    # PPS is communicated through marker size. Give the top three
-                    # positions a restrained outer ring rather than longer labels.
-                    top_three_idx = plane_df.nsmallest(3, "PPS_Rank").index.to_numpy(dtype=int)
-                    ax.scatter(
-                        x[top_three_idx],
-                        y[top_three_idx],
-                        z[top_three_idx],
-                        s=marker_sizes[top_three_idx] + 75.0,
-                        facecolors="none",
-                        edgecolors="#f4d77a",
-                        linewidths=1.25,
-                        depthshade=False,
-                        alpha=0.95,
-                    )
-
-                    cbar = fig.colorbar(sc, ax=ax, shrink=0.62, pad=0.09)
-                    cbar.set_label("Sustain Residual", color="#e7eef7")
-                    cbar.ax.tick_params(colors="#b8c5d4")
-                    for spine in cbar.ax.spines.values():
-                        spine.set_edgecolor("#6f8197")
-
-                    st.pyplot(fig, use_container_width=True)
-                    plt.close(fig)
+                    st.plotly_chart(fig3d, use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
                     st.caption(
-                        "Marker size follows PPS (best overall field-relative performance). "
-                        "Colour shows Sustain Residual separately: positive residual suggests more late sustain than the plane predicted."
+                        "Marker size = PPS · Marker colour = Sustain Residual · Vertical line = Expected Grind to Actual Grind. "
+                        "Gold indicates above-expected sustain; muted red indicates below-expected sustain."
                     )
+
+                    if highlighted_horse != "None":
+                        selected = plane_df[plane_df["Horse"].astype(str) == highlighted_horse].iloc[0]
+                        selected_sr = float(selected["Sustain_Residual"])
+                        selected_direction = "above" if selected_sr > 0 else "below" if selected_sr < 0 else "in line with"
+                        st.info(
+                            f"**{highlighted_horse}:** PPS {float(selected['PPS']):.2f} · "
+                            f"Sustain Residual {selected_sr:+.2f}. The horse finished {selected_direction} the Grind level "
+                            f"predicted from its travelling speed and acceleration. Profile: {selected['Performance_Architecture']}."
+                        )
+
+                    st.markdown("### Performance Architecture Map")
+                    median_pps = float(np.nanmedian(plane_df["PPS"]))
+                    fig2d = go.Figure()
+                    fig2d.add_vline(x=median_pps, line_width=1, line_dash="dash", line_color="rgba(210,220,232,0.38)")
+                    fig2d.add_hline(y=0, line_width=1, line_dash="dash", line_color="rgba(210,220,232,0.38)")
+                    fig2d.add_trace(go.Scatter(
+                        x=plane_df["PPS"],
+                        y=plane_df["Sustain_Residual"],
+                        mode="markers+text",
+                        text=[name if label_mode != "Hover only" and name in key_names else "" for name in horse_names],
+                        textposition="top center",
+                        marker=dict(
+                            size=marker_sizes * 0.9,
+                            color=cr_vals,
+                            colorscale=[
+                                [0.00, "#8e4e4e"], [0.50, "#f2f4f7"], [1.00, "#c49a32"]
+                            ],
+                            cmin=-sr_abs,
+                            cmax=sr_abs,
+                            line=dict(color="#f4f6fa", width=1),
+                            showscale=False,
+                            opacity=opacity_vals,
+                        ),
+                        customdata=list(zip(horse_names.tolist(), architecture_vals.tolist(), finish_vals.tolist(), pi_vals.tolist())),
+                        hovertemplate=(
+                            "<b>%{customdata[0]}</b><br>"
+                            "Finish: %{customdata[2]}<br>PI: %{customdata[3]:.2f}<br>"
+                            "PPS: %{x:.2f}<br>Sustain Residual: %{y:+.2f}<br>"
+                            "%{customdata[1]}<extra></extra>"
+                        ),
+                        showlegend=False,
+                    ))
+                    fig2d.add_annotation(x=0.99, y=0.98, xref="paper", yref="paper", text="Complete / high-level sustain", showarrow=False, font=dict(color="#d8c58a", size=11), xanchor="right")
+                    fig2d.add_annotation(x=0.99, y=0.04, xref="paper", yref="paper", text="Strong but incomplete", showarrow=False, font=dict(color="#b97676", size=11), xanchor="right")
+                    fig2d.add_annotation(x=0.01, y=0.98, xref="paper", yref="paper", text="Hidden sustainer", showarrow=False, font=dict(color="#d8c58a", size=11), xanchor="left")
+                    fig2d.add_annotation(x=0.01, y=0.04, xref="paper", yref="paper", text="Below race structure", showarrow=False, font=dict(color="#b97676", size=11), xanchor="left")
+                    fig2d.update_layout(
+                        height=470,
+                        margin=dict(l=25, r=20, t=25, b=30),
+                        paper_bgcolor="#0b1220",
+                        plot_bgcolor="#0b1220",
+                        font=dict(color="#e8edf4"),
+                        xaxis=dict(title="PPS — Overall Three-Phase Performance", gridcolor="rgba(160,175,195,0.15)", zeroline=False),
+                        yaxis=dict(title="Sustain Residual", gridcolor="rgba(160,175,195,0.15)", zeroline=False),
+                    )
+                    st.plotly_chart(fig2d, use_container_width=True, config={"displaylogo": False})
                 except Exception as e:
-                    st.info(f"3D plane could not be rendered: {e}")
+                    st.info(f"Interactive Race Plane could not be rendered: {e}")
 
             with st.expander("How to read this module"):
                 st.markdown(
