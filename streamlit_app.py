@@ -2982,183 +2982,286 @@ This is experimental. In small fields or unusual race shapes, use it as a guide 
                 )
 
 
-# ======================= Run Stability (Experimental) =======================
-def compute_run_stability(metrics_df: pd.DataFrame, split_step: int, rpss_info=None) -> pd.DataFrame:
-    """
-    One-run, field-relative effort-state model.
+# ======================= Race Shape Verdict =======================
+def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.DataFrame:
+    """Create RPSS-aware, time-only narrative verdicts for each runner.
 
-    It classifies meaningful changes in each horse's residual sectional speed as
-    Build / Hold / Weaken, compresses repeated states, and penalises genuine
-    direction reversals rather than sustained acceleration or a clean fade.
+    The module interprets the existing Race Edge phase indices. It does not alter
+    PI and deliberately ignores position, draw and positional gains.
     """
     if metrics_df is None or metrics_df.empty or "Horse" not in metrics_df.columns:
         return pd.DataFrame()
 
-    step = int(split_step)
-    marker_cols = []
-    for c in metrics_df.columns:
-        m = re.fullmatch(r"(\d+)_Time", str(c))
-        if m:
-            marker_cols.append((int(m.group(1)), c))
-    marker_cols.sort(reverse=True)  # chronological: largest remaining marker first
-    time_cols = [c for _, c in marker_cols]
-    if "Finish_Time" in metrics_df.columns:
-        time_cols.append("Finish_Time")
-
-    # The opening block is dominated by start/positioning noise and is excluded.
-    if len(time_cols) < 5:
+    df = metrics_df.copy()
+    grind_col = "Grind_CG" if "Grind_CG" in df.columns else "Grind"
+    required = ["tsSPI", "Accel", grind_col]
+    if any(c not in df.columns for c in required):
         return pd.DataFrame()
-    analysis_cols = time_cols[1:]
 
-    speed = pd.DataFrame(index=metrics_df.index)
-    for c in analysis_cols:
-        t = pd.to_numeric(metrics_df[c], errors="coerce")
-        speed[c] = np.where(t > 0, 3.6 * step / t, np.nan)
+    for c in required + ["PI", "Grind"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Remove the movement shared by the race at each sectional.
-    field_median = speed.median(axis=0, skipna=True)
-    residual = speed.subtract(field_median, axis=1)
-    changes = residual.diff(axis=1).iloc[:, 1:]
+    def _rz(s: pd.Series) -> pd.Series:
+        x = pd.to_numeric(s, errors="coerce")
+        med = float(np.nanmedian(x)) if np.isfinite(x).any() else 0.0
+        mad = float(np.nanmedian(np.abs(x - med))) if np.isfinite(x).any() else 0.0
+        scale = 1.4826 * mad
+        if not np.isfinite(scale) or scale < 0.20:
+            scale = float(np.nanstd(x, ddof=0))
+        if not np.isfinite(scale) or scale < 0.20:
+            scale = 1.0
+        return ((x - med) / scale).clip(-3.0, 3.0)
 
-    # Race-adaptive noise threshold, with a practical floor for timing noise.
-    vals = changes.to_numpy(dtype=float).ravel()
-    vals = vals[np.isfinite(vals)]
-    robust_noise = mad_std(vals) if vals.size else np.nan
-    threshold = max(0.50, 0.75 * robust_noise) if np.isfinite(robust_noise) else 0.50
-    threshold = float(np.clip(threshold, 0.50, 1.10))
+    z_ts = _rz(df["tsSPI"])
+    z_ac = _rz(df["Accel"])
+    z_gr = _rz(df[grind_col])
+    z_pi = _rz(df["PI"]) if "PI" in df.columns else pd.Series(0.0, index=df.index)
 
-    # RPSS is only a modest contextual modifier because field residuals already
-    # remove most of the common tactical race shape.
     rpss = np.nan
+    rpss_label = "Unknown"
     if isinstance(rpss_info, dict):
         rpss = pd.to_numeric(rpss_info.get("rpss"), errors="coerce")
+        rpss_label = str(rpss_info.get("verdict") or "Unknown")
     if np.isfinite(rpss):
-        rpss_factor = float(np.interp(float(rpss), [88, 94, 98, 102], [0.86, 1.00, 1.06, 1.10]))
+        if float(rpss) < 94.0:
+            context = "Slow"
+        elif float(rpss) < 98.0:
+            context = "Even"
+        else:
+            context = "Fast"
     else:
-        rpss_factor = 1.0
+        context = "Unknown"
 
     rows = []
-    for idx, r in metrics_df.iterrows():
-        ch = pd.to_numeric(changes.loc[idx], errors="coerce").dropna()
-        raw_states = []
-        meaningful = []
-        for v in ch.tolist():
-            if v > threshold:
-                raw_states.append("Build")
-                meaningful.append(float(v))
-            elif v < -threshold:
-                raw_states.append("Weaken")
-                meaningful.append(float(v))
+    for i, r in df.iterrows():
+        horse = str(r.get("Horse", "Unknown"))
+        ts, ac, gr, pi = [float(v) if np.isfinite(v) else 0.0 for v in (z_ts.loc[i], z_ac.loc[i], z_gr.loc[i], z_pi.loc[i])]
+        raw_ts = pd.to_numeric(r.get("tsSPI"), errors="coerce")
+        raw_ac = pd.to_numeric(r.get("Accel"), errors="coerce")
+        raw_gr = pd.to_numeric(r.get(grind_col), errors="coerce")
+        raw_pi = pd.to_numeric(r.get("PI"), errors="coerce")
+
+        balanced = max(ts, ac, gr) - min(ts, ac, gr) <= 0.85
+        complete = ts >= 0.55 and ac >= 0.55 and gr >= 0.55
+        cruise_led = ts >= 0.65 and ts >= ac + 0.45
+        burst_led = ac >= 0.75 and ac >= ts + 0.55
+        controlled_finish = gr > -0.85
+        collapse = gr <= -1.20
+        strong_quality = pi >= 0.20 or max(ts, ac, gr) >= 0.80
+
+        if context == "Slow":
+            if strong_quality and cruise_led and controlled_finish:
+                label = "Hidden Improver"
+                verdict = (
+                    "This slow-run race placed a premium on a sharp late sprint, which did not fully suit this horse's profile. "
+                    "Its strongest evidence came through sustained travelling speed rather than a short burst, while the finish weakened without becoming a complete collapse. "
+                    "A more genuinely run race should allow that cruising strength to play a greater role, and additional distance may also suit."
+                )
+                action = "Follow in a truer-run race or over further."
+                confidence = "High" if ts >= 1.0 and controlled_finish and pi >= 0 else "Moderate"
+            elif burst_led and gr >= -0.35:
+                label = "Tactical Specialist"
+                verdict = (
+                    "This tactical race played directly to the horse's sharp acceleration. The strongest part of the performance was concentrated in the sprint phase after energy had been conserved earlier. "
+                    "The run deserves respect, but it offers less proof that the same level will be reproduced when pressure is sustained from further out."
+                )
+                action = "Best suited by another tactical setup; seek confirmation in a true-run race."
+                confidence = "High" if ac >= 1.15 else "Moderate"
+            elif burst_led and collapse:
+                label = "Short-Burst Profile"
+                verdict = (
+                    "The horse produced a notable acceleration in this slow-run contest but could not sustain it through the finish. "
+                    "That points to short-speed ability rather than clear evidence that a stronger tempo or extra distance will help."
+                )
+                action = "Prefer a tactical race at the same or shorter trip."
+                confidence = "Moderate"
+            elif complete or (balanced and pi >= 0.35):
+                label = "Race-Shape Versatile"
+                verdict = (
+                    "Although the race was tactical, this horse produced a well-distributed performance across travelling speed, acceleration and finishing strength. "
+                    "The evidence is not dependent on one isolated phase, suggesting the performance can transfer to a wider range of race shapes."
+                )
+                action = "Respect under both tactical and more genuine conditions."
+                confidence = "High" if complete else "Moderate"
+            elif not strong_quality and collapse:
+                label = "Limited Evidence"
+                verdict = (
+                    "The tactical race did not produce enough sustained time evidence to support a positive projection. "
+                    "The horse was unable to convert the conserved-energy setup into a competitive late performance."
+                )
+                action = "No upgrade from this run."
+                confidence = "High"
             else:
-                raw_states.append("Hold")
+                label = "Shape Inconclusive"
+                verdict = (
+                    "This slow-run race did not provide a complete test of the horse's ability, but the sectional profile is mixed rather than clearly positive or tactically dependent. "
+                    "More evidence is required before projecting a meaningful improvement or regression under a different tempo."
+                )
+                action = "Treat the run cautiously until tested in a clearer race shape."
+                confidence = "Moderate"
 
-        # Hold is neutral. Consecutive same-direction efforts form one sustained state.
-        active = [x for x in raw_states if x != "Hold"]
-        compressed = []
-        for state in active:
-            if not compressed or compressed[-1] != state:
-                compressed.append(state)
+        elif context == "Fast":
+            if complete and pi >= 0.45:
+                label = "Elite Confirmation"
+                verdict = (
+                    "This genuinely run race provided a full test of sustained ability, and the horse performed strongly through every major phase. "
+                    "It travelled, accelerated and maintained its effort under pressure, confirming that the performance was not created by a favourable tactical setup."
+                )
+                action = "Treat as fully proven under sustained pressure."
+                confidence = "High"
+            elif strong_quality and gr >= 0.35 and ts >= 0.0:
+                label = "Genuine Performer"
+                verdict = (
+                    "The strong race tempo tested the horse's ability to absorb sustained pressure, and its sectional profile held together well. "
+                    "This is credible, repeatable evidence rather than a performance dependent on a short sprint."
+                )
+                action = "Expect the form to remain reliable in another true-run race."
+                confidence = "High" if pi >= 0.5 else "Moderate"
+            elif burst_led and gr < -0.55:
+                label = "Pressure Vulnerable"
+                verdict = (
+                    "The horse showed acceleration but could not maintain that effort once the genuine tempo took full effect. "
+                    "The profile suggests it may be more effective when the race develops into a shorter tactical sprint."
+                )
+                action = "Prefer an easier tempo or shorter pressure phase."
+                confidence = "Moderate"
+            elif collapse:
+                label = "True-Run Exposed"
+                verdict = (
+                    "The genuine tempo exposed a clear weakness in sustaining speed through the finish. "
+                    "This run provides little support for stepping up in distance unless the horse can distribute its effort more efficiently."
+                )
+                action = "Be cautious over further or in another strongly run race."
+                confidence = "High"
+            else:
+                label = "Credible Under Pressure"
+                verdict = (
+                    "This race provided a genuine examination, and the horse's performance was broadly supported by the sectional times. "
+                    "It was not dominant across every phase, but the run carries more weight than form achieved in a tactical contest."
+                )
+                action = "Use as reliable evidence under similar conditions."
+                confidence = "Moderate"
 
-        reversals = max(0, len(compressed) - 1)
-        significant_count = len(active)
-        if compressed:
-            pattern = " → ".join(compressed)
-        else:
-            pattern = "Hold"
+        else:  # Even or RPSS unavailable
+            if complete or (balanced and pi >= 0.45):
+                label = "Versatile Confirmation"
+                verdict = (
+                    "The race provided a balanced test, and this horse performed consistently across the major phases. "
+                    "Its ability was not concentrated in one short section, supporting a reliable and adaptable performance profile."
+                )
+                action = "Respect across a range of normal race shapes."
+                confidence = "High" if complete else "Moderate"
+            elif burst_led:
+                label = "Acceleration-Led"
+                verdict = (
+                    "The performance was driven primarily by acceleration rather than evenly sustained strength. "
+                    "That sharp speed is a genuine asset, although a stronger tempo may place greater pressure on the finishing phase."
+                )
+                action = "Most appealing when a decisive turn of foot is likely to matter."
+                confidence = "Moderate"
+            elif cruise_led and controlled_finish and strong_quality:
+                label = "Further Potential"
+                verdict = (
+                    "The horse's strongest evidence came through sustained travelling speed, with enough finishing integrity to suggest the effort was not exhausted. "
+                    "A slightly stronger tempo or additional distance may allow this profile to become more effective."
+                )
+                action = "Consider over further or when the pace is more sustained."
+                confidence = "Moderate"
+            elif collapse:
+                label = "Finish Concern"
+                verdict = (
+                    "The horse was unable to sustain its effort through the final phase of this balanced contest. "
+                    "That weakens the case for extra distance and raises a question about finishing durability."
+                )
+                action = "Prefer the same or shorter trip until finishing strength improves."
+                confidence = "High"
+            else:
+                label = "Honest Run"
+                verdict = (
+                    "The sectional profile broadly matches the balanced nature of the race. "
+                    "There is no strong evidence that the horse was either substantially helped or hindered by the tempo."
+                )
+                action = "No major race-shape upgrade or downgrade."
+                confidence = "Moderate"
 
-        mag = np.asarray([abs(v) for v in meaningful], dtype=float)
-        excess_mag = float(np.sum(np.maximum(0.0, mag - threshold))) if mag.size else 0.0
-        largest = float(np.max(mag)) if mag.size else 0.0
-
-        # Clean sustained Build/Hold begins high. One normal Build→Weaken sequence
-        # receives only a moderate deduction; repeated reversals are heavily penalised.
-        penalty = (
-            1.85 * reversals
-            + 0.30 * max(0, significant_count - 2)
-            + 0.24 * excess_mag
-            + 0.12 * max(0.0, largest - threshold)
-        ) * rpss_factor
-        score = float(np.clip(9.2 - penalty, 1.0, 10.0))
-
-        if score >= 8.5:
-            flag = "Clean"
-        elif score >= 7.0:
-            flag = "Controlled"
-        elif score >= 5.5:
-            flag = "Tactical"
-        elif score >= 4.0:
-            flag = "Unstable"
-        else:
-            flag = "High Risk"
-
-        pi = pd.to_numeric(r.get("PI"), errors="coerce")
         rows.append({
-            "Horse": r.get("Horse"),
+            "Horse": horse,
             "Finish": pd.to_numeric(r.get("Finish Position"), errors="coerce"),
-            "PI": pi,
-            "Run Stability": score,
-            "Effort Pattern": pattern,
-            "Gear Changes": reversals,
-            "Meaningful Efforts": significant_count,
-            "Flag": flag,
+            "PI": raw_pi,
+            "Verdict": label,
+            "Confidence": confidence,
+            "Narrative": verdict,
+            "Action": action,
+            "tsSPI": raw_ts,
+            "Accel": raw_ac,
+            "Grind": raw_gr,
         })
 
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-
-    # Strong performance with low stability: warning only, never alters PI.
-    pi_cut = pd.to_numeric(out["PI"], errors="coerce").quantile(2/3)
-    risk = (
-        pd.to_numeric(out["PI"], errors="coerce").ge(pi_cut)
-        & pd.to_numeric(out["Run Stability"], errors="coerce").lt(5.5)
-    )
-    out.loc[risk, "Flag"] = "High-PI Risk"
-    out["Run Stability"] = pd.to_numeric(out["Run Stability"], errors="coerce").round(2)
-    out["PI"] = pd.to_numeric(out["PI"], errors="coerce").round(2)
     out["Finish"] = pd.to_numeric(out["Finish"], errors="coerce").astype("Int64")
-    out.attrs["threshold"] = threshold
-    out.attrs["rpss_factor"] = rpss_factor
+    for c in ["PI", "tsSPI", "Accel", "Grind"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
     out.attrs["rpss"] = rpss
-    return out.sort_values(["Run Stability", "PI"], ascending=[False, False]).reset_index(drop=True)
+    out.attrs["rpss_label"] = rpss_label
+    out.attrs["context"] = context
+    return out.sort_values(["PI", "Finish"], ascending=[False, True], na_position="last").reset_index(drop=True)
 
 
 # ======================= Advanced Models =======================
 if _view_is("Advanced Models"):
-    st.markdown("## 🧪 Run Stability (Experimental)")
+    st.markdown("## 🧠 Race Shape Verdict")
     st.caption(
-        "Estimates how cleanly each horse produced this one run relative to the race shape. "
-        "Sustained acceleration is not penalised; repeated Build–Weaken reversals are. "
-        "Use alongside PI while the model is being validated."
+        "An RPSS-aware interpretation of what each horse's sectional profile revealed beyond the finishing position. "
+        "The verdict uses time-based phase evidence only and does not alter PI."
     )
 
-    stability_view = compute_run_stability(metrics, int(split_step), RPSS_INFO)
-    if stability_view.empty:
-        st.info("Run Stability needs at least five usable sectional blocks and could not be calculated for this race.")
+    verdict_view = compute_race_shape_verdict(metrics, RPSS_INFO)
+    if verdict_view.empty:
+        st.info("Race Shape Verdict needs usable tsSPI, Accel and Grind metrics and could not be generated for this race.")
     else:
-        display_cols = [
-            "Horse", "Finish", "PI", "Run Stability", "Effort Pattern",
-            "Gear Changes", "Meaningful Efforts", "Flag"
-        ]
-        st.dataframe(stability_view[display_cols], use_container_width=True, hide_index=True)
-        _thr = stability_view.attrs.get("threshold", np.nan)
-        _rf = stability_view.attrs.get("rpss_factor", 1.0)
-        _rp = stability_view.attrs.get("rpss", np.nan)
+        _rp = verdict_view.attrs.get("rpss", np.nan)
+        _ctx = verdict_view.attrs.get("context", "Unknown")
         _rp_txt = f"{float(_rp):.2f}" if np.isfinite(_rp) else "unavailable"
-        st.caption(
-            f"Meaningful-change threshold: {_thr:.2f} km/h • RPSS: {_rp_txt} • "
-            f"context factor: {_rf:.2f}. The opening block is excluded."
+        st.info(f"Race context: **{_ctx}** • RPSS: **{_rp_txt}**")
+
+        horse_options = verdict_view["Horse"].astype(str).tolist()
+        default_horses = horse_options[:min(6, len(horse_options))]
+        selected_horses = st.multiselect(
+            "Horses to display",
+            options=horse_options,
+            default=default_horses,
+            help="The verdict is calculated for every runner. Select the horses you want to review in detail."
         )
-        with st.expander("How to read Run Stability"):
+
+        selected_view = verdict_view[verdict_view["Horse"].astype(str).isin(selected_horses)]
+        for _, vr in selected_view.iterrows():
+            st.markdown(f"### {vr['Horse']} — {vr['Verdict']}")
+            meta = []
+            if pd.notna(vr.get("Finish")):
+                meta.append(f"Finish {int(vr['Finish'])}")
+            if pd.notna(vr.get("PI")):
+                meta.append(f"PI {float(vr['PI']):.2f}")
+            meta.append(f"Confidence: {vr['Confidence']}")
+            st.caption(" • ".join(meta))
+            st.write(vr["Narrative"])
+            st.markdown(f"**Race Edge action:** {vr['Action']}")
+
+        st.markdown("### All-runner verdict table")
+        table_cols = ["Horse", "Finish", "PI", "Verdict", "Confidence", "Action"]
+        st.dataframe(verdict_view[table_cols], use_container_width=True, hide_index=True)
+
+        with st.expander("How Race Shape Verdict works"):
             st.markdown(
                 """
-- **Build:** the horse improved relative to the field by a meaningful amount.
-- **Hold:** movement was inside the race-adaptive noise threshold.
-- **Weaken:** the horse lost meaningful momentum relative to the field.
-- **Gear Changes:** direction reversals after neutral Hold sections are removed.
-- **High-PI Risk:** PI is in the top third of the field but Run Stability is below 5.5.
-
-Run Stability does not alter PI and is intentionally confined to Advanced Models while it is tested.
+- **Slow RPSS (<94):** looks for hidden true-run/further improvers, tactical specialists and performances flattered by a short sprint.
+- **Even RPSS (94–98):** looks for balanced, versatile profiles and mild distance or tempo projections.
+- **Fast RPSS (≥98):** reinforces horses proven under sustained pressure and flags profiles exposed by a genuine tempo.
+- Evidence comes from **tsSPI, Accel, Grind/Corrected Grind and PI quality**.
+- The module deliberately ignores position, positional gains and draw.
+- The narrative is an interpretation of this single performance, not a permanent statement about the horse.
                 """
             )
 
