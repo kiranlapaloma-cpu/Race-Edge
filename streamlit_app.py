@@ -2618,8 +2618,8 @@ if _view_is("Pressure Retention"):
 if _view_is("Race Plane Analysis", "Class Plane Analysis"):
     st.markdown("## Race Plane Analysis")
     st.caption(
-        "PPS identifies the strongest overall position in tsSPI–Accel–Grind space. "
-        "Class Residual remains a separate signal of above- or below-plane sustain."
+        "PPS identifies the strongest field-relative overall performance across tsSPI, Accel and Grind, using PI's three-phase ratio while excluding the noisy opening block. "
+        "Sustain Residual remains a separate signal of above- or below-plane sustain."
     )
 
     req = {"Horse", "tsSPI", "Accel", "Grind"}
@@ -2646,7 +2646,10 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
         with cpa3:
             show_3d_plane = st.toggle("Show 3D plane", value=True)
 
-        plane_df = metrics.loc[:, ["Horse", "tsSPI", "Accel", plane_grind_col]].copy()
+        # PPS and the plane deliberately exclude the noisy opening block.
+        # The module uses only tsSPI, Accel and Grind.
+        base_plane_cols = ["Horse", "tsSPI", "Accel", plane_grind_col]
+        plane_df = metrics.loc[:, base_plane_cols].copy()
         extra_cols = [c for c in ["TOF", "PI", "SRI", "Peak_Location", "Finish_Pos"] if c in metrics.columns]
         for c in extra_cols:
             plane_df[c] = metrics[c]
@@ -2684,10 +2687,10 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
 
             if centre_values:
                 plane_df["Expected_Grind"] = 100.0 + expected_z
-                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+                plane_df["Sustain_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
             else:
                 plane_df["Expected_Grind"] = expected_z
-                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+                plane_df["Sustain_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
 
             z_mean = float(np.nanmean(z))
             ss_res = float(np.nansum((z - expected_z) ** 2))
@@ -2709,9 +2712,9 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     return "🟠 Below expectation"
                 return "🔴 Emptied / weak sustain"
 
-            plane_df["CR_Profile"] = plane_df["Class_Residual"].map(_cr_profile)
+            plane_df["Sustain_Profile"] = plane_df["Sustain_Residual"].map(_cr_profile)
             plane_df["Expected_Grind"] = plane_df["Expected_Grind"].round(2)
-            plane_df["Class_Residual"] = plane_df["Class_Residual"].round(2)
+            plane_df["Sustain_Residual"] = plane_df["Sustain_Residual"].round(2)
 
             # --- Race DNA: relative contribution of each race-plane input ---
             denom = abs(b_tsspi) + abs(c_accel)
@@ -2722,8 +2725,8 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                 travel_share = np.nan
                 accel_share = np.nan
 
-            residual_std = float(np.nanstd(plane_df["Class_Residual"].to_numpy(dtype=float), ddof=1)) if len(plane_df) > 1 else np.nan
-            residual_range = float(np.nanmax(plane_df["Class_Residual"]) - np.nanmin(plane_df["Class_Residual"])) if len(plane_df) else np.nan
+            residual_std = float(np.nanstd(plane_df["Sustain_Residual"].to_numpy(dtype=float), ddof=1)) if len(plane_df) > 1 else np.nan
+            residual_range = float(np.nanmax(plane_df["Sustain_Residual"]) - np.nanmin(plane_df["Sustain_Residual"])) if len(plane_df) else np.nan
 
             def _influence_label(coef, name):
                 sign = "positive" if coef > 0 else "negative" if coef < 0 else "neutral"
@@ -2753,7 +2756,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             )
             st.caption(
                 f"R² = {r2:.3f} · runners used = {len(plane_df)} · rank = {rank}. "
-                "Class Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
+                "Sustain Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
             )
 
             st.markdown("### Race DNA")
@@ -2771,8 +2774,8 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             if rank < 3:
                 st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
 
-            # --- Plane Position Score (PPS): overall strength of the horse's location in
-            # tsSPI–Accel–Grind space. Residual remains a separate upside/underperformance signal.
+            # --- Plane Position Score (PPS): field-relative overall performance using
+            # the exact same phase weighting as PI. Sustain Residual remains separate.
             def _pps_robust_z(series):
                 s = pd.to_numeric(series, errors="coerce").astype(float)
                 med = float(np.nanmedian(s)) if np.isfinite(s).any() else 0.0
@@ -2788,13 +2791,27 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             plane_df["PPS_z_tsSPI"] = _pps_robust_z(plane_df["tsSPI"])
             plane_df["PPS_z_Accel"] = _pps_robust_z(plane_df["Accel"])
             plane_df["PPS_z_Grind"] = _pps_robust_z(plane_df[plane_grind_col])
-            # PPS weighting ratio: tsSPI : Accel : Grind = 1 : 1.2 : 1
-            # Normalised weights are 31.25%, 37.50%, 31.25%.
-            plane_df["PPS_Core"] = (
-                0.3125 * plane_df["PPS_z_tsSPI"]
-                + 0.3750 * plane_df["PPS_z_Accel"]
-                + 0.3125 * plane_df["PPS_z_Grind"]
-            )
+
+            # PPS follows PI's tsSPI : Accel : Grind relationship, but deliberately
+            # excludes F200/the opening block because that section is noisy. The
+            # three retained PI weights are therefore normalised back to 100%.
+            pi_phase_weights = dict(metrics.attrs.get("PI_PHASE_WEIGHTS", {}) or {})
+            default_accel_ratio = 1.0 + 200.0 / max(float(race_distance_input), 1.0)
+            raw_pps_weights = {
+                "tsSPI": float(pi_phase_weights.get("tsSPI", 1.0)),
+                "Accel": float(pi_phase_weights.get("Accel", default_accel_ratio)),
+                "Grind": float(pi_phase_weights.get("Grind", 1.0)),
+            }
+            raw_total = sum(max(0.0, v) for v in raw_pps_weights.values()) or 1.0
+            pps_weights = {k: max(0.0, v) / raw_total for k, v in raw_pps_weights.items()}
+            available_pps = {
+                "tsSPI": "PPS_z_tsSPI",
+                "Accel": "PPS_z_Accel",
+                "Grind": "PPS_z_Grind",
+            }
+            plane_df["PPS_Core"] = 0.0
+            for phase, z_col in available_pps.items():
+                plane_df["PPS_Core"] += pps_weights[phase] * plane_df[z_col]
             plane_df["PPS"] = np.clip(
                 5.0 + 2.75 * np.tanh(plane_df["PPS_Core"] / 1.35),
                 0.0,
@@ -2803,28 +2820,70 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             plane_df["PPS"] = plane_df["PPS"].round(2)
             plane_df["PPS_Rank"] = plane_df["PPS"].rank(method="min", ascending=False).astype(int)
 
+            pps_hi = float(np.nanquantile(plane_df["PPS"], 0.67))
+            pps_lo = float(np.nanquantile(plane_df["PPS"], 0.33))
+            sr_spread = float(np.nanstd(plane_df["Sustain_Residual"], ddof=1)) if len(plane_df) > 1 else 0.0
+            sr_cut = max(1.0, 0.65 * sr_spread) if np.isfinite(sr_spread) else 1.0
+
+            def _performance_architecture(row):
+                pps = float(row.get("PPS", np.nan))
+                sr = float(row.get("Sustain_Residual", np.nan))
+                if not (np.isfinite(pps) and np.isfinite(sr)):
+                    return "Unclear profile"
+                if pps >= pps_hi and sr >= sr_cut:
+                    return "Complete performance"
+                if pps >= pps_hi and sr <= -sr_cut:
+                    return "Strong but incomplete"
+                if pps >= pps_hi:
+                    return "Strong balanced run"
+                if pps <= pps_lo and sr >= sr_cut:
+                    return "Honest sustain, limited level"
+                if pps <= pps_lo and sr <= -sr_cut:
+                    return "Below benchmark"
+                if sr >= sr_cut:
+                    return "Hidden finishing strength"
+                if sr <= -sr_cut:
+                    return "Acceleration-led, weak sustain"
+                return "Balanced / expected"
+
+            plane_df["Performance_Architecture"] = plane_df.apply(_performance_architecture, axis=1)
+
             st.markdown("### Performance Plane Rankings (PPS)")
+            weight_note = (
+                f"tsSPI {pps_weights['tsSPI']*100:.1f}% · "
+                f"Accel {pps_weights['Accel']*100:.1f}% · Grind {pps_weights['Grind']*100:.1f}%"
+            )
             st.caption(
-                "PPS ranks the strongest overall position in tsSPI–Accel–Grind space using a 1:1.2:1 ratio. "
-                "Class Residual remains separate: it indicates above- or below-plane performance, not overall plane quality."
+                f"PPS excludes the noisy opening block and uses PI's normalised three-phase ratio: {weight_note}. "
+                "Sustain Residual remains separate: it shows whether the horse sustained better or worse than its earlier effort predicted."
             )
 
             top_pps_row = plane_df.sort_values(["PPS", "PI" if "PI" in plane_df.columns else "PPS"], ascending=False).iloc[0]
-            high_cr_row = plane_df.sort_values("Class_Residual", ascending=False).iloc[0]
-            low_cr_row = plane_df.sort_values("Class_Residual", ascending=True).iloc[0]
+            high_cr_row = plane_df.sort_values("Sustain_Residual", ascending=False).iloc[0]
+            incomplete_pool = plane_df[
+                (plane_df["Sustain_Residual"] < -sr_cut) & (plane_df["PPS"] >= pps_hi)
+            ].copy()
             pps_cards = st.columns(3)
-            pps_cards[0].metric("Top Plane Position", str(top_pps_row["Horse"]), f"PPS {float(top_pps_row['PPS']):.2f}")
-            pps_cards[1].metric("Highest Positive Residual", str(high_cr_row["Horse"]), f"CR {float(high_cr_row['Class_Residual']):+.2f}")
-            pps_cards[2].metric("Lowest Residual", str(low_cr_row["Horse"]), f"CR {float(low_cr_row['Class_Residual']):+.2f}")
+            pps_cards[0].metric("Best Overall Performance", str(top_pps_row["Horse"]), f"PPS {float(top_pps_row['PPS']):.2f}")
+            pps_cards[1].metric("Best Sustain Relative to Effort", str(high_cr_row["Horse"]), f"SR {float(high_cr_row['Sustain_Residual']):+.2f}")
+            if len(incomplete_pool):
+                incomplete_row = incomplete_pool.sort_values("PPS", ascending=False).iloc[0]
+                pps_cards[2].metric(
+                    "Strong but Incomplete",
+                    str(incomplete_row["Horse"]),
+                    f"PPS {float(incomplete_row['PPS']):.2f} · SR {float(incomplete_row['Sustain_Residual']):+.2f}",
+                )
+            else:
+                pps_cards[2].metric("Strong but Incomplete", "None flagged", "No high-PPS negative sustain")
 
             out_cols = [
                 "PPS_Rank", "Horse", "Finish_Pos", "PPS", "PI",
                 "tsSPI", "Accel", plane_grind_col,
-                "Expected_Grind", "Class_Residual", "CR_Profile",
+                "Expected_Grind", "Sustain_Residual", "Sustain_Profile", "Performance_Architecture",
             ]
             out_cols = [c for c in out_cols if c in plane_df.columns]
             out_cols += [c for c in ["TOF", "SRI", "Peak_Location"] if c in plane_df.columns and c not in out_cols]
-            rank_df = plane_df.sort_values(["PPS", "Class_Residual"], ascending=[False, False]).reset_index(drop=True)
+            rank_df = plane_df.sort_values(["PPS", "Sustain_Residual"], ascending=[False, False]).reset_index(drop=True)
             st.dataframe(rank_df[out_cols], use_container_width=True, hide_index=True)
 
             csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
@@ -2845,7 +2904,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     ax.set_facecolor("#0b1220")
 
                     # The plane stays analytical; PPS controls marker size and label priority.
-                    cr_vals = plane_df["Class_Residual"].to_numpy(dtype=float)
+                    cr_vals = plane_df["Sustain_Residual"].to_numpy(dtype=float)
                     vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
                     vmax = max(vmax, 1.0)
                     pps_vals = plane_df["PPS"].to_numpy(dtype=float)
@@ -2950,7 +3009,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     )
 
                     cbar = fig.colorbar(sc, ax=ax, shrink=0.62, pad=0.09)
-                    cbar.set_label("Class Residual", color="#e7eef7")
+                    cbar.set_label("Sustain Residual", color="#e7eef7")
                     cbar.ax.tick_params(colors="#b8c5d4")
                     for spine in cbar.ax.spines.values():
                         spine.set_edgecolor("#6f8197")
@@ -2958,8 +3017,8 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     st.pyplot(fig, use_container_width=True)
                     plt.close(fig)
                     st.caption(
-                        "Marker size follows PPS (best overall position on the plane). "
-                        "Colour shows Class Residual separately: positive residual suggests more late sustain than the plane predicted."
+                        "Marker size follows PPS (best overall field-relative performance). "
+                        "Colour shows Sustain Residual separately: positive residual suggests more late sustain than the plane predicted."
                     )
                 except Exception as e:
                     st.info(f"3D plane could not be rendered: {e}")
@@ -2967,13 +3026,14 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             with st.expander("How to read this module"):
                 st.markdown(
                     """
-- **PPS:** overall strength of the horse's position in tsSPI–Accel–Grind space. This is the module's main ranking.
+- **PPS:** field-relative overall performance strength using only tsSPI, Accel and Grind. It follows PI's ratio across those three phases, with the noisy opening block excluded.
 - **PPS Rank:** where the horse sits from strongest to weakest overall plane position.
 - **Race Plane Formula:** the race-specific expected relationship between sustained speed, acceleration and Grind.
 - **Expected Grind:** what the model predicts a horse should have produced from its tsSPI and Accel.
-- **Class Residual:** actual Grind minus expected Grind. It is a separate upside/underperformance signal, not the best-position ranking.
-- **Positive CR:** the horse sustained better than expected.
-- **Negative CR:** the horse did less late than its travel/acceleration profile suggested.
+- **Sustain Residual:** actual Grind minus expected Grind. It measures how well the horse completed the performance relative to its earlier travelling speed and acceleration.
+- **Performance Architecture:** combines PPS and Sustain Residual to describe whether the run was complete, balanced, hidden, acceleration-led or incomplete.
+- **Positive Sustain Residual:** the horse sustained better than expected.
+- **Negative Sustain Residual:** the horse did less late than its travel/acceleration profile suggested.
 
 - **Race DNA:** relative contribution of tsSPI and Accel to the formula, plus R² explainability and residual spread.
 
