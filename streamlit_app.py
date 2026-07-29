@@ -3068,14 +3068,12 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     else:
                         text_labels = [name if name in key_names else "" for name in horse_names]
 
-                    opacity_vals = np.ones(len(plane_df), dtype=float)
+                    selected_mask = np.zeros(len(plane_df), dtype=bool)
                     line_widths = np.full(len(plane_df), 1.1, dtype=float)
                     if highlighted_horse != "None":
-                        opacity_vals[:] = 0.34
-                        sel_mask = horse_names == highlighted_horse
-                        opacity_vals[sel_mask] = 1.0
-                        marker_sizes[sel_mask] = marker_sizes[sel_mask] * 1.45
-                        line_widths[sel_mask] = 3.0
+                        selected_mask = horse_names == highlighted_horse
+                        marker_sizes[selected_mask] = marker_sizes[selected_mask] * 1.45
+                        line_widths[selected_mask] = 3.0
 
                     fig3d = go.Figure()
 
@@ -3138,55 +3136,90 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                         architecture_vals.tolist(),
                     ))
 
-                    fig3d.add_trace(go.Scatter3d(
-                        x=x,
-                        y=y,
-                        z=actual_plot_z,
-                        mode="markers+text",
-                        text=text_labels,
-                        textposition="top center",
-                        textfont=dict(color="#f4f6fa", size=11),
-                        marker=dict(
-                            size=marker_sizes,
-                            color=cr_vals,
-                            colorscale=[
-                                [0.00, "#8e4e4e"],
-                                [0.42, "#c4cbd4"],
-                                [0.50, "#f2f4f7"],
-                                [0.58, "#d8c58a"],
-                                [1.00, "#c49a32"],
-                            ],
-                            cmin=-sr_abs,
-                            cmax=sr_abs,
-                            colorbar=dict(
-                                title=dict(
-                                    text="Sustain<br>Residual",
-                                    font=dict(color="#e9edf3"),
-                                ),
-                                thickness=14,
-                                len=0.65,
-                                tickfont=dict(color="#c9d2de"),
-                                outlinecolor="#526174",
+                    def add_actual_performance_trace(indices, *, opacity, show_scale, trace_name):
+                        """Add one supported Scatter3d trace with scalar opacity.
+
+                        Plotly 3D markers do not accept per-point opacity arrays, so highlighted
+                        and non-highlighted runners are deliberately rendered as separate traces.
+                        """
+                        indices = np.asarray(indices, dtype=int)
+                        if indices.size == 0:
+                            return
+                        fig3d.add_trace(go.Scatter3d(
+                            x=x[indices],
+                            y=y[indices],
+                            z=actual_plot_z[indices],
+                            mode="markers+text",
+                            text=[text_labels[i] for i in indices],
+                            textposition="top center",
+                            textfont=dict(color="#f4f6fa", size=11),
+                            marker=dict(
+                                size=marker_sizes[indices],
+                                color=cr_vals[indices],
+                                colorscale=[
+                                    [0.00, "#8e4e4e"],
+                                    [0.42, "#c4cbd4"],
+                                    [0.50, "#f2f4f7"],
+                                    [0.58, "#d8c58a"],
+                                    [1.00, "#c49a32"],
+                                ],
+                                cmin=-sr_abs,
+                                cmax=sr_abs,
+                                showscale=show_scale,
+                                colorbar=dict(
+                                    title=dict(
+                                        text="Sustain<br>Residual",
+                                        font=dict(color="#e9edf3"),
+                                    ),
+                                    thickness=14,
+                                    len=0.65,
+                                    tickfont=dict(color="#c9d2de"),
+                                    outlinecolor="#526174",
+                                ) if show_scale else None,
+                                line=dict(color="#f4f6fa", width=1.0),
+                                opacity=float(opacity),
                             ),
-                            line=dict(color="#f4f6fa", width=1.0),
-                            opacity=opacity_vals,
-                        ),
-                        customdata=customdata,
-                        hovertemplate=(
-                            "<b>%{customdata[0]}</b><br>"
-                            "Finish: %{customdata[1]}<br>"
-                            "PI: %{customdata[2]:.2f}<br>"
-                            "PPS: %{customdata[3]:.2f}<br><br>"
-                            "tsSPI: %{customdata[4]:.2f}<br>"
-                            "Accel: %{customdata[5]:.2f}<br>"
-                            "Grind: %{customdata[6]:.2f}<br>"
-                            "Expected Grind: %{customdata[7]:.2f}<br>"
-                            "Sustain Residual: %{customdata[8]:+.2f}<br>"
-                            "Architecture: %{customdata[9]}"
-                            "<extra></extra>"
-                        ),
-                        name="Actual performance",
-                    ))
+                            customdata=[customdata[i] for i in indices],
+                            hovertemplate=(
+                                "<b>%{customdata[0]}</b><br>"
+                                "Finish: %{customdata[1]}<br>"
+                                "PI: %{customdata[2]:.2f}<br>"
+                                "PPS: %{customdata[3]:.2f}<br><br>"
+                                "tsSPI: %{customdata[4]:.2f}<br>"
+                                "Accel: %{customdata[5]:.2f}<br>"
+                                "Grind: %{customdata[6]:.2f}<br>"
+                                "Expected Grind: %{customdata[7]:.2f}<br>"
+                                "Sustain Residual: %{customdata[8]:+.2f}<br>"
+                                "Architecture: %{customdata[9]}"
+                                "<extra></extra>"
+                            ),
+                            name=trace_name,
+                            showlegend=False,
+                        ))
+
+                    all_indices = np.arange(len(plane_df), dtype=int)
+                    if highlighted_horse == "None":
+                        add_actual_performance_trace(
+                            all_indices,
+                            opacity=1.0,
+                            show_scale=True,
+                            trace_name="Actual performance",
+                        )
+                    else:
+                        dim_indices = all_indices[~selected_mask]
+                        selected_indices = all_indices[selected_mask]
+                        add_actual_performance_trace(
+                            dim_indices,
+                            opacity=0.30,
+                            show_scale=True,
+                            trace_name="Other runners",
+                        )
+                        add_actual_performance_trace(
+                            selected_indices,
+                            opacity=1.0,
+                            show_scale=False,
+                            trace_name="Highlighted runner",
+                        )
 
                     cameras = {
                         "Performance View": dict(eye=dict(x=1.55, y=-1.65, z=1.15)),
@@ -3245,7 +3278,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                             aspectmode="auto",
                         ),
                     )
-                    st.plotly_chart(fig3d, use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
+                    st.plotly_chart(fig3d, width="stretch", config={"displaylogo": False, "scrollZoom": True})
                     st.caption(
                         "Marker size = PPS · Marker colour = Sustain Residual · Vertical line = Expected Grind to Actual Grind. "
                         "Gold indicates above-expected sustain; muted red indicates below-expected sustain."
@@ -3266,33 +3299,48 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     fig2d = go.Figure()
                     fig2d.add_vline(x=median_pps, line_width=1, line_dash="dash", line_color="rgba(210,220,232,0.38)")
                     fig2d.add_hline(y=0, line_width=1, line_dash="dash", line_color="rgba(210,220,232,0.38)")
-                    fig2d.add_trace(go.Scatter(
-                        x=plane_df["PPS"],
-                        y=plane_df["Sustain_Residual"],
-                        mode="markers+text",
-                        text=[name if label_mode != "Hover only" and name in key_names else "" for name in horse_names],
-                        textposition="top center",
-                        marker=dict(
-                            size=marker_sizes * 0.9,
-                            color=cr_vals,
-                            colorscale=[
-                                [0.00, "#8e4e4e"], [0.50, "#f2f4f7"], [1.00, "#c49a32"]
+                    def add_architecture_trace(indices, *, opacity, trace_name):
+                        indices = np.asarray(indices, dtype=int)
+                        if indices.size == 0:
+                            return
+                        fig2d.add_trace(go.Scatter(
+                            x=plane_df["PPS"].to_numpy(dtype=float)[indices],
+                            y=plane_df["Sustain_Residual"].to_numpy(dtype=float)[indices],
+                            mode="markers+text",
+                            text=[
+                                horse_names[i] if label_mode != "Hover only" and horse_names[i] in key_names else ""
+                                for i in indices
                             ],
-                            cmin=-sr_abs,
-                            cmax=sr_abs,
-                            line=dict(color="#f4f6fa", width=1),
-                            showscale=False,
-                            opacity=opacity_vals,
-                        ),
-                        customdata=list(zip(horse_names.tolist(), architecture_vals.tolist(), finish_vals.tolist(), pi_vals.tolist())),
-                        hovertemplate=(
-                            "<b>%{customdata[0]}</b><br>"
-                            "Finish: %{customdata[2]}<br>PI: %{customdata[3]:.2f}<br>"
-                            "PPS: %{x:.2f}<br>Sustain Residual: %{y:+.2f}<br>"
-                            "%{customdata[1]}<extra></extra>"
-                        ),
-                        showlegend=False,
-                    ))
+                            textposition="top center",
+                            marker=dict(
+                                size=(marker_sizes * 0.9)[indices],
+                                color=cr_vals[indices],
+                                colorscale=[[0.00, "#8e4e4e"], [0.50, "#f2f4f7"], [1.00, "#c49a32"]],
+                                cmin=-sr_abs,
+                                cmax=sr_abs,
+                                line=dict(color="#f4f6fa", width=1),
+                                showscale=False,
+                                opacity=float(opacity),
+                            ),
+                            customdata=[
+                                (horse_names[i], architecture_vals[i], finish_vals[i], pi_vals[i])
+                                for i in indices
+                            ],
+                            hovertemplate=(
+                                "<b>%{customdata[0]}</b><br>"
+                                "Finish: %{customdata[2]}<br>PI: %{customdata[3]:.2f}<br>"
+                                "PPS: %{x:.2f}<br>Sustain Residual: %{y:+.2f}<br>"
+                                "%{customdata[1]}<extra></extra>"
+                            ),
+                            name=trace_name,
+                            showlegend=False,
+                        ))
+
+                    if highlighted_horse == "None":
+                        add_architecture_trace(all_indices, opacity=1.0, trace_name="Field")
+                    else:
+                        add_architecture_trace(all_indices[~selected_mask], opacity=0.30, trace_name="Other runners")
+                        add_architecture_trace(all_indices[selected_mask], opacity=1.0, trace_name="Highlighted runner")
                     fig2d.add_annotation(x=0.99, y=0.98, xref="paper", yref="paper", text="Complete / high-level sustain", showarrow=False, font=dict(color="#d8c58a", size=11), xanchor="right")
                     fig2d.add_annotation(x=0.99, y=0.04, xref="paper", yref="paper", text="Strong but incomplete", showarrow=False, font=dict(color="#b97676", size=11), xanchor="right")
                     fig2d.add_annotation(x=0.01, y=0.98, xref="paper", yref="paper", text="Hidden sustainer", showarrow=False, font=dict(color="#d8c58a", size=11), xanchor="left")
@@ -3306,7 +3354,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                         xaxis=dict(title="PPS — Overall Three-Phase Performance", gridcolor="rgba(160,175,195,0.15)", zeroline=False),
                         yaxis=dict(title="Sustain Residual", gridcolor="rgba(160,175,195,0.15)", zeroline=False),
                     )
-                    st.plotly_chart(fig2d, use_container_width=True, config={"displaylogo": False})
+                    st.plotly_chart(fig2d, width="stretch", config={"displaylogo": False})
                 except Exception as e:
                     st.info(f"Interactive Race Plane could not be rendered: {e}")
 
