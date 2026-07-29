@@ -1760,11 +1760,12 @@ if _view_is("Core Metrics"):
 
     show_cols = [
         "Horse","Finish_Pos","PI",
-        "RaceTime_s","F200_idx","tsSPI","Accel","TOF","TOF_Profile","Grind","Grind_CG",
+        "F200_idx","tsSPI","Accel","Grind","Grind_CG",
+        "RaceTime_s","TOF","TOF_Profile",
         "EARLY_idx","LATE_idx",
         "Peak_Speed","Peak_Location","SRI","SRI_Profile",
         "GrindAdjPts","DeltaG",
-        "PI_pts","Sprint_Conversion_Penalty"
+        "Sprint_Conversion_Penalty"
     ]
 
     # ---- make the column pick robust (no KeyError if some are missing) ----
