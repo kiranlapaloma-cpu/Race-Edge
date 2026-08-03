@@ -284,12 +284,13 @@ def load_saved_horses() -> list[str]:
 
 
 def load_horse_history(horse: str) -> pd.DataFrame:
-    """Load a horse's runs using the exact stored name first.
+    """Load all saved runs for a horse using a robust canonical match.
 
-    The selector is populated directly from Supabase, so querying the exact
-    selected value avoids mismatches caused by brackets, country suffixes,
-    punctuation or unusual whitespace. A canonical fallback remains for
-    manually supplied/legacy names.
+    Supabase/PostgREST exact equality can fail when a stored name contains
+    hidden whitespace or punctuation differences. We therefore fetch the
+    lightweight horse-run rows and compare names in Python using the same
+    canonicalisation used by the search box. This reliably handles names such
+    as ``MISSION TO MARS (IRE)`` and ``MISSION TO MARS IRE``.
     """
     client = get_supabase_client()
     columns = (
@@ -297,29 +298,23 @@ def load_horse_history(horse: str) -> pd.DataFrame:
         "rpss,race_test,mr_achieved,sustain_residual,sustain_verdict,analyst_note"
     )
 
-    exact_name = str(horse or "").strip()
+    target = canon_horse(str(horse or ""))
+    if not target:
+        return pd.DataFrame()
+
     response = (
         client.table("horse_runs")
         .select(columns)
-        .eq("horse", exact_name)
         .order("race_date", desc=True)
+        .limit(10000)
         .execute()
     )
     rows = response.data or []
-
-    if not rows:
-        canonical_name = canon_horse(exact_name)
-        if canonical_name and canonical_name != exact_name:
-            fallback = (
-                client.table("horse_runs")
-                .select(columns)
-                .eq("horse", canonical_name)
-                .order("race_date", desc=True)
-                .execute()
-            )
-            rows = fallback.data or []
-
-    return pd.DataFrame(rows)
+    matched = [
+        row for row in rows
+        if canon_horse(str(row.get("horse", ""))) == target
+    ]
+    return pd.DataFrame(matched)
 
 
 def save_horse_runs(records: list[dict]) -> int:
