@@ -287,7 +287,7 @@ def load_horse_history(horse: str) -> pd.DataFrame:
     client = get_supabase_client()
     response = (
         client.table("horse_runs")
-        .select("id,horse,race_date,track,course,race_number,distance,rpss,race_test,mr_achieved,sustain_residual,sustain_verdict,analyst_note")
+        .select("id,horse,finish_position,race_date,track,course,race_number,distance,rpss,race_test,mr_achieved,sustain_residual,sustain_verdict,analyst_note")
         .eq("horse", canon_horse(horse))
         .order("race_date", desc=True)
         .execute()
@@ -484,6 +484,7 @@ def render_horse_search():
 
     display = history.rename(columns={
         "race_date": "Date",
+        "finish_position": "Finish",
         "track": "Track",
         "course": "Course",
         "race_number": "Race",
@@ -498,7 +499,7 @@ def render_horse_search():
     display["Date"] = display["Date"].dt.strftime("%Y-%m-%d")
     display["Race"] = pd.to_numeric(display["Race"], errors="coerce").astype("Int64")
     cols = [
-        "Date", "Track", "Course", "Race", "Distance", "MR Achieved",
+        "Date", "Track", "Course", "Race", "Distance", "Finish", "MR Achieved",
         "RPSS", "Race Test", "Sustain Residual", "Sustain Verdict", "Analyst Note",
     ]
     st.dataframe(display[cols], width="stretch", hide_index=True)
@@ -518,9 +519,10 @@ def render_horse_search():
             mr_value = _db_num(run.get("MR Achieved"))
             sr_value = _db_num(run.get("Sustain Residual"))
             rpss_value = _db_num(run.get("RPSS"))
-            e1.metric("MR Achieved", "—" if mr_value is None else f"{mr_value:.1f}")
-            e2.metric("RPSS", "—" if rpss_value is None else f"{rpss_value:.2f}")
-            e3.metric("Sustain Residual", "—" if sr_value is None else f"{sr_value:+.2f}")
+            e1.metric("Finish", str(run.get("Finish") or "—"))
+            e2.metric("MR Achieved", "—" if mr_value is None else f"{mr_value:.1f}")
+            e3.metric("RPSS", "—" if rpss_value is None else f"{rpss_value:.2f}")
+            st.metric("Sustain Residual", "—" if sr_value is None else f"{sr_value:+.2f}")
             st.markdown(f"**Race Test:** {run.get('Race Test') or '—'}")
             st.markdown(f"**Sustain Verdict:** {run.get('Sustain Verdict') or '—'}")
             note = str(run.get("Analyst Note") or "").strip()
@@ -4472,9 +4474,19 @@ if _view_is("Horse Database"):
                 with d1:
                     db_race_date = st.date_input("Race Date", value=datetime.now().date(), key="db_race_date")
                 with d2:
-                    db_track = st.text_input("Track", placeholder="e.g. Greyville", key="db_track")
+                    db_track = st.selectbox(
+                        "Track",
+                        ["Greyville", "Scottsville", "Turffontein", "Vaal", "Fairview", "Kenilworth", "Durbanville"],
+                        index=0,
+                        key="db_track",
+                    )
                 with d3:
-                    db_course = st.text_input("Course", placeholder="e.g. Turf / Poly", key="db_course")
+                    db_course = st.selectbox(
+                        "Course",
+                        ["Poly", "Turf", "Inside", "Standside", "Main", "Classic"],
+                        index=1,
+                        key="db_course",
+                    )
                 with d4:
                     db_race_number = st.number_input(
                         "Race Number", min_value=1, max_value=20, value=1, step=1, key="db_race_number"
@@ -4533,6 +4545,24 @@ if _view_is("Horse Database"):
                 st.dataframe(rating_display, width="stretch", hide_index=True)
 
                 save_df = db_plane[["Horse", "Sustain_Residual", "Sustain_Verdict"]].copy()
+
+                # Store finishing position together with field size, e.g. 1/11.
+                field_size = int(len(save_df))
+                finish_lookup = pd.DataFrame({"Horse": save_df["Horse"].astype(str)})
+                if "Finish_Pos" in metrics.columns:
+                    finish_lookup = metrics[["Horse", "Finish_Pos"]].copy()
+                    finish_lookup["Horse"] = finish_lookup["Horse"].astype(str)
+                    finish_lookup["Finish_Pos"] = pd.to_numeric(
+                        finish_lookup["Finish_Pos"], errors="coerce"
+                    ).astype("Int64")
+                    finish_lookup["Finish Position"] = finish_lookup["Finish_Pos"].map(
+                        lambda p: f"{int(p)}/{field_size}" if pd.notna(p) else f"—/{field_size}"
+                    )
+                    finish_lookup = finish_lookup[["Horse", "Finish Position"]]
+                else:
+                    finish_lookup["Finish Position"] = f"—/{field_size}"
+
+                save_df = save_df.merge(finish_lookup, on="Horse", how="left")
                 save_df = save_df.merge(
                     rating_df[["Horse", "Weight (kg)", "Calculated MR"]],
                     on="Horse",
@@ -4544,7 +4574,7 @@ if _view_is("Horse Database"):
                     "F — | T — | A — | CG —"
                 ) + "\n\nNotes:\n"
                 save_df = save_df[[
-                    "Horse", "Weight (kg)", "Calculated MR", "MR Achieved",
+                    "Horse", "Finish Position", "Weight (kg)", "Calculated MR", "MR Achieved",
                     "Sustain_Residual", "Sustain_Verdict", "Analyst Note",
                 ]].rename(columns={
                     "Sustain_Residual": "Sustain Residual",
@@ -4560,7 +4590,7 @@ if _view_is("Horse Database"):
                     width="stretch",
                     hide_index=True,
                     disabled=[
-                        "Horse", "Weight (kg)", "Calculated MR",
+                        "Horse", "Finish Position", "Weight (kg)", "Calculated MR",
                         "Sustain Residual", "Sustain Verdict",
                     ],
                     column_config={
@@ -4594,6 +4624,7 @@ if _view_is("Horse Database"):
                             note = "" if note is None or pd.isna(note) else str(note).strip()
                             records.append({
                                 "horse": horse,
+                                "finish_position": str(row.get("Finish Position", "")).strip(),
                                 "race_date": db_race_date.isoformat(),
                                 "track": str(db_track).strip().title(),
                                 "course": str(db_course).strip().title(),
