@@ -284,15 +284,42 @@ def load_saved_horses() -> list[str]:
 
 
 def load_horse_history(horse: str) -> pd.DataFrame:
+    """Load a horse's runs using the exact stored name first.
+
+    The selector is populated directly from Supabase, so querying the exact
+    selected value avoids mismatches caused by brackets, country suffixes,
+    punctuation or unusual whitespace. A canonical fallback remains for
+    manually supplied/legacy names.
+    """
     client = get_supabase_client()
+    columns = (
+        "id,horse,finish_position,race_date,track,course,race_number,distance,"
+        "rpss,race_test,mr_achieved,sustain_residual,sustain_verdict,analyst_note"
+    )
+
+    exact_name = str(horse or "").strip()
     response = (
         client.table("horse_runs")
-        .select("id,horse,finish_position,race_date,track,course,race_number,distance,rpss,race_test,mr_achieved,sustain_residual,sustain_verdict,analyst_note")
-        .eq("horse", canon_horse(horse))
+        .select(columns)
+        .eq("horse", exact_name)
         .order("race_date", desc=True)
         .execute()
     )
-    return pd.DataFrame(response.data or [])
+    rows = response.data or []
+
+    if not rows:
+        canonical_name = canon_horse(exact_name)
+        if canonical_name and canonical_name != exact_name:
+            fallback = (
+                client.table("horse_runs")
+                .select(columns)
+                .eq("horse", canonical_name)
+                .order("race_date", desc=True)
+                .execute()
+            )
+            rows = fallback.data or []
+
+    return pd.DataFrame(rows)
 
 
 def save_horse_runs(records: list[dict]) -> int:
@@ -442,8 +469,13 @@ def render_horse_search():
         "Horse name",
         placeholder="Type part of a horse's name...",
         key="db_horse_query",
-    ).strip().upper()
-    matches = [h for h in horses if query in h] if query else horses
+    ).strip()
+    canonical_query = canon_horse(query)
+    matches = (
+        [h for h in horses if canonical_query in canon_horse(h)]
+        if canonical_query
+        else horses
+    )
     selected = st.selectbox(
         "Select horse",
         matches,
