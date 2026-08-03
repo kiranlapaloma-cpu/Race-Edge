@@ -1,6 +1,6 @@
 # ======================= Batch 1 — Core + UI + I/O + DB bootstrap =======================
-import io, math, re, os, sqlite3, hashlib
-from datetime import datetime
+import io, math, re, os, hashlib
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -10,6 +10,12 @@ from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.lines import Line2D
 import matplotlib.patheffects as pe
+
+try:
+    from supabase import create_client, Client
+except Exception:
+    create_client = None
+    Client = object
 
 # ======================= Global NaN/Inf → None guard (JSON-safe, index-safe) =======================
 
@@ -183,8 +189,7 @@ st.set_page_config(
 )
 
 # ----------------------- Globals ---------------------------
-DB_DEFAULT_PATH = "race_edge.db"
-APP_VERSION = "3.3"
+APP_VERSION = "3.4"
 
 # ----------------------- Small helpers ---------------------
 def as_num(x):
@@ -217,6 +222,171 @@ def canon_horse(name: str) -> str:
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+# ----------------------- Supabase Horse Database -----------------------
+def _supabase_configured() -> bool:
+    try:
+        return bool(st.secrets["supabase"]["url"] and st.secrets["supabase"]["key"])
+    except Exception:
+        return False
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_client():
+    if create_client is None:
+        raise RuntimeError("The `supabase` package is not installed. Add `supabase` to requirements.txt.")
+    try:
+        url = str(st.secrets["supabase"]["url"]).strip()
+        key = str(st.secrets["supabase"]["key"]).strip()
+    except Exception as exc:
+        raise RuntimeError("Supabase credentials are missing from Streamlit Secrets.") from exc
+    if not url or not key:
+        raise RuntimeError("Supabase URL or key is blank in Streamlit Secrets.")
+    return create_client(url, key)
+
+
+def _db_num(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+        value = float(value)
+        return value if np.isfinite(value) else None
+    except Exception:
+        return None
+
+
+def database_sustain_verdict(value) -> str:
+    value = _db_num(value)
+    if value is None:
+        return "Unavailable"
+    if value >= 3.0:
+        return "Major above expectation"
+    if value >= 1.5:
+        return "Above expectation"
+    if value > -1.5:
+        return "Around expectation"
+    if value > -3.0:
+        return "Below expectation"
+    return "Significant late underperformance"
+
+
+def load_saved_horses() -> list[str]:
+    client = get_supabase_client()
+    response = (
+        client.table("horse_runs")
+        .select("horse")
+        .order("horse")
+        .limit(10000)
+        .execute()
+    )
+    return sorted({str(row.get("horse", "")).strip() for row in (response.data or []) if row.get("horse")})
+
+
+def load_horse_history(horse: str) -> pd.DataFrame:
+    client = get_supabase_client()
+    response = (
+        client.table("horse_runs")
+        .select("id,horse,race_date,track,distance,race_test,mr_achieved,sustain_residual,sustain_verdict,analyst_note")
+        .eq("horse", canon_horse(horse))
+        .order("race_date", desc=True)
+        .execute()
+    )
+    return pd.DataFrame(response.data or [])
+
+
+def save_horse_runs(records: list[dict]) -> int:
+    if not records:
+        return 0
+    client = get_supabase_client()
+    (
+        client.table("horse_runs")
+        .upsert(records, on_conflict="horse,race_date,track,distance")
+        .execute()
+    )
+    load_saved_horses.clear() if hasattr(load_saved_horses, "clear") else None
+    return len(records)
+
+
+def build_database_plane(metrics_df: pd.DataFrame, rpss_info=None):
+    """Reproduce the default centred Race Plane solely for database capture."""
+    required = ["Horse", "tsSPI", "Accel", "Grind"]
+    if metrics_df is None or any(c not in metrics_df.columns for c in required):
+        return pd.DataFrame(), {"label": "Inconclusive race test"}
+    df = metrics_df[required].copy()
+    for c in ["tsSPI", "Accel", "Grind"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Horse", "tsSPI", "Accel", "Grind"]).reset_index(drop=True)
+    if len(df) < 4:
+        return pd.DataFrame(), {"label": "Inconclusive race test"}
+    x = (df["tsSPI"] - 100.0).to_numpy(float)
+    y = (df["Accel"] - 100.0).to_numpy(float)
+    z = (df["Grind"] - 100.0).to_numpy(float)
+    X = np.column_stack([np.ones(len(df)), x, y])
+    coef, *_ = np.linalg.lstsq(X, z, rcond=None)
+    expected = X @ coef
+    df["Expected_Grind"] = 100.0 + expected
+    df["Sustain_Residual"] = df["Grind"] - df["Expected_Grind"]
+    df["Sustain_Verdict"] = df["Sustain_Residual"].map(database_sustain_verdict)
+    try:
+        profile = compute_race_test_profile(metrics_df, rpss_info, "Grind")
+    except Exception:
+        profile = {"label": "Inconclusive race test"}
+    return df, profile
+
+
+def render_horse_search():
+    st.markdown("### Search Horse")
+    st.caption("Search a horse to view every Race Edge run saved in Supabase.")
+    if not _supabase_configured():
+        st.warning("Supabase is not configured in Streamlit Secrets.")
+        return
+    try:
+        horses = load_saved_horses()
+    except Exception as exc:
+        st.error(f"Could not connect to Supabase: {exc}")
+        return
+    if not horses:
+        st.info("The database is connected, but no horse runs have been saved yet.")
+        return
+    query = st.text_input("Horse name", placeholder="Type part of a horse's name...").strip().upper()
+    matches = [h for h in horses if query in h] if query else horses
+    selected = st.selectbox("Select horse", matches, index=None, placeholder="Choose a horse...")
+    if not selected:
+        return
+    try:
+        history = load_horse_history(selected)
+    except Exception as exc:
+        st.error(f"Could not load horse history: {exc}")
+        return
+    if history.empty:
+        st.info("No saved runs found for this horse.")
+        return
+    history["race_date"] = pd.to_datetime(history["race_date"], errors="coerce")
+    history["mr_achieved"] = pd.to_numeric(history["mr_achieved"], errors="coerce")
+    history["sustain_residual"] = pd.to_numeric(history["sustain_residual"], errors="coerce")
+    latest_mr = history.loc[history["mr_achieved"].notna(), "mr_achieved"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Saved Runs", len(history))
+    c2.metric("Latest MR", "—" if latest_mr.empty else f"{latest_mr.iloc[0]:.0f}")
+    c3.metric("Best MR", "—" if latest_mr.empty else f"{latest_mr.max():.0f}")
+    sr = history["sustain_residual"].dropna()
+    c4.metric("Average Sustain", "—" if sr.empty else f"{sr.mean():+.2f}")
+    display = history.rename(columns={
+        "race_date": "Date", "track": "Track", "distance": "Distance",
+        "race_test": "Race Test", "mr_achieved": "MR Achieved",
+        "sustain_residual": "Sustain Residual", "sustain_verdict": "Sustain Verdict",
+        "analyst_note": "Analyst Note"
+    })
+    display["Date"] = display["Date"].dt.strftime("%Y-%m-%d")
+    cols = ["Date", "Track", "Distance", "MR Achieved", "Race Test", "Sustain Residual", "Sustain Verdict", "Analyst Note"]
+    st.dataframe(display[cols], width="stretch", hide_index=True)
+    st.download_button(
+        "Download this horse's history (CSV)",
+        data=display[cols].to_csv(index=False).encode("utf-8"),
+        file_name=f"{canon_horse(selected).replace(' ', '_').lower()}_race_edge_history.csv",
+        mime="text/csv",
+    )
 
 def color_cycle(n):
     base = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0','C1','C2','C3','C4','C5','C6','C7','C8','C9'])
@@ -607,7 +777,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Core Metrics", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models"],
+        ["Core Metrics", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Horse Database"],
         index=0,
     )
 
@@ -645,78 +815,13 @@ with st.sidebar:
         SHOW_WARNINGS = st.toggle("Show data warnings", value=True)
         DEBUG = st.toggle("Debug info", value=False)
 
-    with st.expander("Database", expanded=False):
-        db_path = st.text_input("Database path", value=DB_DEFAULT_PATH)
-        init_btn = st.button("Initialise / Check DB")
-
-# ----------------------- DB init (races + performances) -------------------
-if init_btn:
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        conn.executescript("""
-CREATE TABLE IF NOT EXISTS races(
-  race_id        TEXT PRIMARY KEY,
-  date           TEXT,
-  track          TEXT,
-  race_no        INTEGER,
-  distance_m     INTEGER NOT NULL,
-  split_step     INTEGER CHECK(split_step IN (100,200)) NOT NULL,
-  fsr            REAL,
-  collapse       REAL,
-  shape_tag      TEXT,
-  sci            REAL,
-  fra_applied    INTEGER,
-  going          TEXT,       -- NEW: Track going used for PI weighting (Firm/Good/Soft/Heavy)
-  app_version    TEXT,
-  created_ts     TEXT DEFAULT (datetime('now')),
-  src_hash       TEXT
-);
-CREATE TABLE IF NOT EXISTS performances(
-  perf_id         TEXT PRIMARY KEY,
-  race_id         TEXT NOT NULL REFERENCES races(race_id) ON DELETE CASCADE,
-  horse           TEXT NOT NULL,
-  horse_canon     TEXT NOT NULL,
-  finish_pos      INTEGER,
-  race_time_s     REAL,
-  f200_idx        REAL,
-  tsspi           REAL,
-  accel           REAL,
-  grind           REAL,
-  grind_cg        REAL,
-  delta_g         REAL,
-  finisher_factor REAL,
-  grind_adj_pts   REAL,
-  pi              REAL,
-  pi_rs           REAL,    -- NEW: PI after race-shape adjustments (if any)
-  hidden          REAL,
-  ability         REAL,
-  ability_tier    TEXT,
-  iai             REAL,
-  bal             REAL,
-  comp            REAL,
-  iai_pct         REAL,
-  hid_pct         REAL,
-  bal_pct         REAL,
-  comp_pct        REAL,
-  dir_hint        TEXT,
-  confidence      TEXT,
-  inserted_ts     TEXT DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_perf_horse ON performances(horse_canon);
-CREATE INDEX IF NOT EXISTS idx_perf_race  ON performances(race_id);
-CREATE INDEX IF NOT EXISTS idx_races_date ON races(date);
-""")
-        conn.commit()
-        conn.close()
-        st.success(f"DB ready at {db_path}")
-    except Exception as e:
-        st.error(f"DB init failed: {e}")
-
-# ----------------------- Stop until a file is uploaded --------------------
+# ----------------------- Database search works without a race upload -------
 if not up:
+    if _view_is("Horse Database"):
+        st.title("Horse Database")
+        render_horse_search()
+    else:
+        st.info("Upload a sectional file to begin the Race Edge analysis.")
     st.stop()
 
 # ----------------------- Header normalization / Aliases -------------------
@@ -4194,3 +4299,84 @@ if _view_is("Advanced Models"):
             f"shape de-bias via RSI×SCI, trip friction damp, and a race 'temperature' τ={tau:.2f} from field size & dispersion. "
             f"Interpretation: chance to win if this same race were replayed 100 times."
         )
+
+
+# ======================= Horse Database (Supabase) =======================
+if _view_is("Horse Database"):
+    st.title("Horse Database")
+    st.caption("Save the current race and search every recorded run for a horse.")
+
+    add_tab, search_tab = st.tabs(["Add Current Race", "Search Horse"])
+
+    with add_tab:
+        if not _supabase_configured():
+            st.warning("Supabase is not configured in Streamlit Secrets.")
+        else:
+            db_plane, db_profile = build_database_plane(metrics, RPSS_INFO)
+            if db_plane.empty:
+                st.info("At least four runners with tsSPI, Accel and Grind are required before this race can be saved.")
+            else:
+                st.markdown("### Race Details")
+                d1, d2, d3 = st.columns(3)
+                with d1:
+                    db_race_date = st.date_input("Race Date", value=datetime.now().date(), key="db_race_date")
+                with d2:
+                    db_track = st.text_input("Track", placeholder="e.g. Greyville", key="db_track")
+                with d3:
+                    st.number_input("Distance (m)", value=int(race_distance_input), disabled=True, key="db_distance")
+                race_test_label = str(db_profile.get("label", "Inconclusive race test"))
+                st.text_input("Race Test", value=race_test_label, disabled=True, key="db_race_test")
+
+                save_df = db_plane[["Horse", "Sustain_Residual", "Sustain_Verdict"]].copy()
+                save_df["MR Achieved"] = pd.Series([None] * len(save_df), dtype="object")
+                save_df["Analyst Note"] = ""
+                save_df = save_df[["Horse", "MR Achieved", "Sustain_Residual", "Sustain_Verdict", "Analyst Note"]]
+                save_df = save_df.rename(columns={
+                    "Sustain_Residual": "Sustain Residual",
+                    "Sustain_Verdict": "Sustain Verdict",
+                })
+                edited_db = st.data_editor(
+                    save_df,
+                    width="stretch",
+                    hide_index=True,
+                    disabled=["Horse", "Sustain Residual", "Sustain Verdict"],
+                    column_config={
+                        "MR Achieved": st.column_config.NumberColumn("MR Achieved", step=1.0, format="%.1f"),
+                        "Sustain Residual": st.column_config.NumberColumn("Sustain Residual", format="%+.2f"),
+                        "Analyst Note": st.column_config.TextColumn("Analyst Note", width="large"),
+                    },
+                    key="supabase_race_editor",
+                )
+
+                if st.button("Save / Update Race in Database", type="primary", key="save_supabase_race"):
+                    if not str(db_track).strip():
+                        st.error("Enter the track before saving.")
+                    else:
+                        records = []
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        for _, row in edited_db.iterrows():
+                            horse = canon_horse(str(row.get("Horse", "")))
+                            if not horse:
+                                continue
+                            note = row.get("Analyst Note", "")
+                            note = "" if note is None or pd.isna(note) else str(note).strip()
+                            records.append({
+                                "horse": horse,
+                                "race_date": db_race_date.isoformat(),
+                                "track": str(db_track).strip().title(),
+                                "distance": int(race_distance_input),
+                                "race_test": race_test_label,
+                                "mr_achieved": _db_num(row.get("MR Achieved")),
+                                "sustain_residual": _db_num(row.get("Sustain Residual")),
+                                "sustain_verdict": str(row.get("Sustain Verdict", "")),
+                                "analyst_note": note,
+                                "updated_at": now_iso,
+                            })
+                        try:
+                            count = save_horse_runs(records)
+                            st.success(f"Saved or updated {count} horse runs in Supabase.")
+                        except Exception as exc:
+                            st.error(f"Database save failed: {exc}")
+
+    with search_tab:
+        render_horse_search()
