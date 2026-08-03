@@ -287,7 +287,7 @@ def load_horse_history(horse: str) -> pd.DataFrame:
     client = get_supabase_client()
     response = (
         client.table("horse_runs")
-        .select("id,horse,race_date,track,course,race_number,distance,race_test,mr_achieved,sustain_residual,sustain_verdict,analyst_note")
+        .select("id,horse,race_date,track,course,race_number,distance,rpss,race_test,mr_achieved,sustain_residual,sustain_verdict,analyst_note")
         .eq("horse", canon_horse(horse))
         .order("race_date", desc=True)
         .execute()
@@ -334,6 +334,35 @@ def build_database_plane(metrics_df: pd.DataFrame, rpss_info=None):
         profile = {"label": "Inconclusive race test"}
     return df, profile
 
+
+
+def build_database_phase_notes(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    """Build the compact, editable F | T | A | CG note prefix for each horse."""
+    if metrics_df is None or "Horse" not in metrics_df.columns:
+        return pd.DataFrame(columns=["Horse", "Phase Note"])
+
+    front_candidates = ["F200_idx", "F200", "F200_Index", "F200 index"]
+    cg_candidates = ["Grind_CG", "Corrected_Grind", "Corrected Grind"]
+    front_col = next((c for c in front_candidates if c in metrics_df.columns), None)
+    cg_col = next((c for c in cg_candidates if c in metrics_df.columns), None)
+
+    needed = ["Horse"] + [c for c in [front_col, "tsSPI", "Accel", cg_col] if c is not None]
+    out = metrics_df[needed].copy()
+
+    def fmt(v):
+        v = _db_num(v)
+        return "—" if v is None else f"{v:.1f}"
+
+    out["Phase Note"] = out.apply(
+        lambda r: (
+            f"F {fmt(r.get(front_col))} | "
+            f"T {fmt(r.get('tsSPI'))} | "
+            f"A {fmt(r.get('Accel'))} | "
+            f"CG {fmt(r.get(cg_col))}"
+        ),
+        axis=1,
+    )
+    return out[["Horse", "Phase Note"]]
 
 
 def build_database_handicap(metrics_df: pd.DataFrame, distance_m: float) -> pd.DataFrame:
@@ -437,6 +466,7 @@ def render_horse_search():
     history["race_date"] = pd.to_datetime(history["race_date"], errors="coerce")
     history["mr_achieved"] = pd.to_numeric(history["mr_achieved"], errors="coerce")
     history["sustain_residual"] = pd.to_numeric(history["sustain_residual"], errors="coerce")
+    history["rpss"] = pd.to_numeric(history.get("rpss"), errors="coerce")
     history["race_number"] = pd.to_numeric(history["race_number"], errors="coerce")
     history = history.sort_values(
         ["race_date", "race_number"],
@@ -458,6 +488,7 @@ def render_horse_search():
         "course": "Course",
         "race_number": "Race",
         "distance": "Distance",
+        "rpss": "RPSS",
         "race_test": "Race Test",
         "mr_achieved": "MR Achieved",
         "sustain_residual": "Sustain Residual",
@@ -468,7 +499,7 @@ def render_horse_search():
     display["Race"] = pd.to_numeric(display["Race"], errors="coerce").astype("Int64")
     cols = [
         "Date", "Track", "Course", "Race", "Distance", "MR Achieved",
-        "Race Test", "Sustain Residual", "Sustain Verdict", "Analyst Note",
+        "RPSS", "Race Test", "Sustain Residual", "Sustain Verdict", "Analyst Note",
     ]
     st.dataframe(display[cols], width="stretch", hide_index=True)
 
@@ -483,11 +514,13 @@ def render_horse_search():
         dist_text = "—" if pd.isna(distance) else f"{int(distance)}m"
         heading = f"{date_label} · {track_label} {course_label} · Race {race_text} · {dist_text}"
         with st.expander(heading):
-            e1, e2 = st.columns(2)
+            e1, e2, e3 = st.columns(3)
             mr_value = _db_num(run.get("MR Achieved"))
             sr_value = _db_num(run.get("Sustain Residual"))
+            rpss_value = _db_num(run.get("RPSS"))
             e1.metric("MR Achieved", "—" if mr_value is None else f"{mr_value:.1f}")
-            e2.metric("Sustain Residual", "—" if sr_value is None else f"{sr_value:+.2f}")
+            e2.metric("RPSS", "—" if rpss_value is None else f"{rpss_value:.2f}")
+            e3.metric("Sustain Residual", "—" if sr_value is None else f"{sr_value:+.2f}")
             st.markdown(f"**Race Test:** {run.get('Race Test') or '—'}")
             st.markdown(f"**Sustain Verdict:** {run.get('Sustain Verdict') or '—'}")
             note = str(run.get("Analyst Note") or "").strip()
@@ -4427,6 +4460,7 @@ if _view_is("Horse Database"):
         else:
             db_plane, db_profile = build_database_plane(metrics, RPSS_INFO)
             handicap_df = build_database_handicap(metrics, race_distance_input)
+            phase_notes_df = build_database_phase_notes(metrics)
 
             if db_plane.empty:
                 st.info("At least four runners with tsSPI, Accel and Grind are required before this race can be saved.")
@@ -4446,11 +4480,19 @@ if _view_is("Horse Database"):
                         "Race Number", min_value=1, max_value=20, value=1, step=1, key="db_race_number"
                     )
 
-                rd1, rd2 = st.columns(2)
+                rd1, rd2, rd3 = st.columns(3)
                 with rd1:
                     st.number_input("Distance (m)", value=int(race_distance_input), disabled=True, key="db_distance")
-                race_test_label = str(db_profile.get("label", "Inconclusive race test"))
+                rpss_value = _db_num(RPSS_INFO.get("rpss")) if isinstance(RPSS_INFO, dict) else None
                 with rd2:
+                    st.text_input(
+                        "RPSS",
+                        value="—" if rpss_value is None else f"{rpss_value:.2f}",
+                        disabled=True,
+                        key="db_rpss",
+                    )
+                race_test_label = str(db_profile.get("label", "Inconclusive race test"))
+                with rd3:
                     st.text_input("Race Test", value=race_test_label, disabled=True, key="db_race_test")
 
                 st.markdown("### Ahead of the Handicap")
@@ -4497,7 +4539,10 @@ if _view_is("Horse Database"):
                     how="left",
                 )
                 save_df["MR Achieved"] = save_df["Calculated MR"]
-                save_df["Analyst Note"] = ""
+                save_df = save_df.merge(phase_notes_df, on="Horse", how="left")
+                save_df["Analyst Note"] = save_df["Phase Note"].fillna(
+                    "F — | T — | A — | CG —"
+                ) + "\n\nNotes:\n"
                 save_df = save_df[[
                     "Horse", "Weight (kg)", "Calculated MR", "MR Achieved",
                     "Sustain_Residual", "Sustain_Verdict", "Analyst Note",
@@ -4554,6 +4599,7 @@ if _view_is("Horse Database"):
                                 "course": str(db_course).strip().title(),
                                 "race_number": int(db_race_number),
                                 "distance": int(race_distance_input),
+                                "rpss": rpss_value,
                                 "race_test": race_test_label,
                                 "mr_achieved": _db_num(row.get("MR Achieved")),
                                 "sustain_residual": _db_num(row.get("Sustain Residual")),
