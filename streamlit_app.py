@@ -474,7 +474,7 @@ def build_database_phase_notes(metrics_df: pd.DataFrame) -> pd.DataFrame:
     return out[["Horse", "Phase Note"]]
 
 
-def build_database_handicap(metrics_df: pd.DataFrame, distance_m: float) -> pd.DataFrame:
+def build_database_handicap(metrics_df: pd.DataFrame, distance_m: float, source_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """Create the line-horse rating frame using the existing PI conversion and 1 kg = 2 MR points."""
     if metrics_df is None or "Horse" not in metrics_df.columns or "PI" not in metrics_df.columns:
         return pd.DataFrame()
@@ -483,11 +483,17 @@ def build_database_handicap(metrics_df: pd.DataFrame, distance_m: float) -> pd.D
     weight_col = next((c for c in weight_candidates if c in metrics_df.columns), None)
 
     out = metrics_df[["Horse", "PI"]].copy()
-    out["Weight (kg)"] = (
-        pd.to_numeric(metrics_df[weight_col], errors="coerce")
-        if weight_col is not None
-        else 60.0
-    )
+    if weight_col is not None:
+        out["Weight (kg)"] = pd.to_numeric(metrics_df[weight_col], errors="coerce")
+    elif source_df is not None and isinstance(source_df, pd.DataFrame) and "Horse" in source_df.columns:
+        _source_meta = _horse_metadata_frame(source_df)
+        _weights = _source_meta[["Horse Key", "Horse Weight"]].drop_duplicates("Horse Key")
+        out["Horse Key"] = out["Horse"].map(canon_horse)
+        out = out.merge(_weights, on="Horse Key", how="left")
+        out["Weight (kg)"] = pd.to_numeric(out["Horse Weight"], errors="coerce")
+        out = out.drop(columns=[c for c in ["Horse Key", "Horse Weight"] if c in out.columns])
+    else:
+        out["Weight (kg)"] = 60.0
     out["Weight (kg)"] = pd.to_numeric(out["Weight (kg)"], errors="coerce").fillna(60.0)
     out["PI"] = pd.to_numeric(out["PI"], errors="coerce")
     out = out.dropna(subset=["Horse", "PI"]).reset_index(drop=True)
@@ -1035,6 +1041,91 @@ def render_rpss_section(rpss_info: dict | None):
 
     # Runner-level tsSPI detail table intentionally removed to keep the app lighter and faster.
 
+
+# ----------------------- CSV metadata helpers ---------------------------
+def _first_present_value(df: pd.DataFrame | None, candidates, default=None):
+    """Return the first non-empty value from the first matching column."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return default
+    column_map = {str(c).strip().lower(): c for c in df.columns}
+    for candidate in candidates:
+        col = column_map.get(str(candidate).strip().lower())
+        if col is None:
+            continue
+        series = df[col]
+        for value in series.tolist():
+            if value is None:
+                continue
+            try:
+                if pd.isna(value):
+                    continue
+            except Exception:
+                pass
+            if str(value).strip() != "":
+                return value
+    return default
+
+
+def _parse_race_date_value(value, default=None):
+    if value is None:
+        return default
+    parsed = pd.to_datetime(value, errors="coerce", dayfirst=False)
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    return default if pd.isna(parsed) else parsed.date()
+
+
+def _normalise_going_for_pi(value: object) -> str:
+    txt = str(value or "").strip().lower()
+    if any(token in txt for token in ["heavy", "hvy"]):
+        return "Heavy"
+    if any(token in txt for token in ["soft", "v/soft", "very soft", "yield", "yld"]):
+        return "Soft"
+    if any(token in txt for token in ["firm", "fast"]):
+        return "Firm"
+    return "Good"
+
+
+def _uploaded_file_preview(uploaded_file) -> pd.DataFrame | None:
+    """Read a small metadata preview without consuming the uploaded file."""
+    if uploaded_file is None:
+        return None
+    try:
+        uploaded_file.seek(0)
+        name = str(getattr(uploaded_file, "name", "")).lower()
+        preview = (
+            pd.read_csv(uploaded_file)
+            if name.endswith(".csv")
+            else pd.read_excel(uploaded_file)
+        )
+        uploaded_file.seek(0)
+        return preview
+    except Exception:
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+        return None
+
+
+def _horse_metadata_frame(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Return canonical Horse/Age/Weight/Finish/Official MR data when present."""
+    if df is None or not isinstance(df, pd.DataFrame) or "Horse" not in df.columns:
+        return pd.DataFrame(columns=["Horse", "Age", "Horse Weight", "Finish_Pos", "Official MR"])
+    out = pd.DataFrame({"Horse": df["Horse"].astype(str)})
+    aliases = {
+        "Age": ["Age", "A"],
+        "Horse Weight": ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)", "Wgh"],
+        "Finish_Pos": ["Finish_Pos", "Finish Position", "Fin", "Position"],
+        "Official MR": ["Official MR", "Official_MR", "MR", "Merit Rating"],
+    }
+    cmap = {str(c).strip().lower(): c for c in df.columns}
+    for target, candidates in aliases.items():
+        source = next((cmap.get(str(c).strip().lower()) for c in candidates if cmap.get(str(c).strip().lower()) is not None), None)
+        out[target] = df[source] if source is not None else pd.NA
+    out["Horse Key"] = out["Horse"].map(canon_horse)
+    return out
+
 # ----------------------- Sidebar ---------------------------
 with st.sidebar:
     st.markdown(f"### Race Edge v{APP_VERSION}")
@@ -1051,7 +1142,18 @@ with st.sidebar:
         "Upload CSV/XLSX with 100 m or 200 m splits",
         type=["csv", "xlsx", "xls"]
     )
-    race_distance_input = st.number_input("Race Distance (m)", min_value=800, max_value=4000, step=50, value=1600)
+    _upload_preview = _uploaded_file_preview(up)
+    _csv_distance = _first_present_value(_upload_preview, ["Distance", "Race Distance", "Distance (m)"], 1600)
+    try:
+        _distance_default = int(round(float(_csv_distance)))
+    except Exception:
+        _distance_default = 1600
+    _distance_default = int(np.clip(_distance_default, 800, 4000))
+    race_distance_input = st.number_input(
+        "Race Distance (m)", min_value=800, max_value=4000, step=50,
+        value=_distance_default,
+        help="Auto-filled from the CSV when a Distance column is present; otherwise enter it manually.",
+    )
 
     with st.expander("Advanced settings", expanded=False):
         USE_CG = st.toggle("Use Corrected Grind (CG)", value=True, help="Adjust Grind when the field finish collapses; preserves finisher credit.")
@@ -1064,11 +1166,14 @@ with st.sidebar:
             value=True,
             help="Adjust PI weighting based on track going (Firm/Good/Soft/Heavy)"
         )
+        _csv_going = _first_present_value(_upload_preview, ["Going", "Track Going", "Condition"], "Good")
+        _going_default = _normalise_going_for_pi(_csv_going)
+        _going_options = ["Good", "Firm", "Soft", "Heavy"]
         GOING_TYPE = st.selectbox(
             "Track Going",
-            options=["Good", "Firm", "Soft", "Heavy"],
-            index=0,
-            help="Only affects PI weights; the underlying sectional indices stay unchanged"
+            options=_going_options,
+            index=_going_options.index(_going_default),
+            help="Auto-filled from the CSV when Going is present. Only affects PI weights; sectional indices stay unchanged."
         ) if USE_GOING_ADJUST else "Good"
         WIND_AFFECTED = st.toggle("Wind affected race?", value=False, help="Purely informational (disclaimer only).")
         WIND_TAG = st.selectbox(
@@ -4578,7 +4683,7 @@ if _view_is("Horse Database"):
             st.warning("Supabase is not configured in Streamlit Secrets.")
         else:
             db_plane, db_profile = build_database_plane(metrics, RPSS_INFO)
-            handicap_df = build_database_handicap(metrics, race_distance_input)
+            handicap_df = build_database_handicap(metrics, race_distance_input, work)
             phase_notes_df = build_database_phase_notes(metrics)
 
             if db_plane.empty:
@@ -4587,27 +4692,55 @@ if _view_is("Horse Database"):
                 st.info("Horse, PI and weight data are required before ratings can be calculated.")
             else:
                 st.markdown("### Race Details")
+                _race_meta_source = work if isinstance(work, pd.DataFrame) else metrics
+                _csv_date_raw = _first_present_value(_race_meta_source, ["Race Date", "Date", "Race_Date"])
+                _csv_date = _parse_race_date_value(_csv_date_raw, datetime.now().date())
+                _csv_track = str(_first_present_value(_race_meta_source, ["Track", "Racecourse", "Venue"], "Greyville")).strip().title()
+                _csv_course = str(_first_present_value(_race_meta_source, ["Course"], "Turf")).strip().title()
+                _csv_race_number = _first_present_value(_race_meta_source, ["Race Number", "Race_Number", "Race"], 1)
+                try:
+                    _csv_race_number = int(float(_csv_race_number))
+                except Exception:
+                    _csv_race_number = 1
+
+                _track_options = ["Greyville", "Scottsville", "Turffontein", "Vaal", "Fairview", "Kenilworth", "Durbanville"]
+                _course_options = ["Poly", "Turf", "Inside", "Standside", "Main", "Classic"]
+                if _csv_track and _csv_track not in _track_options:
+                    _track_options = [_csv_track] + _track_options
+                if _csv_course and _csv_course not in _course_options:
+                    _course_options = [_csv_course] + _course_options
+
                 d1, d2, d3, d4 = st.columns(4)
                 with d1:
-                    db_race_date = st.date_input("Race Date", value=datetime.now().date(), key="db_race_date")
+                    db_race_date = st.date_input(
+                        "Race Date", value=_csv_date,
+                        key=f"db_race_date_{_csv_date.isoformat()}_{int(race_distance_input)}",
+                    )
                 with d2:
                     db_track = st.selectbox(
-                        "Track",
-                        ["Greyville", "Scottsville", "Turffontein", "Vaal", "Fairview", "Kenilworth", "Durbanville"],
-                        index=0,
-                        key="db_track",
+                        "Track", _track_options,
+                        index=_track_options.index(_csv_track) if _csv_track in _track_options else 0,
+                        key=f"db_track_{canon_horse(_csv_track)}_{int(race_distance_input)}",
                     )
                 with d3:
                     db_course = st.selectbox(
-                        "Course",
-                        ["Poly", "Turf", "Inside", "Standside", "Main", "Classic"],
-                        index=1,
-                        key="db_course",
+                        "Course", _course_options,
+                        index=_course_options.index(_csv_course) if _csv_course in _course_options else 0,
+                        key=f"db_course_{canon_horse(_csv_course)}_{int(race_distance_input)}",
                     )
                 with d4:
                     db_race_number = st.number_input(
-                        "Race Number", min_value=1, max_value=20, value=1, step=1, key="db_race_number"
+                        "Race Number", min_value=1, max_value=20, value=int(np.clip(_csv_race_number, 1, 20)), step=1,
+                        key=f"db_race_number_{_csv_date.isoformat()}_{canon_horse(_csv_track)}",
                     )
+
+                _autofilled = []
+                if _csv_date_raw is not None: _autofilled.append("date")
+                if _first_present_value(_race_meta_source, ["Track", "Racecourse", "Venue"]) is not None: _autofilled.append("track")
+                if _first_present_value(_race_meta_source, ["Course"]) is not None: _autofilled.append("course")
+                if _first_present_value(_race_meta_source, ["Race Number", "Race_Number", "Race"]) is not None: _autofilled.append("race number")
+                if _autofilled:
+                    st.caption("Auto-filled from CSV: " + ", ".join(_autofilled) + ". All fields remain editable.")
 
                 rd1, rd2, rd3 = st.columns(3)
                 with rd1:
@@ -4631,11 +4764,21 @@ if _view_is("Horse Database"):
                     "and calculates every MR automatically. **1 lb = 0.5 kg** and **1 kg = 2 MR points**."
                 )
 
+                _horse_meta = _horse_metadata_frame(work)
                 age_input = handicap_df[["Horse"]].copy()
-                age_input["Age"] = pd.Series([pd.NA] * len(age_input), dtype="Int64")
+                age_input["Horse Key"] = age_input["Horse"].map(canon_horse)
+                if not _horse_meta.empty:
+                    age_input = age_input.merge(
+                        _horse_meta[["Horse Key", "Age"]].drop_duplicates("Horse Key"),
+                        on="Horse Key", how="left",
+                    )
+                else:
+                    age_input["Age"] = pd.NA
+                age_input["Age"] = pd.to_numeric(age_input["Age"], errors="coerce").astype("Int64")
+                age_input = age_input[["Horse", "Age"]]
                 age_editor_key = (
                     f"db_age_editor_{int(db_race_number)}_{db_race_date.isoformat()}_"
-                    f"{int(race_distance_input)}"
+                    f"{int(race_distance_input)}_{int(age_input['Age'].notna().sum())}"
                 )
                 edited_ages = st.data_editor(
                     age_input,
@@ -4655,11 +4798,23 @@ if _view_is("Horse Database"):
                 line_options = handicap_df["Horse"].astype(str).tolist()
                 h1, h2 = st.columns(2)
                 with h1:
-                    line_horse = st.selectbox("Line Horse", line_options, key="db_line_horse")
+                    line_horse = st.selectbox(
+                        "Line Horse", line_options,
+                        key=f"db_line_horse_{db_race_date.isoformat()}_{int(db_race_number)}",
+                    )
+                _official_mr_lookup = {}
+                if not _horse_meta.empty:
+                    for _, _r in _horse_meta.drop_duplicates("Horse Key").iterrows():
+                        _mr = _db_num(_r.get("Official MR"))
+                        if _mr is not None:
+                            _official_mr_lookup[str(_r.get("Horse Key"))] = _db_round_mr(_mr)
+                _line_mr_default = _official_mr_lookup.get(canon_horse(line_horse), 100)
                 with h2:
                     line_mr = st.number_input(
                         "Line Horse MR Achieved", min_value=0, max_value=200,
-                        value=100, step=1, key="db_line_mr"
+                        value=int(_line_mr_default), step=1,
+                        key=f"db_line_mr_{db_race_date.isoformat()}_{int(db_race_number)}_{canon_horse(line_horse)}",
+                        help="Auto-filled from Official MR when available; otherwise enter the line rating manually.",
                     )
 
                 if missing_age_horses:
@@ -4726,8 +4881,10 @@ if _view_is("Horse Database"):
                     # Store finishing position together with field size, e.g. 1/11.
                     field_size = int(len(save_df))
                     finish_lookup = pd.DataFrame({"Horse": save_df["Horse"].astype(str)})
-                    if "Finish_Pos" in metrics.columns:
-                        finish_lookup = metrics[["Horse", "Finish_Pos"]].copy()
+                    _finish_source = metrics if "Finish_Pos" in metrics.columns else work
+                    _finish_col = next((c for c in ["Finish_Pos", "Finish Position", "Fin", "Position"] if c in _finish_source.columns), None)
+                    if _finish_col is not None:
+                        finish_lookup = _finish_source[["Horse", _finish_col]].copy().rename(columns={_finish_col: "Finish_Pos"})
                         finish_lookup["Horse"] = finish_lookup["Horse"].astype(str)
                         finish_lookup["Finish_Pos"] = pd.to_numeric(
                             finish_lookup["Finish_Pos"], errors="coerce"
