@@ -334,6 +334,15 @@ def _db_num(value):
         return None
 
 
+def _db_round_mr(value):
+    """Round a calculated MR to the nearest whole number for database storage."""
+    value = _db_num(value)
+    if value is None:
+        return None
+    # Merit ratings are non-negative; this gives conventional .5-up rounding.
+    return int(math.floor(value + 0.5))
+
+
 def database_sustain_verdict(value) -> str:
     value = _db_num(value)
     if value is None:
@@ -4798,7 +4807,7 @@ if _view_is("Horse Database"):
                                 "distance": int(race_distance_input),
                                 "rpss": rpss_value,
                                 "race_test": race_test_label,
-                                "mr_achieved": _db_num(row.get("MR Achieved")),
+                                "mr_achieved": _db_round_mr(row.get("MR Achieved")),
                                 "sustain_residual": _db_num(row.get("Sustain Residual")),
                                 "sustain_verdict": str(row.get("Sustain Verdict", "")),
                                 "analyst_note": note,
