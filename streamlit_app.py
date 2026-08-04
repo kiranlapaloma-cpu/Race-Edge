@@ -224,6 +224,84 @@ def canon_horse(name: str) -> str:
     return s
 
 
+# ----------------------- South African WFA scale -----------------------
+# Official chart values are in pounds. Race Edge intentionally uses the
+# simplified conversion requested by the analyst: 1 lb = 0.5 kg. Since
+# 1 kg = 2 MR points, 1 lb of WFA is therefore exactly 1 MR point.
+_WFA_MONTHS = [
+    "August", "September", "October", "November", "December", "January",
+    "February", "March", "April", "May", "June", "July",
+]
+
+_WFA_LB = {
+    "LE1200": {
+        2: [0, 0, 0, 0, 0, 0, 0, 0, 21, 19, 17, 15],
+        3: [14, 13, 11, 10, 8, 7, 6, 5, 4, 3, 2, 1],
+        4: [0] * 12,
+    },
+    "1201_1400": {
+        2: [0, 0, 0, 0, 0, 0, 0, 0, 24, 22, 20, 18],
+        3: [17, 16, 14, 12, 10, 9, 7, 6, 5, 4, 3, 2],
+        4: [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    },
+    "1401_1600": {
+        2: [0, 0, 0, 0, 0, 0, 0, 0, 25, 23, 21, 19],
+        3: [18, 17, 16, 14, 12, 10, 8, 6, 5, 4, 3, 2],
+        4: [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    },
+    "1601_2000": {
+        2: [0, 0, 0, 0, 0, 0, 0, 0, 27, 25, 23, 21],
+        3: [20, 19, 18, 16, 14, 12, 10, 9, 7, 5, 4, 3],
+        4: [2, 2, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+    },
+    "2001_2400": {
+        2: [0] * 12,
+        3: [21, 20, 19, 17, 16, 14, 12, 10, 9, 7, 6, 4],
+        4: [3, 3, 3, 2, 2, 2, 1, 1, 1, 0, 0, 0],
+    },
+    "2401_3600": {
+        2: [0] * 12,
+        3: [23, 22, 21, 19, 18, 16, 14, 12, 11, 9, 8, 7],
+        4: [4, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1],
+    },
+}
+
+_WFA_BAND_LABELS = {
+    "LE1200": "≤1200 m",
+    "1201_1400": "1201–1400 m",
+    "1401_1600": "1401–1600 m",
+    "1601_2000": "1601–2000 m",
+    "2001_2400": "2001–2400 m",
+    "2401_3600": "2401–3600 m",
+}
+
+def wfa_distance_band(distance_m: float) -> str:
+    d = float(distance_m)
+    if d <= 1200:
+        return "LE1200"
+    if d <= 1400:
+        return "1201_1400"
+    if d <= 1600:
+        return "1401_1600"
+    if d <= 2000:
+        return "1601_2000"
+    if d <= 2400:
+        return "2001_2400"
+    if d <= 3600:
+        return "2401_3600"
+    raise ValueError("The built-in WFA chart only covers races up to 3600 m.")
+
+def get_wfa_lb(race_date, distance_m: float, age: int) -> float:
+    band = wfa_distance_band(distance_m)
+    month_name = race_date.strftime("%B")
+    month_idx = _WFA_MONTHS.index(month_name)
+    age = int(age)
+    if age >= 5:
+        return 0.0
+    if age not in (2, 3, 4):
+        raise ValueError(f"Unsupported horse age: {age}")
+    return float(_WFA_LB[band][age][month_idx])
+
 # ----------------------- Supabase Horse Database -----------------------
 def _supabase_configured() -> bool:
     try:
@@ -4479,7 +4557,7 @@ if _view_is("Advanced Models"):
 # ======================= Horse Database (Supabase) =======================
 if _view_is("Horse Database"):
     st.title("Horse Database")
-    st.caption("Calculate editable ratings, save the current race, and search every recorded run for a horse.")
+    st.caption("Calculate automatic WFA-adjusted ratings, save the current race, and search every recorded run for a horse.")
 
     add_tab, search_tab = st.tabs(["Add Current Race", "Search Horse"])
 
@@ -4534,11 +4612,33 @@ if _view_is("Horse Database"):
                 with rd3:
                     st.text_input("Race Test", value=race_test_label, disabled=True, key="db_race_test")
 
-                st.markdown("### Ahead of the Handicap")
+                st.markdown("### Ahead of the Handicap — WFA Adjusted")
                 st.caption(
-                    "Select a line horse and assign its achieved MR. Relative PI performance is converted to MR, "
-                    "then carried weight is adjusted at **1 kg = 2 MR points**."
+                    "Enter each horse's age, select the line horse and assign its achieved MR. "
+                    "Race Edge reads the race month and distance, applies the South African WFA scale, "
+                    "and calculates every MR automatically. **1 lb = 0.5 kg** and **1 kg = 2 MR points**."
                 )
+
+                age_input = handicap_df[["Horse"]].copy()
+                age_input["Age"] = pd.Series([pd.NA] * len(age_input), dtype="Int64")
+                age_editor_key = (
+                    f"db_age_editor_{int(db_race_number)}_{db_race_date.isoformat()}_"
+                    f"{int(race_distance_input)}"
+                )
+                edited_ages = st.data_editor(
+                    age_input,
+                    width="stretch",
+                    hide_index=True,
+                    disabled=["Horse"],
+                    column_config={
+                        "Age": st.column_config.NumberColumn(
+                            "Age", min_value=2, max_value=15, step=1, required=True
+                        ),
+                    },
+                    key=age_editor_key,
+                )
+                edited_ages["Age"] = pd.to_numeric(edited_ages["Age"], errors="coerce")
+                missing_age_horses = edited_ages.loc[edited_ages["Age"].isna(), "Horse"].astype(str).tolist()
 
                 line_options = handicap_df["Horse"].astype(str).tolist()
                 h1, h2 = st.columns(2)
@@ -4550,89 +4650,128 @@ if _view_is("Horse Database"):
                         value=100.0, step=1.0, key="db_line_mr"
                     )
 
-                line_row = handicap_df.loc[handicap_df["Horse"].astype(str) == str(line_horse)].iloc[0]
-                line_perf_mr = float(line_row["Performance MR"])
-                line_weight = float(line_row["Weight (kg)"])
-
-                rating_df = handicap_df.copy()
-                rating_df["Performance Difference"] = rating_df["Performance MR"] - line_perf_mr
-                rating_df["Weight Adjustment"] = 2.0 * (rating_df["Weight (kg)"] - line_weight)
-                rating_df["Calculated MR"] = (
-                    float(line_mr)
-                    + rating_df["Performance Difference"]
-                    + rating_df["Weight Adjustment"]
-                )
-
-                rating_display = rating_df[[
-                    "Horse", "Weight (kg)", "PI", "Performance Difference",
-                    "Weight Adjustment", "Calculated MR",
-                ]].copy()
-                for col in ["Weight (kg)", "PI", "Performance Difference", "Weight Adjustment", "Calculated MR"]:
-                    rating_display[col] = pd.to_numeric(rating_display[col], errors="coerce").round(2)
-                st.dataframe(rating_display, width="stretch", hide_index=True)
-
-                save_df = db_plane[["Horse", "Sustain_Residual", "Sustain_Verdict"]].copy()
-
-                # Store finishing position together with field size, e.g. 1/11.
-                field_size = int(len(save_df))
-                finish_lookup = pd.DataFrame({"Horse": save_df["Horse"].astype(str)})
-                if "Finish_Pos" in metrics.columns:
-                    finish_lookup = metrics[["Horse", "Finish_Pos"]].copy()
-                    finish_lookup["Horse"] = finish_lookup["Horse"].astype(str)
-                    finish_lookup["Finish_Pos"] = pd.to_numeric(
-                        finish_lookup["Finish_Pos"], errors="coerce"
-                    ).astype("Int64")
-                    finish_lookup["Finish Position"] = finish_lookup["Finish_Pos"].map(
-                        lambda p: f"{int(p)}/{field_size}" if pd.notna(p) else f"—/{field_size}"
-                    )
-                    finish_lookup = finish_lookup[["Horse", "Finish Position"]]
+                if missing_age_horses:
+                    preview = ", ".join(missing_age_horses[:5])
+                    more = "…" if len(missing_age_horses) > 5 else ""
+                    st.warning(f"Enter an age for every horse before ratings can be calculated: {preview}{more}")
+                    rating_df = pd.DataFrame()
                 else:
-                    finish_lookup["Finish Position"] = f"—/{field_size}"
+                    rating_df = handicap_df.merge(edited_ages, on="Horse", how="left")
+                    rating_df["Age"] = rating_df["Age"].astype(int)
+                    rating_df["WFA (lb)"] = rating_df["Age"].map(
+                        lambda age: get_wfa_lb(db_race_date, race_distance_input, int(age))
+                    )
+                    rating_df["WFA (kg)"] = rating_df["WFA (lb)"] * 0.5
+                    rating_df["Effective Weight"] = rating_df["Weight (kg)"] + rating_df["WFA (kg)"]
 
-                save_df = save_df.merge(finish_lookup, on="Horse", how="left")
-                save_df = save_df.merge(
-                    rating_df[["Horse", "Weight (kg)", "Calculated MR"]],
-                    on="Horse",
-                    how="left",
-                )
-                save_df["MR Achieved"] = save_df["Calculated MR"]
-                save_df = save_df.merge(phase_notes_df, on="Horse", how="left")
-                save_df["Analyst Note"] = save_df["Phase Note"].fillna(
-                    "F — | T — | A — | CG —"
-                ) + "\n\nNotes:\n"
-                save_df = save_df[[
-                    "Horse", "Finish Position", "Weight (kg)", "Calculated MR", "MR Achieved",
-                    "Sustain_Residual", "Sustain_Verdict", "Analyst Note",
-                ]].rename(columns={
-                    "Sustain_Residual": "Sustain Residual",
-                    "Sustain_Verdict": "Sustain Verdict",
-                })
+                    line_row = rating_df.loc[
+                        rating_df["Horse"].astype(str) == str(line_horse)
+                    ].iloc[0]
+                    line_perf_mr = float(line_row["Performance MR"])
+                    line_effective_weight = float(line_row["Effective Weight"])
 
-                editor_key = (
-                    f"supabase_race_editor_{canon_horse(line_horse)}_"
-                    f"{float(line_mr):.1f}_{int(db_race_number)}"
-                )
-                edited_db = st.data_editor(
-                    save_df,
-                    width="stretch",
-                    hide_index=True,
-                    disabled=[
-                        "Horse", "Finish Position", "Weight (kg)", "Calculated MR",
-                        "Sustain Residual", "Sustain Verdict",
-                    ],
-                    column_config={
-                        "Weight (kg)": st.column_config.NumberColumn("Weight (kg)", format="%.1f"),
-                        "Calculated MR": st.column_config.NumberColumn("Calculated MR", format="%.1f"),
-                        "MR Achieved": st.column_config.NumberColumn(
-                            "MR Achieved (editable)", step=1.0, format="%.1f"
-                        ),
-                        "Sustain Residual": st.column_config.NumberColumn("Sustain Residual", format="%+.2f"),
-                        "Analyst Note": st.column_config.TextColumn("Analyst Note", width="large"),
-                    },
-                    key=editor_key,
-                )
+                    rating_df["Performance Difference"] = rating_df["Performance MR"] - line_perf_mr
+                    rating_df["Weight + WFA Adjustment"] = 2.0 * (
+                        rating_df["Effective Weight"] - line_effective_weight
+                    )
+                    rating_df["MR Achieved"] = (
+                        float(line_mr)
+                        + rating_df["Performance Difference"]
+                        + rating_df["Weight + WFA Adjustment"]
+                    )
 
-                if st.button("Save / Update Race in Database", type="primary", key="save_supabase_race"):
+                    band = wfa_distance_band(race_distance_input)
+                    st.info(
+                        f"WFA scale applied: **{db_race_date.strftime('%B')} · "
+                        f"{_WFA_BAND_LABELS[band]}**. "
+                        f"Line horse: **{line_horse}**, age **{int(line_row['Age'])}**, "
+                        f"WFA **{line_row['WFA (lb)']:.0f} lb**."
+                    )
+
+                    rating_display = rating_df[[
+                        "Horse", "Age", "Weight (kg)", "WFA (lb)", "WFA (kg)",
+                        "Effective Weight", "PI", "Performance Difference",
+                        "Weight + WFA Adjustment", "MR Achieved",
+                    ]].copy()
+                    for col in [
+                        "Weight (kg)", "WFA (lb)", "WFA (kg)", "Effective Weight",
+                        "PI", "Performance Difference", "Weight + WFA Adjustment", "MR Achieved",
+                    ]:
+                        rating_display[col] = pd.to_numeric(rating_display[col], errors="coerce").round(2)
+                    st.dataframe(rating_display, width="stretch", hide_index=True)
+
+                if rating_df.empty:
+                    st.info("Complete the horse ages to unlock the database save table.")
+                else:
+                    save_df = db_plane[["Horse", "Sustain_Residual", "Sustain_Verdict"]].copy()
+
+                    # Store finishing position together with field size, e.g. 1/11.
+                    field_size = int(len(save_df))
+                    finish_lookup = pd.DataFrame({"Horse": save_df["Horse"].astype(str)})
+                    if "Finish_Pos" in metrics.columns:
+                        finish_lookup = metrics[["Horse", "Finish_Pos"]].copy()
+                        finish_lookup["Horse"] = finish_lookup["Horse"].astype(str)
+                        finish_lookup["Finish_Pos"] = pd.to_numeric(
+                            finish_lookup["Finish_Pos"], errors="coerce"
+                        ).astype("Int64")
+                        finish_lookup["Finish Position"] = finish_lookup["Finish_Pos"].map(
+                            lambda p: f"{int(p)}/{field_size}" if pd.notna(p) else f"—/{field_size}"
+                        )
+                        finish_lookup = finish_lookup[["Horse", "Finish Position"]]
+                    else:
+                        finish_lookup["Finish Position"] = f"—/{field_size}"
+
+                    save_df = save_df.merge(finish_lookup, on="Horse", how="left")
+                    save_df = save_df.merge(
+                        rating_df[[
+                            "Horse", "Age", "Weight (kg)", "WFA (lb)",
+                            "Effective Weight", "MR Achieved"
+                        ]],
+                        on="Horse",
+                        how="left",
+                    )
+                    save_df = save_df.merge(phase_notes_df, on="Horse", how="left")
+                    save_df["Analyst Note"] = save_df["Phase Note"].fillna(
+                        "F — | T — | A — | CG —"
+                    ) + "\n\nNotes:\n"
+                    save_df = save_df[[
+                        "Horse", "Finish Position", "Age", "Weight (kg)", "WFA (lb)",
+                        "Effective Weight", "MR Achieved", "Sustain_Residual",
+                        "Sustain_Verdict", "Analyst Note",
+                    ]].rename(columns={
+                        "Sustain_Residual": "Sustain Residual",
+                        "Sustain_Verdict": "Sustain Verdict",
+                    })
+
+                    editor_key = (
+                        f"supabase_race_editor_{canon_horse(line_horse)}_"
+                        f"{float(line_mr):.1f}_{int(db_race_number)}_wfa"
+                    )
+                    edited_db = st.data_editor(
+                        save_df,
+                        width="stretch",
+                        hide_index=True,
+                        disabled=[
+                            "Horse", "Finish Position", "Age", "Weight (kg)", "WFA (lb)",
+                            "Effective Weight", "MR Achieved", "Sustain Residual", "Sustain Verdict",
+                        ],
+                        column_config={
+                            "Age": st.column_config.NumberColumn("Age", format="%d"),
+                            "Weight (kg)": st.column_config.NumberColumn("Weight (kg)", format="%.1f"),
+                            "WFA (lb)": st.column_config.NumberColumn("WFA (lb)", format="%.0f"),
+                            "Effective Weight": st.column_config.NumberColumn(
+                                "Effective Weight", format="%.1f"
+                            ),
+                            "MR Achieved": st.column_config.NumberColumn("MR Achieved", format="%.1f"),
+                            "Sustain Residual": st.column_config.NumberColumn(
+                                "Sustain Residual", format="%+.2f"
+                            ),
+                            "Analyst Note": st.column_config.TextColumn("Analyst Note", width="large"),
+                        },
+                        key=editor_key,
+                    )
+
+                if not rating_df.empty and st.button("Save / Update Race in Database", type="primary", key="save_supabase_race"):
                     errors = []
                     if not str(db_track).strip():
                         errors.append("enter the track")
