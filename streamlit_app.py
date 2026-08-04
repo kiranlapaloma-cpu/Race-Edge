@@ -382,7 +382,7 @@ def load_horse_history(horse: str) -> pd.DataFrame:
     client = get_supabase_client()
     columns = (
         "id,horse,finish_position,race_date,track,course,race_number,distance,"
-        "rpss,race_test,mr_achieved,sustain_residual,sustain_verdict,analyst_note"
+        "rpss,race_test,official_mr,mr_achieved,sustain_residual,sustain_verdict,analyst_note"
     )
 
     target = canon_horse(str(horse or ""))
@@ -584,6 +584,7 @@ def render_horse_search():
         return
 
     history["race_date"] = pd.to_datetime(history["race_date"], errors="coerce")
+    history["official_mr"] = pd.to_numeric(history.get("official_mr"), errors="coerce")
     history["mr_achieved"] = pd.to_numeric(history["mr_achieved"], errors="coerce")
     history["sustain_residual"] = pd.to_numeric(history["sustain_residual"], errors="coerce")
     history["rpss"] = pd.to_numeric(history.get("rpss"), errors="coerce")
@@ -611,6 +612,7 @@ def render_horse_search():
         "distance": "Distance",
         "rpss": "RPSS",
         "race_test": "Race Test",
+        "official_mr": "Official MR",
         "mr_achieved": "MR Achieved",
         "sustain_residual": "Sustain Residual",
         "sustain_verdict": "Sustain Verdict",
@@ -618,11 +620,14 @@ def render_horse_search():
     })
     display["Date"] = display["Date"].dt.strftime("%Y-%m-%d")
     display["Race"] = pd.to_numeric(display["Race"], errors="coerce").astype("Int64")
+    display["Official MR"] = pd.to_numeric(
+        display["Official MR"], errors="coerce"
+    ).round().astype("Int64")
     display["MR Achieved"] = pd.to_numeric(
         display["MR Achieved"], errors="coerce"
     ).round().astype("Int64")
     cols = [
-        "Date", "Track", "Course", "Race", "Distance", "Finish", "MR Achieved",
+        "Date", "Track", "Course", "Race", "Distance", "Finish", "Official MR", "MR Achieved",
         "RPSS", "Race Test", "Sustain Residual", "Sustain Verdict", "Analyst Note",
     ]
     st.dataframe(display[cols], width="stretch", hide_index=True)
@@ -4897,11 +4902,15 @@ if _view_is("Horse Database"):
                         finish_lookup["Finish Position"] = f"—/{field_size}"
 
                     save_df = save_df.merge(finish_lookup, on="Horse", how="left")
+                    rating_save = rating_df[[
+                        "Horse", "Age", "Weight (kg)", "WFA (lb)",
+                        "Effective Weight", "MR Achieved"
+                    ]].copy()
+                    rating_save["Official MR"] = rating_save["Horse"].map(
+                        lambda horse: _official_mr_lookup.get(canon_horse(horse))
+                    )
                     save_df = save_df.merge(
-                        rating_df[[
-                            "Horse", "Age", "Weight (kg)", "WFA (lb)",
-                            "Effective Weight", "MR Achieved"
-                        ]],
+                        rating_save,
                         on="Horse",
                         how="left",
                     )
@@ -4911,7 +4920,7 @@ if _view_is("Horse Database"):
                     ) + "\n\nNotes:\n"
                     save_df = save_df[[
                         "Horse", "Finish Position", "Age", "Weight (kg)", "WFA (lb)",
-                        "Effective Weight", "MR Achieved", "Sustain_Residual",
+                        "Effective Weight", "Official MR", "MR Achieved", "Sustain_Residual",
                         "Sustain_Verdict", "Analyst Note",
                     ]].rename(columns={
                         "Sustain_Residual": "Sustain Residual",
@@ -4928,7 +4937,7 @@ if _view_is("Horse Database"):
                         hide_index=True,
                         disabled=[
                             "Horse", "Finish Position", "Age", "Weight (kg)", "WFA (lb)",
-                            "Effective Weight", "MR Achieved", "Sustain Residual", "Sustain Verdict",
+                            "Effective Weight", "Official MR", "MR Achieved", "Sustain Residual", "Sustain Verdict",
                         ],
                         column_config={
                             "Age": st.column_config.NumberColumn("Age", format="%d"),
@@ -4937,6 +4946,7 @@ if _view_is("Horse Database"):
                             "Effective Weight": st.column_config.NumberColumn(
                                 "Effective Weight", format="%.1f"
                             ),
+                            "Official MR": st.column_config.NumberColumn("Official MR", format="%d"),
                             "MR Achieved": st.column_config.NumberColumn("MR Achieved", format="%d"),
                             "Sustain Residual": st.column_config.NumberColumn(
                                 "Sustain Residual", format="%+.2f"
@@ -4973,6 +4983,7 @@ if _view_is("Horse Database"):
                                 "distance": int(race_distance_input),
                                 "rpss": rpss_value,
                                 "race_test": race_test_label,
+                                "official_mr": _db_round_mr(row.get("Official MR")),
                                 "mr_achieved": _db_round_mr(row.get("MR Achieved")),
                                 "sustain_residual": _db_num(row.get("Sustain Residual")),
                                 "sustain_verdict": str(row.get("Sustain Verdict", "")),
