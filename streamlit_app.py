@@ -612,6 +612,9 @@ def render_horse_search():
     })
     display["Date"] = display["Date"].dt.strftime("%Y-%m-%d")
     display["Race"] = pd.to_numeric(display["Race"], errors="coerce").astype("Int64")
+    display["MR Achieved"] = pd.to_numeric(
+        display["MR Achieved"], errors="coerce"
+    ).round().astype("Int64")
     cols = [
         "Date", "Track", "Course", "Race", "Distance", "Finish", "MR Achieved",
         "RPSS", "Race Test", "Sustain Residual", "Sustain Verdict", "Analyst Note",
@@ -634,7 +637,7 @@ def render_horse_search():
             sr_value = _db_num(run.get("Sustain Residual"))
             rpss_value = _db_num(run.get("RPSS"))
             e1.metric("Finish", str(run.get("Finish") or "—"))
-            e2.metric("MR Achieved", "—" if mr_value is None else f"{mr_value:.1f}")
+            e2.metric("MR Achieved", "—" if mr_value is None else f"{_db_round_mr(mr_value)}")
             e3.metric("RPSS", "—" if rpss_value is None else f"{rpss_value:.2f}")
             st.metric("Sustain Residual", "—" if sr_value is None else f"{sr_value:+.2f}")
             st.markdown(f"**Race Test:** {run.get('Race Test') or '—'}")
@@ -4655,8 +4658,8 @@ if _view_is("Horse Database"):
                     line_horse = st.selectbox("Line Horse", line_options, key="db_line_horse")
                 with h2:
                     line_mr = st.number_input(
-                        "Line Horse MR Achieved", min_value=0.0, max_value=200.0,
-                        value=100.0, step=1.0, key="db_line_mr"
+                        "Line Horse MR Achieved", min_value=0, max_value=200,
+                        value=100, step=1, key="db_line_mr"
                     )
 
                 if missing_age_horses:
@@ -4683,11 +4686,14 @@ if _view_is("Horse Database"):
                     rating_df["Weight + WFA Adjustment"] = 2.0 * (
                         rating_df["Effective Weight"] - line_effective_weight
                     )
-                    rating_df["MR Achieved"] = (
+                    rating_df["MR Achieved Raw"] = (
                         float(line_mr)
                         + rating_df["Performance Difference"]
                         + rating_df["Weight + WFA Adjustment"]
                     )
+                    # Merit Ratings are whole numbers. Use conventional .5-up rounding
+                    # for both display and database storage.
+                    rating_df["MR Achieved"] = rating_df["MR Achieved Raw"].map(_db_round_mr).astype("Int64")
 
                     band = wfa_distance_band(race_distance_input)
                     st.info(
@@ -4704,9 +4710,12 @@ if _view_is("Horse Database"):
                     ]].copy()
                     for col in [
                         "Weight (kg)", "WFA (lb)", "WFA (kg)", "Effective Weight",
-                        "PI", "Performance Difference", "Weight + WFA Adjustment", "MR Achieved",
+                        "PI", "Performance Difference", "Weight + WFA Adjustment",
                     ]:
                         rating_display[col] = pd.to_numeric(rating_display[col], errors="coerce").round(2)
+                    rating_display["MR Achieved"] = pd.to_numeric(
+                        rating_display["MR Achieved"], errors="coerce"
+                    ).astype("Int64")
                     st.dataframe(rating_display, width="stretch", hide_index=True)
 
                 if rating_df.empty:
@@ -4771,7 +4780,7 @@ if _view_is("Horse Database"):
                             "Effective Weight": st.column_config.NumberColumn(
                                 "Effective Weight", format="%.1f"
                             ),
-                            "MR Achieved": st.column_config.NumberColumn("MR Achieved", format="%.1f"),
+                            "MR Achieved": st.column_config.NumberColumn("MR Achieved", format="%d"),
                             "Sustain Residual": st.column_config.NumberColumn(
                                 "Sustain Residual", format="%+.2f"
                             ),
