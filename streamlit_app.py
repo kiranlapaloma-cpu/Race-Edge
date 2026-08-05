@@ -1420,17 +1420,22 @@ def _adaptive_f_cols_and_dist(D, step, markers, frame_cols):
     return cols, float(dist)
 
 def _adaptive_tssp_start(D, step, markers):
-    """tsSPI start per your spec."""
+    """Return the first sectional marker after the opening block.
+
+    For odd-distance 200m races (for example 1160m), the markers are aligned to
+    the course rather than to ``distance - 200``.  Using arithmetic such as
+    1160 - 150 = 1010 creates column names that do not exist.  The actual next
+    marker in the uploaded file is therefore used.
+    """
     D = float(D); step = int(step)
     if step == 100:
         return int(D - (150 if int(D) % 100 == 50 else 300))
     if not markers:
         return int(D - 400)
-    first_span = D - int(markers[0])
-    if first_span <= 120:  return int(D - 100)
-    if first_span <= 180:  return int(D - 150)
-    if first_span <= 220:  return int(D - 400)
-    return int(D - 250)
+    ordered = sorted({int(m) for m in markers}, reverse=True)
+    if len(ordered) >= 2:
+        return ordered[1]
+    return ordered[0]
 
 # -------- Speed→Index mapping (robust to small fields) --------
 def _shrink_center(idx_series):
@@ -1659,10 +1664,13 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         w["SRI"] = np.nan
         w["SRI_Profile"] = "-"
 
-    # RaceTime = sum of segments (incl Finish)
+    # RaceTime = sum the actual sectional columns present (incl Finish).
+    # This is essential for odd trips such as 1160m, whose markers are commonly
+    # 1000, 800, 600, 400 and 200 rather than 960, 760, 560, etc.
     if seg_markers:
-        wanted = [f"{m}_Time" for m in range(int(D)-step, step-1, -step) if f"{m}_Time" in w.columns]
-        if "Finish_Time" in w.columns: wanted += ["Finish_Time"]
+        wanted = [f"{int(m)}_Time" for m in seg_markers if f"{int(m)}_Time" in w.columns]
+        if "Finish_Time" in w.columns:
+            wanted.append("Finish_Time")
         w["RaceTime_s"] = w[wanted].apply(pd.to_numeric, errors="coerce").clip(lower=0).replace(0,np.nan).sum(axis=1)
     else:
         w["RaceTime_s"] = pd.to_numeric(w.get("Race Time"), errors="coerce")
@@ -2191,13 +2199,21 @@ if RPSS_INFO:
     metrics.attrs["RPSS_RACE_AVG_SPLIT"] = RPSS_INFO.get("race_avg_split_time")
 
 # ======================= Data Integrity & Header (post compute) ==========================
-def _expected_segments(distance_m: float, step:int) -> list[str]:
-    cols = [f"{m}_Time" for m in range(int(distance_m)-step, step-1, -step)]
-    cols.append("Finish_Time")
+def _expected_segments(df: pd.DataFrame) -> list[str]:
+    """Return the real sectional columns supplied by the file.
+
+    Distance-derived names are unreliable for odd-distance 200m races such as
+    1160m, where the first panel can be 160m and the remaining markers stay on
+    the normal 200m grid.
+    """
+    marks = _collect_markers(df)
+    cols = [f"{int(m)}_Time" for m in marks if f"{int(m)}_Time" in df.columns]
+    if "Finish_Time" in df.columns:
+        cols.append("Finish_Time")
     return cols
 
 def _integrity_scan(df: pd.DataFrame, distance_m: float, step: int):
-    exp_cols = _expected_segments(distance_m, step)
+    exp_cols = _expected_segments(df)
     missing = [c for c in exp_cols if c not in df.columns]
     invalid_counts = {}
     for c in exp_cols:
