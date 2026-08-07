@@ -358,27 +358,41 @@ def database_sustain_verdict(value) -> str:
     return "Significant late underperformance"
 
 
-def load_saved_horses() -> list[str]:
+def _fetch_all_horse_rows(columns: str, order_col: str | None = None, desc: bool = False) -> list[dict]:
+    """Fetch every horse_runs row in pages so Supabase's per-request row cap
+    can never make the Horse Database search silently incomplete.
+    """
     client = get_supabase_client()
-    response = (
-        client.table("horse_runs")
-        .select("horse")
-        .order("horse")
-        .limit(10000)
-        .execute()
-    )
-    return sorted({str(row.get("horse", "")).strip() for row in (response.data or []) if row.get("horse")})
+    page_size = 1000
+    start = 0
+    rows: list[dict] = []
+    while True:
+        query = client.table("horse_runs").select(columns)
+        if order_col:
+            query = query.order(order_col, desc=desc)
+        response = query.range(start, start + page_size - 1).execute()
+        batch = response.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+    return rows
+
+
+def load_saved_horses() -> list[str]:
+    # Do not use .limit(10000) here: Supabase projects commonly impose a
+    # server-side 1,000-row maximum per response. Pagination guarantees that
+    # every saved horse remains searchable as the Race Edge database grows.
+    rows = _fetch_all_horse_rows("horse", order_col="horse")
+    return sorted({
+        str(row.get("horse", "")).strip()
+        for row in rows
+        if str(row.get("horse", "")).strip()
+    })
 
 
 def load_horse_history(horse: str) -> pd.DataFrame:
-    """Load all saved runs for a horse using a robust canonical match.
-
-    Supabase/PostgREST exact equality can fail when a stored name contains
-    hidden whitespace or punctuation differences. We therefore fetch the
-    lightweight horse-run rows and compare names in Python using the same
-    canonicalisation used by the search box. This reliably handles names such
-    as ``MISSION TO MARS (IRE)`` and ``MISSION TO MARS IRE``.
-    """
+    """Load every saved run for one horse without scanning a capped global set."""
     client = get_supabase_client()
     columns = (
         "id,horse,finish_position,race_date,track,course,race_number,distance,"
@@ -389,14 +403,21 @@ def load_horse_history(horse: str) -> pd.DataFrame:
     if not target:
         return pd.DataFrame()
 
+    # Records saved by this app are canonicalised before insert, so querying
+    # the canonical value directly is both faster and immune to the global
+    # Supabase row cap. Keep a paginated fallback for legacy/non-canonical rows.
     response = (
         client.table("horse_runs")
         .select(columns)
+        .eq("horse", target)
         .order("race_date", desc=True)
-        .limit(10000)
         .execute()
     )
-    rows = response.data or []
+    direct_rows = response.data or []
+    if direct_rows:
+        return pd.DataFrame(direct_rows)
+
+    rows = _fetch_all_horse_rows(columns, order_col="race_date", desc=True)
     matched = [
         row for row in rows
         if canon_horse(str(row.get("horse", ""))) == target
@@ -5016,6 +5037,11 @@ if _view_is("Horse Database"):
                         try:
                             count = save_horse_runs(records)
                             st.success(f"Saved or updated {count} horse runs in Supabase.")
+                            if count != len(edited_db):
+                                st.warning(
+                                    f"Database save contained {count} records from {len(edited_db)} rows in the save table. "
+                                    "Check for a blank horse name if those numbers differ."
+                                )
                         except Exception as exc:
                             st.error(f"Database save failed: {exc}")
 
