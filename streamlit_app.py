@@ -4897,9 +4897,28 @@ if _view_is("Horse Database"):
                 if rating_df.empty:
                     st.info("Complete the horse ages to unlock the database save table.")
                 else:
-                    save_df = db_plane[["Horse", "Sustain_Residual", "Sustain_Verdict"]].copy()
+                    # IMPORTANT: build the database save list from the full rated field,
+                    # not from db_plane. A horse can legitimately be missing one of
+                    # tsSPI / Accel / Grind and therefore have no Race Plane residual,
+                    # but it should still be preserved in the historical database.
+                    rating_save = rating_df[[
+                        "Horse", "Age", "Weight (kg)", "WFA (lb)",
+                        "Effective Weight", "MR Achieved"
+                    ]].copy()
+                    rating_save["Official MR"] = rating_save["Horse"].map(
+                        lambda horse: _official_mr_lookup.get(canon_horse(horse))
+                    )
+                    save_df = rating_save.copy()
 
-                    # Store finishing position together with field size, e.g. 1/11.
+                    # Merge Race Plane information where it exists. Missing values are
+                    # retained as NULL / Unavailable rather than dropping the horse.
+                    plane_save = db_plane[["Horse", "Sustain_Residual", "Sustain_Verdict"]].copy()
+                    save_df = save_df.merge(plane_save, on="Horse", how="left")
+                    save_df["Sustain_Verdict"] = save_df["Sustain_Verdict"].fillna("Unavailable")
+
+                    # Store finishing position together with the full rated field size,
+                    # e.g. 1/11. This keeps the denominator correct even when a runner
+                    # does not have enough phase data for the Race Plane calculation.
                     field_size = int(len(save_df))
                     finish_lookup = pd.DataFrame({"Horse": save_df["Horse"].astype(str)})
                     _finish_source = metrics if "Finish_Pos" in metrics.columns else work
@@ -4918,18 +4937,6 @@ if _view_is("Horse Database"):
                         finish_lookup["Finish Position"] = f"—/{field_size}"
 
                     save_df = save_df.merge(finish_lookup, on="Horse", how="left")
-                    rating_save = rating_df[[
-                        "Horse", "Age", "Weight (kg)", "WFA (lb)",
-                        "Effective Weight", "MR Achieved"
-                    ]].copy()
-                    rating_save["Official MR"] = rating_save["Horse"].map(
-                        lambda horse: _official_mr_lookup.get(canon_horse(horse))
-                    )
-                    save_df = save_df.merge(
-                        rating_save,
-                        on="Horse",
-                        how="left",
-                    )
                     save_df = save_df.merge(phase_notes_df, on="Horse", how="left")
                     save_df["Analyst Note"] = save_df["Phase Note"].fillna(
                         "F — | T — | A — | CG —"
