@@ -1185,20 +1185,23 @@ def render_race_card():
             st.dataframe(reserves[display_cols], width="stretch", hide_index=True)
 
     if _supabase_configured():
-        history_horses = active.loc[active["Race Edge Runs"].fillna(0) > 0, "Horse"].astype(str).tolist()
-        if history_horses:
-            st.markdown("### Compare Race Edge History")
-            selected = st.multiselect(
-                "Select 2–5 runners",
-                history_horses,
-                max_selections=5,
-                placeholder="Choose runners with saved Race Edge history...",
-                key="race_card_compare_horses",
+        history_horses = active.loc[
+            active["Race Edge Runs"].fillna(0) > 0,
+            "Horse"
+        ].astype(str).tolist()
+
+        if len(history_horses) >= 2:
+            st.markdown("### Race Edge History Comparison")
+            st.caption(
+                f"Automatically comparing all {len(history_horses)} active runners "
+                "with saved Race Edge history."
             )
-            if len(selected) >= 2:
-                _render_racecard_history_snapshot(selected)
-            elif selected:
-                st.caption("Select at least two runners to compare.")
+            _render_racecard_history_snapshot(history_horses)
+        elif len(history_horses) == 1:
+            st.markdown("### Race Edge History")
+            st.caption(
+                f"{history_horses[0]} is the only active runner with saved Race Edge history."
+            )
 
 
 def color_cycle(n):
