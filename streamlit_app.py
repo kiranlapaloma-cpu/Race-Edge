@@ -1173,8 +1173,8 @@ def render_race_card():
         st.caption(f"Race Edge database coverage: {with_history}/{len(active)} active runners have saved history.")
 
     display_cols = [
-        "No.", "Horse", "Draw", "Age", "Weight", "Official MR", "Horse Wgt", "Wgt Δ",
-        "Jockey", "Trainer", "Odds", "Open", "Days Since Run", "Race Edge Runs",
+        "No.", "Horse", "Draw", "Age", "Weight", "Official MR",
+        "Jockey", "Trainer", "Days Since Run", "Race Edge Runs",
     ]
 
     st.markdown("### Runners")
