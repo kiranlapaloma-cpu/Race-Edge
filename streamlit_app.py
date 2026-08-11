@@ -1,5 +1,5 @@
 # ======================= Batch 1 — Core + UI + I/O + DB bootstrap =======================
-import io, math, re, os, hashlib
+import io, math, re, os, hashlib, json
 from datetime import datetime, timezone
 
 import numpy as np
@@ -885,6 +885,322 @@ def render_horse_compare():
         })
         st.dataframe(head_rows, width="stretch", hide_index=True)
 
+
+# ----------------------- Race Card -----------------------
+def _racecard_official_mr(value):
+    """Race-card feeds use MR=0 for unrated horses. Display/store that as missing."""
+    try:
+        v = int(float(value))
+    except Exception:
+        return None
+    return None if v <= 0 else v
+
+
+def _racecard_int(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _racecard_float(value):
+    try:
+        if value is None or value == "":
+            return None
+        v = float(value)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _racecard_parse(raw_text: str) -> dict:
+    raw_text = str(raw_text or "").strip()
+    if not raw_text:
+        raise ValueError("Paste the race-card JSON first.")
+    payload = json.loads(raw_text)
+    if not isinstance(payload, dict):
+        raise ValueError("The race-card JSON must contain one race object.")
+    runners = payload.get("runners")
+    if not isinstance(runners, list):
+        raise ValueError("No runners array was found in this race-card JSON.")
+    return payload
+
+
+def _racecard_db_counts() -> dict[str, int]:
+    """Return canonical horse -> number of saved Race Edge runs."""
+    if not _supabase_configured():
+        return {}
+    rows = _fetch_all_horse_rows("horse", order_col="horse")
+    counts = {}
+    for row in rows:
+        key = canon_horse(str(row.get("horse", "")))
+        if key:
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) -> pd.DataFrame:
+    db_counts = db_counts or {}
+    rows = []
+    for runner in card.get("runners", []):
+        horse = str(runner.get("horseName") or "").strip()
+        if not horse:
+            continue
+
+        status = str(runner.get("status") or "").strip().upper()
+        is_reserve = status == "R" or str(runner.get("jockeyName") or "").strip().lower().startswith("reserve")
+        horse_weight = _racecard_int(runner.get("horseWeight"))
+        weight_delta = _racecard_int(runner.get("horseWeightDelta"))
+        official_mr = _racecard_official_mr(runner.get("MR"))
+        draw = _racecard_int(runner.get("draw"))
+        if is_reserve and (draw is None or draw <= 0):
+            draw = None
+
+        rows.append({
+            "No.": _racecard_int(runner.get("saddleNo")),
+            "Horse": horse,
+            "Draw": draw,
+            "Age": _racecard_int(runner.get("age")),
+            "Sex": str(runner.get("sex") or "").strip().upper(),
+            "Weight": _racecard_float(runner.get("weight")),
+            "Official MR": official_mr,
+            "Horse Wgt": horse_weight,
+            "Wgt Δ": weight_delta,
+            "Jockey": str(runner.get("jockeyName") or "").strip(),
+            "Trainer": str(runner.get("trainerName") or "").strip(),
+            "Odds": str(runner.get("odds") or "").strip(),
+            "Open": str(runner.get("openBet") or "").strip(),
+            "Equipment": str(runner.get("equipment") or "").strip(),
+            "Days Since Run": _racecard_int(runner.get("restDays")),
+            "Race Edge Runs": int(db_counts.get(canon_horse(horse), 0)),
+            "Status": "Reserve" if is_reserve else "Runner",
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    for c in ["No.", "Draw", "Age", "Official MR", "Horse Wgt", "Wgt Δ", "Days Since Run", "Race Edge Runs"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    df["Weight"] = pd.to_numeric(df["Weight"], errors="coerce")
+    return df.sort_values(["Status", "No."], ascending=[True, True], na_position="last").reset_index(drop=True)
+
+
+def _render_racecard_history_snapshot(selected_horses: list[str]):
+    """Compact comparison for runners selected directly from the race card."""
+    if len(selected_horses) < 2:
+        return
+    if not _supabase_configured():
+        st.info("Supabase is not configured, so saved Race Edge histories cannot be compared.")
+        return
+
+    summary_rows = []
+    run_rows = []
+    for horse in selected_horses:
+        try:
+            hist = load_horse_history(horse)
+        except Exception as exc:
+            st.warning(f"Could not load {horse}: {exc}")
+            continue
+
+        if hist.empty:
+            summary_rows.append({
+                "Horse": horse, "Saved Runs": 0, "Latest Official MR": np.nan,
+                "Avg MR Achieved": np.nan, "Best MR Achieved": np.nan,
+                "Avg MR +/-": np.nan, "Best MR +/-": np.nan,
+                "Avg Sustain": np.nan,
+            })
+            continue
+
+        h = hist.copy()
+        h["race_date"] = pd.to_datetime(h.get("race_date"), errors="coerce")
+        for c in ["official_mr", "mr_achieved", "sustain_residual", "rpss", "distance", "race_number"]:
+            h[c] = pd.to_numeric(h.get(c), errors="coerce")
+        h["MR +/-"] = h["mr_achieved"] - h["official_mr"]
+        h = h.sort_values(["race_date", "race_number"], ascending=[False, False], na_position="last")
+
+        official = h["official_mr"].dropna()
+        mr = h["mr_achieved"].dropna()
+        diff = h["MR +/-"].dropna()
+        sustain = h["sustain_residual"].dropna()
+
+        summary_rows.append({
+            "Horse": horse,
+            "Saved Runs": len(h),
+            "Latest Official MR": official.iloc[0] if not official.empty else np.nan,
+            "Avg MR Achieved": mr.mean() if not mr.empty else np.nan,
+            "Best MR Achieved": mr.max() if not mr.empty else np.nan,
+            "Avg MR +/-": diff.mean() if not diff.empty else np.nan,
+            "Best MR +/-": diff.max() if not diff.empty else np.nan,
+            "Avg Sustain": sustain.mean() if not sustain.empty else np.nan,
+        })
+
+        for _, row in h.head(5).iterrows():
+            run_rows.append({
+                "Horse": horse,
+                "Date": row.get("race_date"),
+                "Track": row.get("track"),
+                "Course": row.get("course"),
+                "Distance": row.get("distance"),
+                "Finish": row.get("finish_position"),
+                "Official MR": row.get("official_mr"),
+                "MR Achieved": row.get("mr_achieved"),
+                "MR +/-": row.get("MR +/-"),
+                "Sustain Residual": row.get("sustain_residual"),
+            })
+
+    if summary_rows:
+        st.markdown("### Selected Runner Comparison")
+        summary = pd.DataFrame(summary_rows)
+        for c in ["Latest Official MR", "Avg MR Achieved", "Best MR Achieved", "Avg MR +/-", "Best MR +/-", "Avg Sustain"]:
+            summary[c] = pd.to_numeric(summary[c], errors="coerce").round(2)
+        st.dataframe(summary, width="stretch", hide_index=True)
+
+    if run_rows:
+        st.markdown("#### Last 5 Saved Runs")
+        runs = pd.DataFrame(run_rows)
+        runs["Date"] = pd.to_datetime(runs["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        for c in ["Distance", "Official MR", "MR Achieved"]:
+            runs[c] = pd.to_numeric(runs[c], errors="coerce").round().astype("Int64")
+        for c in ["MR +/-", "Sustain Residual"]:
+            runs[c] = pd.to_numeric(runs[c], errors="coerce").round(2)
+        st.dataframe(runs, width="stretch", hide_index=True)
+
+
+def render_race_card():
+    st.title("Race Card")
+    st.caption(
+        "Paste a race-card JSON object to load the field before the race. "
+        "This module is independent of the sectional CSV analysis."
+    )
+
+    if "race_card_payload" not in st.session_state:
+        st.session_state["race_card_payload"] = None
+    if "race_card_input_version" not in st.session_state:
+        st.session_state["race_card_input_version"] = 0
+
+    raw = st.text_area(
+        "Race-card JSON",
+        height=220,
+        placeholder='Paste the JSON containing the race details and "runners" array...',
+        key=f"race_card_json_{st.session_state['race_card_input_version']}",
+    )
+
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        load_clicked = st.button("Load Race Card", type="primary", width="stretch")
+    with b2:
+        clear_clicked = st.button("Clear Race Card", width="stretch")
+
+    if clear_clicked:
+        st.session_state["race_card_payload"] = None
+        st.session_state["race_card_input_version"] += 1
+        st.rerun()
+
+    if load_clicked:
+        try:
+            st.session_state["race_card_payload"] = _racecard_parse(raw)
+            st.success("Race card loaded.")
+        except Exception as exc:
+            st.error(f"Could not load race card: {exc}")
+
+    card = st.session_state.get("race_card_payload")
+    if not card:
+        return
+
+    # Race header.
+    date_label = str(card.get("dateFormat") or card.get("date") or "—")
+    track = str(card.get("clubName") or "—")
+    race_no = _racecard_int(card.get("race"))
+    time_label = str(card.get("time") or "—")
+    distance = _racecard_int(card.get("distance"))
+    surface = str(card.get("surfaceDescr") or "—")
+    direction = str(card.get("direction") or "").strip()
+    name = str(card.get("name") or "").strip()
+    description = str(card.get("description") or "").strip()
+    stake = str(card.get("stake") or "").strip()
+    currency = str(card.get("currency") or "").strip()
+
+    st.markdown(f"### {track}")
+    st.markdown(
+        f"**{date_label} · Race {race_no if race_no is not None else '—'} · {time_label} · "
+        f"{distance if distance is not None else '—'}m · {surface}"
+        + (f" · {direction}" if direction else "")
+        + "**"
+    )
+    if name:
+        st.write(name)
+    if description:
+        st.caption(description)
+
+    active_count = sum(
+        1 for r in card.get("runners", [])
+        if str(r.get("status") or "").strip().upper() != "R"
+    )
+    reserve_count = sum(
+        1 for r in card.get("runners", [])
+        if str(r.get("status") or "").strip().upper() == "R"
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Runners", active_count)
+    m2.metric("Reserves", reserve_count)
+    m3.metric("Distance", "—" if distance is None else f"{distance}m")
+    m4.metric("Stake", "—" if not stake else f"{currency}{stake}")
+
+    db_counts = {}
+    db_error = None
+    if _supabase_configured():
+        try:
+            db_counts = _racecard_db_counts()
+        except Exception as exc:
+            db_error = str(exc)
+
+    field = _racecard_runner_frame(card, db_counts)
+    if field.empty:
+        st.warning("No valid runners were found in this race card.")
+        return
+
+    active = field[field["Status"] == "Runner"].copy()
+    reserves = field[field["Status"] == "Reserve"].copy()
+
+    if db_error:
+        st.warning(f"Race Edge database status could not be loaded: {db_error}")
+    elif _supabase_configured():
+        with_history = int((active["Race Edge Runs"].fillna(0) > 0).sum())
+        st.caption(f"Race Edge database coverage: {with_history}/{len(active)} active runners have saved history.")
+
+    display_cols = [
+        "No.", "Horse", "Draw", "Age", "Weight", "Official MR", "Horse Wgt", "Wgt Δ",
+        "Jockey", "Trainer", "Odds", "Open", "Days Since Run", "Race Edge Runs",
+    ]
+
+    st.markdown("### Runners")
+    st.dataframe(active[display_cols], width="stretch", hide_index=True)
+
+    if not reserves.empty:
+        with st.expander(f"Reserves ({len(reserves)})", expanded=False):
+            st.dataframe(reserves[display_cols], width="stretch", hide_index=True)
+
+    if _supabase_configured():
+        history_horses = active.loc[active["Race Edge Runs"].fillna(0) > 0, "Horse"].astype(str).tolist()
+        if history_horses:
+            st.markdown("### Compare Race Edge History")
+            selected = st.multiselect(
+                "Select 2–5 runners",
+                history_horses,
+                max_selections=5,
+                placeholder="Choose runners with saved Race Edge history...",
+                key="race_card_compare_horses",
+            )
+            if len(selected) >= 2:
+                _render_racecard_history_snapshot(selected)
+            elif selected:
+                st.caption("Select at least two runners to compare.")
+
+
 def color_cycle(n):
     base = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0','C1','C2','C3','C4','C5','C6','C7','C8','C9'])
     out, i = [], 0
@@ -1359,7 +1675,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Core Metrics", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Save Race to Database", "Horse Database"],
+        ["Core Metrics", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Race Card", "Save Race to Database", "Horse Database"],
         index=0,
     )
 
@@ -1413,7 +1729,9 @@ with st.sidebar:
 
 # ----------------------- Horse Database works without a race upload -------
 if not up:
-    if _view_is("Horse Database"):
+    if _view_is("Race Card"):
+        render_race_card()
+    elif _view_is("Horse Database"):
         st.title("Horse Database")
         st.caption("Research saved horse histories or compare multiple horses. No race file is required.")
         search_tab, compare_tab = st.tabs(["Horse Search", "Compare Horses"])
@@ -5252,6 +5570,9 @@ if _view_is("Save Race to Database"):
 
 
 # ======================= Horse Database (Supabase) =======================
+if _view_is("Race Card"):
+    render_race_card()
+
 if _view_is("Horse Database"):
     st.title("Horse Database")
     st.caption("Research saved horse histories or compare multiple horses. This module works without a race file loaded.")
