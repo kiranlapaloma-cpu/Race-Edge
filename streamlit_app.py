@@ -588,10 +588,20 @@ def render_rating_improvers():
     st.markdown("### Rating Improvers")
     st.caption(
         "Find horses whose Race Edge MR Achieved exceeded their Official MR. "
-        "The default threshold is +5 points."
+        "The default view is +5 points or better from the last 30 days."
     )
     if not _supabase_configured():
         st.warning("Supabase is not configured in Streamlit Secrets.")
+        return
+
+    try:
+        all_runs = load_rating_improver_runs()
+    except Exception as exc:
+        st.error(f"Could not load rating improvers: {exc}")
+        return
+
+    if all_runs.empty:
+        st.info("No saved runs currently contain both Official MR and MR Achieved.")
         return
 
     c1, c2 = st.columns([1, 2])
@@ -612,17 +622,46 @@ def render_rating_improvers():
             key="db_rating_improver_filter",
         ).strip()
 
-    try:
-        all_runs = load_rating_improver_runs()
-    except Exception as exc:
-        st.error(f"Could not load rating improvers: {exc}")
-        return
+    st.markdown("##### Time Period")
+    period = st.radio(
+        "Show qualifying performances from",
+        ["Last 7 days", "Last 30 days", "This month", "This season", "Custom"],
+        index=1,
+        horizontal=True,
+        key="db_rating_improver_period",
+        label_visibility="collapsed",
+    )
 
-    if all_runs.empty:
-        st.info("No saved runs currently contain both Official MR and MR Achieved.")
-        return
+    today = pd.Timestamp.now().normalize()
+    if period == "Last 7 days":
+        start_date, end_date = today - pd.Timedelta(days=6), today
+    elif period == "Last 30 days":
+        start_date, end_date = today - pd.Timedelta(days=29), today
+    elif period == "This month":
+        start_date, end_date = today.replace(day=1), today
+    elif period == "This season":
+        # South African racing season starts on 1 August.
+        season_year = today.year if today.month >= 8 else today.year - 1
+        start_date, end_date = pd.Timestamp(season_year, 8, 1), today
+    else:
+        default_start = today - pd.Timedelta(days=29)
+        custom = st.date_input(
+            "Custom date range",
+            value=(default_start.date(), today.date()),
+            max_value=today.date(),
+            key="db_rating_improver_custom_dates",
+        )
+        if isinstance(custom, (tuple, list)) and len(custom) == 2:
+            start_date, end_date = pd.Timestamp(custom[0]), pd.Timestamp(custom[1])
+        else:
+            st.info("Choose both a start date and an end date.")
+            return
 
-    qualifying = all_runs.loc[all_runs["MR Edge"] >= float(threshold)].copy()
+    qualifying = all_runs.loc[
+        (all_runs["MR Edge"] >= float(threshold))
+        & (all_runs["race_date"] >= start_date)
+        & (all_runs["race_date"] <= end_date + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1))
+    ].copy()
     if horse_filter:
         key = canon_horse(horse_filter)
         qualifying = qualifying.loc[
@@ -630,11 +669,11 @@ def render_rating_improvers():
         ].copy()
 
     if qualifying.empty:
-        st.info(f"No saved performances are currently +{int(threshold)} MR or better.")
+        st.info(f"No performances in the selected time period are +{int(threshold)} MR or better.")
         return
 
     qualifying = qualifying.sort_values(
-        ["MR Edge", "race_date", "race_number"],
+        ["race_date", "MR Edge", "race_number"],
         ascending=[False, False, False],
         na_position="last",
     ).reset_index(drop=True)
@@ -665,7 +704,9 @@ def render_rating_improvers():
         })
 
     summary = pd.DataFrame(summary_rows).sort_values(
-        ["Best Edge", "Qualifying Runs"], ascending=[False, False]
+        ["Latest Qualifying Date", "Best Edge", "Qualifying Runs"],
+        ascending=[False, False, False],
+        na_position="last",
     ).reset_index(drop=True)
     for c in ["Best Official MR", "Best MR Achieved", "Best Run Distance"]:
         summary[c] = pd.to_numeric(summary[c], errors="coerce").round().astype("Int64")
