@@ -189,7 +189,7 @@ st.set_page_config(
 )
 
 # ----------------------- Globals ---------------------------
-APP_VERSION = "3.4"
+APP_VERSION = "3.5"
 
 # ----------------------- Small helpers ---------------------
 def as_num(x):
@@ -435,6 +435,7 @@ def save_horse_runs(records: list[dict]) -> int:
         .execute()
     )
     load_saved_horses.clear() if hasattr(load_saved_horses, "clear") else None
+    load_rating_improver_runs.clear() if hasattr(load_rating_improver_runs, "clear") else None
     return len(records)
 
 
@@ -558,6 +559,216 @@ def build_database_handicap(metrics_df: pd.DataFrame, distance_m: float, source_
     out["Horse"] = out["Horse"].astype(str)
     return out[["Horse", "Weight (kg)", "PI", "Performance MR"]]
 
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_rating_improver_runs() -> pd.DataFrame:
+    """Load database runs that have both Official MR and MR Achieved available."""
+    columns = (
+        "id,horse,finish_position,race_date,track,course,race_number,distance,"
+        "rpss,race_test,official_mr,mr_achieved,sustain_residual,sustain_verdict,analyst_note"
+    )
+    rows = _fetch_all_horse_rows(columns, order_col="race_date", desc=True)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["official_mr"] = pd.to_numeric(df.get("official_mr"), errors="coerce")
+    df["mr_achieved"] = pd.to_numeric(df.get("mr_achieved"), errors="coerce")
+    df["race_date"] = pd.to_datetime(df.get("race_date"), errors="coerce")
+    df["race_number"] = pd.to_numeric(df.get("race_number"), errors="coerce")
+    df["distance"] = pd.to_numeric(df.get("distance"), errors="coerce")
+    df["sustain_residual"] = pd.to_numeric(df.get("sustain_residual"), errors="coerce")
+    df["rpss"] = pd.to_numeric(df.get("rpss"), errors="coerce")
+    df = df.dropna(subset=["horse", "official_mr", "mr_achieved"]).copy()
+    df["MR Edge"] = df["mr_achieved"] - df["official_mr"]
+    return df
+
+
+def render_rating_improvers():
+    st.markdown("### Rating Improvers")
+    st.caption(
+        "Find horses whose Race Edge MR Achieved exceeded their Official MR. "
+        "The default threshold is +5 points."
+    )
+    if not _supabase_configured():
+        st.warning("Supabase is not configured in Streamlit Secrets.")
+        return
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        threshold = st.number_input(
+            "Minimum MR improvement",
+            min_value=1,
+            max_value=50,
+            value=5,
+            step=1,
+            key="db_rating_improver_threshold",
+            help="MR Achieved minus Official MR. Example: Official 80 and Achieved 86 = +6.",
+        )
+    with c2:
+        horse_filter = st.text_input(
+            "Filter horses",
+            placeholder="Optional: type part of a horse name...",
+            key="db_rating_improver_filter",
+        ).strip()
+
+    try:
+        all_runs = load_rating_improver_runs()
+    except Exception as exc:
+        st.error(f"Could not load rating improvers: {exc}")
+        return
+
+    if all_runs.empty:
+        st.info("No saved runs currently contain both Official MR and MR Achieved.")
+        return
+
+    qualifying = all_runs.loc[all_runs["MR Edge"] >= float(threshold)].copy()
+    if horse_filter:
+        key = canon_horse(horse_filter)
+        qualifying = qualifying.loc[
+            qualifying["horse"].astype(str).map(canon_horse).str.contains(key, na=False)
+        ].copy()
+
+    if qualifying.empty:
+        st.info(f"No saved performances are currently +{int(threshold)} MR or better.")
+        return
+
+    qualifying = qualifying.sort_values(
+        ["MR Edge", "race_date", "race_number"],
+        ascending=[False, False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    # Horse-level watchlist: one row per horse, ranked by its strongest qualifying run.
+    summary_rows = []
+    for horse, group in qualifying.groupby("horse", sort=False):
+        group = group.sort_values(
+            ["MR Edge", "race_date", "race_number"],
+            ascending=[False, False, False],
+            na_position="last",
+        )
+        best = group.iloc[0]
+        latest = group.sort_values(
+            ["race_date", "race_number"],
+            ascending=[False, False],
+            na_position="last",
+        ).iloc[0]
+        summary_rows.append({
+            "Horse": str(horse),
+            "Best Edge": float(best["MR Edge"]),
+            "Qualifying Runs": int(len(group)),
+            "Best Official MR": best.get("official_mr"),
+            "Best MR Achieved": best.get("mr_achieved"),
+            "Best Run Date": best.get("race_date"),
+            "Best Run Distance": best.get("distance"),
+            "Latest Qualifying Date": latest.get("race_date"),
+        })
+
+    summary = pd.DataFrame(summary_rows).sort_values(
+        ["Best Edge", "Qualifying Runs"], ascending=[False, False]
+    ).reset_index(drop=True)
+    for c in ["Best Official MR", "Best MR Achieved", "Best Run Distance"]:
+        summary[c] = pd.to_numeric(summary[c], errors="coerce").round().astype("Int64")
+    summary["Best Edge"] = pd.to_numeric(summary["Best Edge"], errors="coerce").round().astype("Int64")
+    summary["Best Edge"] = summary["Best Edge"].map(lambda x: "—" if pd.isna(x) else f"+{int(x)}")
+    for c in ["Best Run Date", "Latest Qualifying Date"]:
+        summary[c] = pd.to_datetime(summary[c], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Horses Found", int(summary["Horse"].nunique()))
+    m2.metric("Qualifying Runs", int(len(qualifying)))
+    best_edge = float(pd.to_numeric(qualifying["MR Edge"], errors="coerce").max())
+    m3.metric("Largest Edge", f"+{_db_round_mr(best_edge)} MR")
+
+    st.markdown("#### Horses Ahead of the Handicap")
+    st.dataframe(summary, width="stretch", hide_index=True)
+
+    st.markdown("#### Qualifying Performances")
+    runs = qualifying.rename(columns={
+        "horse": "Horse",
+        "race_date": "Date",
+        "track": "Track",
+        "course": "Course",
+        "race_number": "Race",
+        "distance": "Distance",
+        "finish_position": "Finish",
+        "official_mr": "Official MR",
+        "mr_achieved": "MR Achieved",
+        "sustain_residual": "Sustain Residual",
+        "rpss": "RPSS",
+        "race_test": "Race Test",
+    }).copy()
+    runs["Date"] = pd.to_datetime(runs["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for c in ["Race", "Distance", "Official MR", "MR Achieved"]:
+        runs[c] = pd.to_numeric(runs[c], errors="coerce").round().astype("Int64")
+    runs["MR Edge"] = pd.to_numeric(runs["MR Edge"], errors="coerce").round().astype("Int64")
+    runs["MR Edge"] = runs["MR Edge"].map(lambda x: "—" if pd.isna(x) else f"+{int(x)}")
+    runs["Sustain Residual"] = pd.to_numeric(runs["Sustain Residual"], errors="coerce").round(2)
+    runs["RPSS"] = pd.to_numeric(runs["RPSS"], errors="coerce").round(2)
+    run_cols = [
+        "Horse", "Date", "Track", "Course", "Race", "Distance", "Finish",
+        "Official MR", "MR Achieved", "MR Edge", "RPSS", "Sustain Residual", "Race Test",
+    ]
+    st.dataframe(runs[run_cols], width="stretch", hide_index=True)
+
+    st.markdown("#### Open Horse History")
+    selected = st.selectbox(
+        "Select an improver",
+        options=summary["Horse"].tolist(),
+        index=None,
+        placeholder="Choose a horse to inspect every saved run...",
+        key="db_rating_improver_selected_horse",
+    )
+    if not selected:
+        return
+
+    try:
+        history = load_horse_history(selected)
+    except Exception as exc:
+        st.error(f"Could not load horse history: {exc}")
+        return
+    if history.empty:
+        st.info("No saved history was found for this horse.")
+        return
+
+    history = history.copy()
+    history["race_date"] = pd.to_datetime(history.get("race_date"), errors="coerce")
+    for c in ["official_mr", "mr_achieved", "race_number", "distance", "rpss", "sustain_residual"]:
+        history[c] = pd.to_numeric(history.get(c), errors="coerce")
+    history["MR Edge"] = history["mr_achieved"] - history["official_mr"]
+    history = history.sort_values(
+        ["race_date", "race_number"], ascending=[False, False], na_position="last"
+    ).reset_index(drop=True)
+
+    full = history.rename(columns={
+        "race_date": "Date",
+        "track": "Track",
+        "course": "Course",
+        "race_number": "Race",
+        "distance": "Distance",
+        "finish_position": "Finish",
+        "official_mr": "Official MR",
+        "mr_achieved": "MR Achieved",
+        "rpss": "RPSS",
+        "sustain_residual": "Sustain Residual",
+        "race_test": "Race Test",
+        "analyst_note": "Analyst Note",
+    })
+    full["Date"] = full["Date"].dt.strftime("%Y-%m-%d")
+    for c in ["Race", "Distance", "Official MR", "MR Achieved"]:
+        full[c] = pd.to_numeric(full[c], errors="coerce").round().astype("Int64")
+    full["MR Edge"] = pd.to_numeric(full["MR Edge"], errors="coerce").round().astype("Int64")
+    full["RPSS"] = pd.to_numeric(full["RPSS"], errors="coerce").round(2)
+    full["Sustain Residual"] = pd.to_numeric(full["Sustain Residual"], errors="coerce").round(2)
+    st.markdown(f"**{selected} — complete Race Edge history**")
+    st.dataframe(
+        full[[
+            "Date", "Track", "Course", "Race", "Distance", "Finish", "Official MR",
+            "MR Achieved", "MR Edge", "RPSS", "Sustain Residual", "Race Test", "Analyst Note",
+        ]],
+        width="stretch",
+        hide_index=True,
+    )
 
 def render_horse_search():
     st.markdown("### Search Horse")
@@ -1737,9 +1948,11 @@ if not up:
     elif _view_is("Horse Database"):
         st.title("Horse Database")
         st.caption("Research saved horse histories or compare multiple horses. No race file is required.")
-        search_tab, compare_tab = st.tabs(["Horse Search", "Compare Horses"])
+        search_tab, improver_tab, compare_tab = st.tabs(["Horse Search", "Rating Improvers", "Compare Horses"])
         with search_tab:
             render_horse_search()
+        with improver_tab:
+            render_rating_improvers()
         with compare_tab:
             render_horse_compare()
     elif _view_is("Save Race to Database"):
