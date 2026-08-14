@@ -189,7 +189,7 @@ st.set_page_config(
 )
 
 # ----------------------- Globals ---------------------------
-APP_VERSION = "3.6"
+APP_VERSION = "3.7"
 
 # ----------------------- Small helpers ---------------------
 def as_num(x):
@@ -1805,57 +1805,85 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Core Metrics", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Race Card", "Save Race to Database", "Horse Database"],
+        [
+            "Core Metrics",
+            "Pressure Retention",
+            "Pace Curve",
+            "Ability Radar",
+            "Race Plane Analysis",
+            "Advanced Models",
+            "Save Race to Database",
+            "Race Card",
+            "Horse Database",
+        ],
         index=0,
     )
 
-    st.markdown("#### Race Setup")
-    up = st.file_uploader(
-        "Upload CSV/XLSX with 100 m or 200 m splits",
-        type=["csv", "xlsx", "xls"]
-    )
-    _upload_preview = _uploaded_file_preview(up)
-    _csv_distance = _first_present_value(_upload_preview, ["Distance", "Race Distance", "Distance (m)"], 1600)
-    try:
-        _distance_default = int(round(float(_csv_distance)))
-    except Exception:
-        _distance_default = 1600
-    _distance_default = int(np.clip(_distance_default, 800, 4000))
-    race_distance_input = st.number_input(
-        "Race Distance (m)", min_value=800, max_value=4000, step=50,
-        value=_distance_default,
-        help="Auto-filled from the CSV when a Distance column is present; otherwise enter it manually.",
-    )
-
-    with st.expander("Advanced settings", expanded=False):
-        USE_CG = st.toggle("Use Corrected Grind (CG)", value=True, help="Adjust Grind when the field finish collapses; preserves finisher credit.")
-        DAMPEN_CG = st.toggle("Dampen Grind weight if collapsed", value=True, help="Shift a little weight Grind→Accel/tsSPI on collapse races.")
-        # Race-shape calculations remain enabled internally for advanced models,
-        # but their controls and summary outputs are intentionally hidden.
-        USE_RACE_SHAPE = True
-        USE_GOING_ADJUST = st.toggle(
-            "Use Going Adjustment",
-            value=True,
-            help="Adjust PI weighting based on track going (Firm/Good/Soft/Heavy)"
+    # Race Card and Horse Database are database/reference views and do not
+    # require a sectional file. Hide Race Setup entirely in those views.
+    if APP_VIEW not in ("Race Card", "Horse Database"):
+        st.markdown("#### Race Setup")
+        up = st.file_uploader(
+            "Upload CSV/XLSX with 100 m or 200 m splits",
+            type=["csv", "xlsx", "xls"]
         )
-        _csv_going = _first_present_value(_upload_preview, ["Going", "Track Going", "Condition"], "Good")
-        _going_default = _normalise_going_for_pi(_csv_going)
-        _going_options = ["Good", "Firm", "Soft", "Heavy"]
-        GOING_TYPE = st.selectbox(
-            "Track Going",
-            options=_going_options,
-            index=_going_options.index(_going_default),
-            help="Auto-filled from the CSV when Going is present. Only affects PI weights; sectional indices stay unchanged."
-        ) if USE_GOING_ADJUST else "Good"
-        WIND_AFFECTED = st.toggle("Wind affected race?", value=False, help="Purely informational (disclaimer only).")
-        WIND_TAG = st.selectbox(
-            "Wind note",
-            options=["Headwind", "Tailwind", "Crosswind", "Negligible"],
-            index=0,
-            disabled=not WIND_AFFECTED,
-        ) if WIND_AFFECTED else "None"
-        SHOW_WARNINGS = st.toggle("Show data warnings", value=True)
-        DEBUG = st.toggle("Debug info", value=False)
+        _upload_preview = _uploaded_file_preview(up)
+        _csv_distance = _first_present_value(_upload_preview, ["Distance", "Race Distance", "Distance (m)"], 1600)
+        try:
+            _distance_default = int(round(float(_csv_distance)))
+        except Exception:
+            _distance_default = 1600
+        _distance_default = int(np.clip(_distance_default, 800, 4000))
+        race_distance_input = st.number_input(
+            "Race Distance (m)", min_value=800, max_value=4000, step=50,
+            value=_distance_default,
+            help="Auto-filled from the CSV when a Distance column is present; otherwise enter it manually.",
+        )
+
+        with st.expander("Advanced settings", expanded=False):
+            USE_CG = st.toggle("Use Corrected Grind (CG)", value=True, help="Adjust Grind when the field finish collapses; preserves finisher credit.")
+            DAMPEN_CG = st.toggle("Dampen Grind weight if collapsed", value=True, help="Shift a little weight Grind→Accel/tsSPI on collapse races.")
+            # Race-shape calculations remain enabled internally for advanced models,
+            # but their controls and summary outputs are intentionally hidden.
+            USE_RACE_SHAPE = True
+            USE_GOING_ADJUST = st.toggle(
+                "Use Going Adjustment",
+                value=True,
+                help="Adjust PI weighting based on track going (Firm/Good/Soft/Heavy)"
+            )
+            _csv_going = _first_present_value(_upload_preview, ["Going", "Track Going", "Condition"], "Good")
+            _going_default = _normalise_going_for_pi(_csv_going)
+            _going_options = ["Good", "Firm", "Soft", "Heavy"]
+            GOING_TYPE = st.selectbox(
+                "Track Going",
+                options=_going_options,
+                index=_going_options.index(_going_default),
+                help="Auto-filled from the CSV when Going is present. Only affects PI weights; sectional indices stay unchanged."
+            ) if USE_GOING_ADJUST else "Good"
+            WIND_AFFECTED = st.toggle("Wind affected race?", value=False, help="Purely informational (disclaimer only).")
+            WIND_TAG = st.selectbox(
+                "Wind note",
+                options=["Headwind", "Tailwind", "Crosswind", "Negligible"],
+                index=0,
+                disabled=not WIND_AFFECTED,
+            ) if WIND_AFFECTED else "None"
+            SHOW_WARNINGS = st.toggle("Show data warnings", value=True)
+            DEBUG = st.toggle("Debug info", value=False)
+    else:
+        # Safe defaults keep the rest of the app state valid while these
+        # database-only views bypass race-file analysis.
+        up = None
+        _upload_preview = pd.DataFrame()
+        race_distance_input = 1600
+        USE_CG = True
+        DAMPEN_CG = True
+        USE_RACE_SHAPE = True
+        USE_GOING_ADJUST = True
+        GOING_TYPE = "Good"
+        WIND_AFFECTED = False
+        WIND_TAG = "None"
+        SHOW_WARNINGS = True
+        DEBUG = False
 
 # ----------------------- Horse Database works without a race upload -------
 if not up:
