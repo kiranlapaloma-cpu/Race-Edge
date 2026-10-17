@@ -22,6 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "engine"))
 from race_prediction import build_race_predictions
 from wfa import get_wfa_lb
 from database_readonly import horse_history, race_date_runs
+from sahr import (SAHRError, get_meetings_for_date, get_fields_meeting,
+                  meeting_race_options, race_to_race_edge_card)
+from race_card_service import prediction_runners
 
 app = FastAPI(title="Race Edge 2.0 — Python Engine", version="0.1.0")
 
@@ -134,3 +137,86 @@ def db_predictions(payload: DatabasePredictionRequest):
         return clean(result)
     except Exception:
         raise HTTPException(status_code=502, detail="Prediction or database query failed; check server logs")
+
+
+# Race-card endpoints: all protected, because these are part of a private tool.
+@app.get("/api/cards/meetings", dependencies=[Depends(require_api_key)])
+def card_meetings(race_date: date):
+    try:
+        meetings = get_meetings_for_date(race_date)
+        return {"date": race_date.isoformat(), "meetings": [
+            {"date": item["date"], "club": item["club"], "name": item["name"]}
+            for item in meetings]}
+    except SAHRError as exc:
+        raise HTTPException(status_code=502, detail=f"Race-card feed unavailable: {exc}") from exc
+
+
+def _load_card(race_date: date, club: int, race: int):
+    try:
+        meeting = get_fields_meeting(race_date, club)
+        card = race_to_race_edge_card(meeting, str(race))
+        if not card.get("distance"):
+            raise HTTPException(status_code=422, detail="Race distance is missing from the feed")
+        return card
+    except SAHRError as exc:
+        raise HTTPException(status_code=502, detail=f"Race-card feed unavailable: {exc}") from exc
+
+
+@app.get("/api/cards/races", dependencies=[Depends(require_api_key)])
+def card_races(race_date: date, club: int):
+    try:
+        meeting = get_fields_meeting(race_date, club)
+        return {"date": race_date.isoformat(), "club": club, "races": [
+            {"key": key, "label": label}
+            for key, label in meeting_race_options(meeting)]}
+    except SAHRError as exc:
+        raise HTTPException(status_code=502, detail=f"Race-card feed unavailable: {exc}") from exc
+
+
+@app.get("/api/cards/race", dependencies=[Depends(require_api_key)])
+def card_race(race_date: date, club: int, race: int):
+    card = _load_card(race_date, club, race)
+    return {"card": card, "prediction_runners": prediction_runners(card)}
+
+
+@app.get("/api/cards/predictions", dependencies=[Depends(require_api_key)])
+def card_predictions(race_date: date, club: int, race: int, include_peak: bool = False):
+    """Automatically load the card and histories, then call original maths.
+
+    Peak is calculated by the original engine but omitted from the default
+    API response; this does not alter any projection or ranking.
+    """
+    card = _load_card(race_date, club, race)
+    runners = prediction_runners(card)
+    if not runners:
+        raise HTTPException(status_code=422, detail="No runners returned by race-card feed")
+    histories = {}
+    try:
+        for runner in runners:
+            if runner["Status"] != "Runner":
+                continue
+            horse = runner["Horse"]
+            # Exclude races on/after target date to prevent look-ahead leakage.
+            rows = horse_history(horse)
+            histories[horse] = pd.DataFrame([
+                row for row in rows if str(row.get("race_date") or "")[:10] < race_date.isoformat()
+            ])
+        result = build_race_predictions(
+            pd.DataFrame(runners), race_date=race_date,
+            distance_m=float(card["distance"]),
+            history_loader=lambda horse: histories.get(horse, pd.DataFrame()).copy(),
+            apply_apprentice_claims=False,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Historical data or prediction calculation failed; check server logs") from exc
+    response = clean(result)
+    if not include_peak:
+        response.get("scenarios", {}).pop("Peak Ability", None)
+    return {
+        "meeting": {"date": race_date.isoformat(), "club": club, "race": race},
+        "card": card,
+        "prediction_runners": runners,
+        "prediction": response,
+        "visible_scenarios": ["Recent Best", "Latest Form"] + (["Peak Ability"] if include_peak else []),
+        "apprentice_claims_applied": False,
+    }
