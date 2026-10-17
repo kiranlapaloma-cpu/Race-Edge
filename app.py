@@ -221,6 +221,6 @@ def card_predictions(race_date: date, club: int, race: int, include_peak: bool =
         "apprentice_claims_applied": False,
     } 
 
-from race_analysis_api import router as analysis_router
+from race_analysis_api import analysis_router
 
 app.include_router(analysis_router)
