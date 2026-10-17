@@ -219,4 +219,8 @@ def card_predictions(race_date: date, club: int, race: int, include_peak: bool =
         "prediction": response,
         "visible_scenarios": ["Recent Best", "Latest Form"] + (["Peak Ability"] if include_peak else []),
         "apprentice_claims_applied": False,
-    }
+    } 
+
+from race_analysis_api import router as analysis_router
+
+app.include_router(analysis_router)
