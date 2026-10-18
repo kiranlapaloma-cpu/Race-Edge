@@ -224,3 +224,7 @@ def card_predictions(race_date: date, club: int, race: int, include_peak: bool =
 from race_analysis_api import analysis_router
 
 app.include_router(analysis_router)
+
+from race_plane_api import race_plane_router
+
+app.include_router(race_plane_router)
