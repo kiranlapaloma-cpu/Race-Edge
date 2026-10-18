@@ -81,3 +81,29 @@ def calculate_analysis(payload: AnalysisRequest):
         }
     except (ValueError, TypeError, KeyError, ZeroDivisionError) as exc:
         raise HTTPException(status_code=422, detail=f"Sectional calculation failed: {exc}") from exc
+
+
+# Read-only handicap ratings: call after /calculate with its metric rows.
+from race_ratings import calculate_handicap_ratings
+
+class RatingsRequest(BaseModel):
+    distance_m: float = Field(gt=0, le=3600)
+    race_date: date
+    metrics_rows: list[dict[str, Any]] = Field(min_length=2)
+    source_rows: list[dict[str, Any]] = Field(min_length=2)
+    race_diagnostics: dict[str, Any] = Field(default_factory=dict)
+    line_horse: str | None = None
+    line_mr: int | None = None
+    missing_ages: dict[str, int] = Field(default_factory=dict)
+
+@analysis_router.post("/ratings")
+def calculate_ratings(payload: RatingsRequest):
+    try:
+        return _json_safe(calculate_handicap_ratings(
+            payload.metrics_rows, payload.source_rows, payload.distance_m,
+            payload.race_date, line_horse=payload.line_horse,
+            line_mr=payload.line_mr, missing_ages=payload.missing_ages,
+            diagnostics=payload.race_diagnostics,
+        ))
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
