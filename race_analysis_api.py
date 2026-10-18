@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "engine"))
 from metrics_engine import build_metrics_and_shape
+from rpss_engine import compute_rpss
 
 def require_api_key(x_api_key: str | None = Header(default=None)):
     expected = os.environ.get("RACE_EDGE_API_KEY", "")
@@ -52,6 +53,10 @@ def _json_safe(value: Any) -> Any:
         return None
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, pd.DataFrame):
+        return _json_safe(value.replace([np.inf, -np.inf], np.nan).to_dict(orient="records"))
+    if isinstance(value, pd.Series):
+        return _json_safe(value.to_list())
     if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
     return value
@@ -71,11 +76,20 @@ def calculate_analysis(payload: AnalysisRequest):
             use_race_shape=payload.use_race_shape, debug=False,
             going_type=payload.going_type,
         )
+        # RPSS uses the original sectional times, not indexed tsSPI values.
+        rpss_info = compute_rpss(frame, payload.distance_m, payload.step, markers)
+        rpss_details = _json_safe(rpss_info) if rpss_info is not None else None
+        diagnostics = _json_safe(dict(result.attrs))
+        diagnostics["rpss"] = rpss_details.get("rpss") if rpss_details else None
+        diagnostics["rpss_verdict"] = rpss_details.get("verdict") if rpss_details else "Unavailable"
         return {
+            "rpss": diagnostics["rpss"],
+            "rpss_verdict": diagnostics["rpss_verdict"],
+            "rpss_details": rpss_details,
             "distance_m": payload.distance_m,
             "step": payload.step,
             "markers": [int(m) for m in markers],
-            "race_diagnostics": _json_safe(dict(result.attrs)),
+            "race_diagnostics": diagnostics,
             "rows": _json_safe(result.replace([np.inf, -np.inf], np.nan).to_dict(orient="records")),
             "saved": False,
         }
