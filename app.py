@@ -227,4 +227,13 @@ app.include_router(analysis_router)
 
 from race_plane_api import race_plane_router
 
+
+from database_save_api import database_save_router
+
+app.include_router(
+    database_save_router,
+    dependencies=[Depends(require_api_key)]
+)
+
+
 app.include_router(race_plane_router)
