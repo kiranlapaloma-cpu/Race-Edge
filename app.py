@@ -1,4 +1,4 @@
-"""Race Edge 2.0 Phase 1: private, data-in/data-out prediction API.
+""Race Edge 2.0 Phase 1: private, data-in/data-out prediction API.
 
 No Supabase credentials are required or accepted. Historical rows are supplied
 by the caller for this first integration milestone.
@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 sys.path.insert(0, str(Path(__file__).resolve().parent / "engine"))
 from race_prediction import build_race_predictions
 from wfa import get_wfa_lb
-from database_readonly import horse_history, race_date_runs
+from database_readonly import horse_history, race_date_runs, historical_race_explorer
 from sahr import (SAHRError, get_meetings_for_date, get_fields_meeting,
                   meeting_race_options, race_to_race_edge_card)
 from race_card_service import prediction_runners
@@ -113,6 +113,32 @@ def db_date(race_date: date):
         return {"race_date": race_date.isoformat(), "runs": race_date_runs(race_date.isoformat())}
     except Exception:
         raise HTTPException(status_code=502, detail="Database query failed; check server logs")
+
+@app.get("/api/db/historical-race", dependencies=[Depends(require_api_key)])
+def db_historical_race(
+    race_date: date,
+    track: str,
+    course: str,
+    race_number: int,
+    subsequent_limit: int = 5,
+):
+    """Full saved field and subsequent Race Edge runs, read-only."""
+    if not track.strip() or not course.strip():
+        raise HTTPException(status_code=422, detail="Track and course are required")
+    if race_number < 1 or not 1 <= subsequent_limit <= 20:
+        raise HTTPException(status_code=422, detail="Invalid race number or subsequent limit")
+    try:
+        return clean(historical_race_explorer(
+            day=race_date.isoformat(),
+            track=track,
+            course=course,
+            race_number=race_number,
+            subsequent_limit=subsequent_limit,
+        ))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        raise HTTPException(status_code=502, detail="Historical race query failed; check server logs")
 
 class DatabasePredictionRequest(BaseModel):
     race_date: date
@@ -219,21 +245,12 @@ def card_predictions(race_date: date, club: int, race: int, include_peak: bool =
         "prediction": response,
         "visible_scenarios": ["Recent Best", "Latest Form"] + (["Peak Ability"] if include_peak else []),
         "apprentice_claims_applied": False,
-    } 
+    }
 
 from race_analysis_api import analysis_router
-
 app.include_router(analysis_router)
 
 from race_plane_api import race_plane_router
-
-
 from database_save_api import database_save_router
-
-app.include_router(
-    database_save_router,
-    dependencies=[Depends(require_api_key)]
-)
-
-
+app.include_router(database_save_router, dependencies=[Depends(require_api_key)])
 app.include_router(race_plane_router)
