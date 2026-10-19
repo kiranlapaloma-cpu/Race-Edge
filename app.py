@@ -1,4 +1,4 @@
-""Race Edge 2.0 Phase 1: private, data-in/data-out prediction API.
+"""Race Edge 2.0 Phase 1: private, data-in/data-out prediction API.
 
 No Supabase credentials are required or accepted. Historical rows are supplied
 by the caller for this first integration milestone.
