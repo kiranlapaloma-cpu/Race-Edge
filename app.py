@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 sys.path.insert(0, str(Path(__file__).resolve().parent / "engine"))
 from race_prediction import build_race_predictions
 from wfa import get_wfa_lb
-from database_readonly import horse_history, race_date_runs, historical_race_explorer
+from database_readonly import horse_history, race_date_runs, historical_race_explorer, search_saved_horses
 from sahr import (SAHRError, get_meetings_for_date, get_fields_meeting,
                   meeting_race_options, race_to_race_edge_card)
 from race_card_service import prediction_runners
@@ -99,6 +99,18 @@ def require_api_key(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=503, detail="API access is not configured")
     if not x_api_key or not secrets.compare_digest(x_api_key, expected):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+@app.get("/api/db/horse-search", dependencies=[Depends(require_api_key)])
+def db_horse_search(q: str = "", limit: int = 30):
+    """Search horse names saved in Race Edge, independent of live race cards."""
+    if len(q.strip()) < 2:
+        return {"query": q, "horses": []}
+    if not 1 <= limit <= 50:
+        raise HTTPException(status_code=422, detail="Limit must be between 1 and 50")
+    try:
+        return {"query": q, "horses": search_saved_horses(q, limit=limit)}
+    except Exception:
+        raise HTTPException(status_code=502, detail="Horse search failed; check server logs")
 
 @app.get("/api/db/horse/{horse}", dependencies=[Depends(require_api_key)])
 def db_horse(horse: str):
