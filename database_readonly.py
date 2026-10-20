@@ -49,6 +49,40 @@ def horse_history(horse: str):
         return rows
     return [r for r in _all_rows() if canon_horse(r.get('horse', '')) == target]
 
+
+def search_saved_horses(query: str, limit: int = 30):
+    """Search distinct horse names saved in horse_runs (never live race cards)."""
+    term = str(query or '').strip()
+    if len(term) < 2:
+        return []
+    limit = max(1, min(int(limit), 50))
+    # Canonical names are generally stored uppercase. Search is case insensitive,
+    # and the canonical fallback handles punctuation differences in legacy rows.
+    normalized = canon_horse(term)
+    if not normalized:
+        return []
+    # Escape LIKE wildcards so input is treated as literal horse-name text.
+    escaped = normalized.replace('\\', '\\\\').replace('%', r'\%').replace('_', r'\_')
+    results = []
+    seen = set()
+    offset = 0
+    while True:
+        batch = (client().table('horse_runs').select('horse')
+                 .ilike('horse', f'%{escaped}%')
+                 .order('horse').range(offset, offset + 999).execute().data or [])
+        for row in batch:
+            name = str(row.get('horse') or '').strip()
+            canonical = canon_horse(name)
+            if canonical and canonical not in seen:
+                seen.add(canonical)
+                results.append(name)
+                if len(results) >= limit:
+                    return results
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    return results
+
 def race_date_runs(day: str):
     # All rows for the date, paginated to preserve the original database semantics.
     rows = []
