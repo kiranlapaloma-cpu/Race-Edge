@@ -30,24 +30,32 @@ def _all_rows(columns=COLUMNS, order='race_date', desc=True):
         offset += 1000
 
 def horse_history(horse: str):
+    """Return all saved runs for a horse, regardless of name letter case.
+
+    Use a case-insensitive exact-name query for the normal path, then retain
+    the legacy canonical-name fallback for punctuation/spacing variations.
+    """
     target = canon_horse(horse)
     if not target:
         return []
-    # Original module tries a direct canonical lookup then a paginated legacy fallback.
-    # Paginate the direct match as well, avoiding truncation for horses with many runs.
     rows = []
     offset = 0
     while True:
         batch = (client().table('horse_runs').select(COLUMNS)
-                 .eq('horse', target).order('race_date', desc=True)
+                 .ilike('horse', target).order('race_date', desc=True)
                  .range(offset, offset + 999).execute().data or [])
         rows.extend(batch)
         if len(batch) < 1000:
             break
         offset += 1000
-    if rows:
-        return rows
-    return [r for r in _all_rows() if canon_horse(r.get('horse', '')) == target]
+    # Legacy entries may differ in punctuation or whitespace, so include them
+    # too. This avoids dropping records when both naming styles exist.
+    canonical_rows = [r for r in _all_rows() if canon_horse(r.get('horse', '')) == target]
+    by_id = {}
+    for row in rows + canonical_rows:
+        key = row.get('id') or (row.get('horse'), row.get('race_date'), row.get('track'), row.get('course'), row.get('race_number'))
+        by_id[str(key)] = row
+    return sorted(by_id.values(), key=lambda r: (str(r.get('race_date') or ''), str(r.get('created_at') or '')), reverse=True)
 
 
 def search_saved_horses(query: str, limit: int = 30):
