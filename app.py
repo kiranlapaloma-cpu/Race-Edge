@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "engine"))
 from race_prediction import build_race_predictions
 from wfa import get_wfa_lb
 from database_readonly import horse_history, race_date_runs, historical_race_explorer, search_saved_horses
+from form_line_validation import validate_form_line
 from sahr import (SAHRError, get_meetings_for_date, get_fields_meeting,
                   meeting_race_options, race_to_race_edge_card)
 from race_card_service import prediction_runners
@@ -151,6 +152,44 @@ def db_historical_race(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:
         raise HTTPException(status_code=502, detail="Historical race query failed; check server logs")
+
+@app.get("/api/db/form-line-validation", dependencies=[Depends(require_api_key)])
+def db_form_line_validation(
+    race_date: date,
+    track: str,
+    course: str,
+    race_number: int,
+    follow_up_starts: int = 3,
+    mr_tolerance: float = 3.0,
+):
+    """Read-only retrospective validation of a saved race's subsequent form.
+
+    Uses each runner's own MR Achieved (never average MR), with saved
+    follow-up results only. Placings are 2nd/3rd, not Tote payout places.
+    """
+    if not track.strip() or not course.strip():
+        raise HTTPException(status_code=422, detail="Track and course are required")
+    if race_number < 1 or not 1 <= follow_up_starts <= 20:
+        raise HTTPException(status_code=422, detail="Invalid race number or follow-up starts")
+    if not math.isfinite(mr_tolerance) or mr_tolerance < 0:
+        raise HTTPException(status_code=422, detail="MR tolerance must be a nonnegative finite number")
+    try:
+        explorer = historical_race_explorer(
+            day=race_date.isoformat(), track=track.strip(), course=course.strip(),
+            race_number=race_number, subsequent_limit=follow_up_starts,
+        )
+        if not explorer.get("runners"):
+            raise HTTPException(status_code=404, detail="No saved runners found for this race")
+        return clean(validate_form_line(
+            explorer, follow_up_starts=follow_up_starts, mr_tolerance=mr_tolerance,
+        ))
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        raise HTTPException(status_code=502, detail="Form-line validation failed; check server logs")
+
 
 class DatabasePredictionRequest(BaseModel):
     race_date: date
