@@ -23,6 +23,7 @@ from race_prediction import build_race_predictions
 from wfa import get_wfa_lb
 from database_readonly import horse_history, race_date_runs, historical_race_explorer, search_saved_horses
 from form_line_validation import validate_form_line
+from horse_telemetry import horse_telemetry, compare_horse_telemetry
 from sahr import (SAHRError, get_meetings_for_date, get_fields_meeting,
                   meeting_race_options, race_to_race_edge_card)
 from race_card_service import prediction_runners
@@ -189,6 +190,34 @@ def db_form_line_validation(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:
         raise HTTPException(status_code=502, detail="Form-line validation failed; check server logs")
+
+
+@app.get("/api/db/horse-telemetry", dependencies=[Depends(require_api_key)])
+def db_horse_telemetry(horse: str, before_date: date | None = None):
+    """Read-only historical sectional telemetry for one saved horse."""
+    if not horse.strip():
+        raise HTTPException(status_code=422, detail="Horse name is required")
+    try:
+        return clean(horse_telemetry(
+            horse.strip(), before_date=before_date.isoformat() if before_date else None,
+        ))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        raise HTTPException(status_code=502, detail="Horse telemetry query failed; check server logs")
+
+
+@app.get("/api/db/horse-telemetry-compare", dependencies=[Depends(require_api_key)])
+def db_horse_telemetry_compare(horses: list[str], before_date: date | None = None):
+    """Read-only side-by-side telemetry for two to four distinct horses."""
+    try:
+        return clean(compare_horse_telemetry(
+            horses, before_date=before_date.isoformat() if before_date else None,
+        ))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        raise HTTPException(status_code=502, detail="Horse telemetry comparison failed; check server logs")
 
 
 class DatabasePredictionRequest(BaseModel):
