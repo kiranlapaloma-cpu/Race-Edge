@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 sys.path.insert(0, str(Path(__file__).resolve().parent / "engine"))
 from race_prediction import build_race_predictions
 from wfa import get_wfa_lb
-from database_readonly import horse_history, race_date_runs, historical_race_explorer, search_saved_horses
+from database_readonly import horse_history, horse_histories, race_date_runs, historical_race_explorer, search_saved_horses
 from form_line_validation import validate_form_line
 from horse_telemetry import horse_telemetry, compare_horse_telemetry
 from sahr import (SAHRError, get_meetings_for_date, get_fields_meeting,
@@ -298,15 +298,9 @@ def card_predictions(race_date: date, club: int, race: int, include_peak: bool =
         raise HTTPException(status_code=422, detail="No runners returned by race-card feed")
     histories = {}
     try:
-        for runner in runners:
-            if runner["Status"] != "Runner":
-                continue
-            horse = runner["Horse"]
-            # Exclude races on/after target date to prevent look-ahead leakage.
-            rows = horse_history(horse)
-            histories[horse] = pd.DataFrame([
-                row for row in rows if str(row.get("race_date") or "")[:10] < race_date.isoformat()
-            ])
+        active_names = [runner["Horse"] for runner in runners if runner["Status"] == "Runner"]
+        grouped = horse_histories(active_names, before_date=race_date.isoformat())
+        histories = {horse: pd.DataFrame(grouped.get(horse, [])) for horse in active_names}
         result = build_race_predictions(
             pd.DataFrame(runners), race_date=race_date,
             distance_m=float(card["distance"]),
