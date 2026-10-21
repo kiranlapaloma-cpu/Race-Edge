@@ -58,6 +58,48 @@ def horse_history(horse: str):
     return sorted(by_id.values(), key=lambda r: (str(r.get('race_date') or ''), str(r.get('created_at') or '')), reverse=True)
 
 
+
+def horse_histories(horses, before_date=None):
+    """Fetch histories for multiple horses in one paginated database scan.
+
+    Canonical matching preserves the same punctuation/spacing handling as
+    horse_history. A before_date cutoff excludes runs on/after that date.
+    No persistent cache is used: new saved records remain immediately visible.
+    """
+    names = [str(name or '').strip() for name in horses]
+    targets = {canon_horse(name) for name in names if canon_horse(name)}
+    grouped = {target: [] for target in targets}
+    if not targets:
+        return {name: [] for name in names}
+
+    # Query only runs before the race when predicting historical/coming races.
+    # Unlike a full-table scan, this prevents retrieving future records.
+    output = []
+    offset = 0
+    while True:
+        query = client().table('horse_runs').select(COLUMNS)
+        if before_date is not None:
+            query = query.lt('race_date', str(before_date)[:10])
+        batch = (query.order('race_date', desc=True)
+                 .range(offset, offset + 999).execute().data or [])
+        output.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+
+    for row in output:
+        target = canon_horse(row.get('horse', ''))
+        if target in grouped:
+            grouped[target].append(row)
+    for target, rows in grouped.items():
+        by_id = {}
+        for row in rows:
+            key = row.get('id') or (row.get('horse'), row.get('race_date'), row.get('track'), row.get('course'), row.get('race_number'))
+            by_id[str(key)] = row
+        grouped[target] = sorted(by_id.values(), key=lambda r: (
+            str(r.get('race_date') or ''), str(r.get('created_at') or '')), reverse=True)
+    return {name: list(grouped.get(canon_horse(name), [])) for name in names}
+
 def search_saved_horses(query: str, limit: int = 30):
     """Search distinct horse names saved in horse_runs (never live race cards)."""
     term = str(query or '').strip()
@@ -153,9 +195,11 @@ def historical_race_explorer(day: str, track: str, course: str, race_number: int
         canon_horse(row.get('horse', '')),
     ))
 
+    # Load all runner histories together instead of scanning the table per runner.
+    histories = horse_histories([row.get('horse', '') for row in field])
     runners = []
     for row in field:
-        history = horse_history(row.get('horse', ''))
+        history = histories.get(str(row.get('horse', '')).strip(), [])
         later = [run for run in history if str(run.get('race_date') or '') > day]
         later.sort(key=lambda run: (
             str(run.get('race_date') or ''),
